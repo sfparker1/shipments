@@ -90,8 +90,12 @@ def _token_request(data):
     req = urllib.request.Request(CFG["base_url"] + "/identity/connect/token",
                                  data=urllib.parse.urlencode(data).encode(),
                                  headers={"Content-Type": "application/x-www-form-urlencoded"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "ignore")
+        raise RuntimeError(f"HTTP {e.code} from token endpoint -> {body}")
 
 def exchange_code(code):
     pk = load_json(PKCE_PATH) or {}
