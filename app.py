@@ -198,25 +198,40 @@ def find_sales_orders(po):
                             "status": g("Status")})
     return matches, st, data
 
-def find_sales_orders_batch(pos, chunk=12):
-    """One query per ~chunk PO#s (OR'd together) instead of one per PO# — far fewer
-    round trips, so the slow 'contains' scan runs a handful of times, not 10-29."""
+_OPEN_ORDERS = {"rows": None, "ts": 0}
+OPEN_TTL = 600   # cache open sales orders for 10 min
+
+def load_open_orders(force=False):
+    """Fetch all OPEN sales orders once (no slow 'contains' scan — just a Status
+    filter), cache them, and reuse. Turns N table scans into one bounded fetch."""
+    now = time.time()
+    if not force and _OPEN_ORDERS["rows"] is not None and now - _OPEN_ORDERS["ts"] < OPEN_TTL:
+        return _OPEN_ORDERS["rows"]
+    rows = []
+    q = (f"{ENTITY}/SalesOrder?$filter=Status eq 'Open'"
+         f"&$select=OrderType,OrderNbr,CustomerOrderNbr,CustomerID,Status")
+    st, data = api("GET", q)
+    if st == 200 and isinstance(data, list):
+        for so in data:
+            g = lambda k: (so.get(k) or {}).get("value")
+            rows.append({"order_type": g("OrderType"), "order_nbr": g("OrderNbr"),
+                         "cust_order": g("CustomerOrderNbr") or "", "customer": g("CustomerID"),
+                         "status": g("Status")})
+        _OPEN_ORDERS["rows"] = rows
+        _OPEN_ORDERS["ts"] = now
+    return rows
+
+def find_sales_orders_batch(pos):
+    """Match every PO# against the cached open-order list locally (instant)."""
+    orders = load_open_orders()
     results = {p: [] for p in pos}
-    for i in range(0, len(pos), chunk):
-        grp = pos[i:i + chunk]
-        ors = " or ".join(f"substringof('{p}',CustomerOrderNbr) eq true" for p in grp)
-        q = (f"{ENTITY}/SalesOrder?$filter=({ors}) and Status eq 'Open'"
-             f"&$select=OrderType,OrderNbr,CustomerOrderNbr,Status,CustomerID")
-        st, data = api("GET", q)
-        if st == 200 and isinstance(data, list):
-            for so in data:
-                g = lambda k: (so.get(k) or {}).get("value")
-                m = {"order_type": g("OrderType"), "order_nbr": g("OrderNbr"),
-                     "cust_order": g("CustomerOrderNbr") or "", "customer": g("CustomerID"),
-                     "status": g("Status")}
-                for p in grp:
-                    if p in m["cust_order"]:
-                        results[p].append(m)
+    for o in orders:
+        co = o["cust_order"]
+        if not co:
+            continue
+        for p in pos:
+            if p in co:
+                results[p].append(o)
     return results
 
 # ---------------- shipment creation (validate via /diag first) ----------------
