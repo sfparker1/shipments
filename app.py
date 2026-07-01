@@ -44,6 +44,7 @@ RUNS_PATH = os.path.join(TOKEN_DIR, "ship_runs.jsonl")
 REDIRECT_URI = CFG["public_url"] + "/callback"
 COOKIE_SECRET = (CFG["app_password"] or "dev").encode() + b"::ship"
 SESSIONS = {}
+_PKCE = {}   # in-memory PKCE state (primary); disk is a backup
 ENTITY = f"/entity/Default/{CFG['api_version']}"
 
 # ---------------- helpers ----------------
@@ -80,6 +81,7 @@ def build_authorize_url():
     verifier = b64url(secrets.token_bytes(32))
     challenge = b64url(hashlib.sha256(verifier.encode()).digest())
     state = b64url(secrets.token_bytes(16))
+    _PKCE["verifier"] = verifier; _PKCE["state"] = state
     save_json(PKCE_PATH, {"verifier": verifier, "state": state})
     q = {"response_type": "code", "client_id": CFG["client_id"], "redirect_uri": REDIRECT_URI,
          "scope": "api offline_access", "code_challenge": challenge,
@@ -98,7 +100,7 @@ def _token_request(data):
         raise RuntimeError(f"HTTP {e.code} from token endpoint -> {body}")
 
 def exchange_code(code):
-    pk = load_json(PKCE_PATH) or {}
+    pk = _PKCE if _PKCE.get("verifier") else (load_json(PKCE_PATH) or {})
     tok = _token_request({"grant_type": "authorization_code", "code": code,
                           "redirect_uri": REDIRECT_URI, "client_id": CFG["client_id"],
                           "client_secret": CFG["client_secret"], "code_verifier": pk.get("verifier", "")})
