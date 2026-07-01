@@ -11,7 +11,7 @@ read-back verification, reconciliation certificate, run-history log. Runs on
 Render (always-on) alongside the receipts tool. Config via env vars.
 """
 import os, re, json, time, base64, hashlib, hmac, secrets
-import urllib.parse, urllib.request, urllib.error, cgi
+import urllib.parse, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
@@ -59,6 +59,21 @@ def load_json(path):
     try:
         with open(path) as f: return json.load(f)
     except Exception: return None
+
+def parse_multipart(body, boundary):
+    """Minimal multipart/form-data parser (replaces the removed stdlib `cgi`).
+    Returns {name: bytes} for file parts and {name: str} for text parts."""
+    fields = {}
+    for part in body.split(b"--" + boundary):
+        if not part or part.strip() in (b"", b"--"): continue
+        if b"\r\n\r\n" not in part: continue
+        head, data = part.split(b"\r\n\r\n", 1)
+        head_s = head.decode("utf-8", "ignore")
+        m = re.search(r'name="([^"]+)"', head_s)
+        if not m: continue
+        if data.endswith(b"\r\n"): data = data[:-2]
+        fields[m.group(1)] = data if 'filename="' in head_s else data.decode("utf-8", "ignore")
+    return fields
 
 # ---------------- OAuth (Auth Code + PKCE; state persisted to disk) ----------------
 def build_authorize_url():
@@ -417,14 +432,15 @@ class H(BaseHTTPRequestHandler):
         if not self._authed():
             return self._send(403, "forbidden", "text/plain")
         if u.path == "/process":
-            ctype, pdict = cgi.parse_header(self.headers.get("Content-Type", ""))
-            if ctype != "multipart/form-data":
+            ctype = self.headers.get("Content-Type", "")
+            if "multipart/form-data" not in ctype or "boundary=" not in ctype:
                 return self._send(400, json.dumps({"error": "expected upload"}), "application/json")
-            pdict["boundary"] = pdict["boundary"].encode()
-            fields = cgi.parse_multipart(self.rfile, pdict)
-            filedata = fields.get("pdf", [None])[0]
-            dry = fields.get("dry", ["1"])[0] == "1"
-            sd = (fields.get("sd", [""])[0] or None)
+            boundary = ctype.split("boundary=", 1)[1].strip().strip('"').encode()
+            ln = int(self.headers.get("Content-Length", 0))
+            fields = parse_multipart(self.rfile.read(ln), boundary)
+            filedata = fields.get("pdf")
+            dry = (fields.get("dry") or "1") == "1"
+            sd = (fields.get("sd") or "") or None
             if not filedata:
                 return self._send(400, json.dumps({"error": "no file"}), "application/json")
             tmp = os.path.join(TOKEN_DIR, "_ship_upload.pdf")
