@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: handover-shipments
+    runtime: python
+    plan: starter            # always-on, so the OAuth flow never cold-starts mid-login
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: ACU_BASE_URL
+        value: https://sandandfog.acumatica.com
+      - key: ACU_TENANT           # live tenant name
+        sync: false
+      - key: ACU_CLIENT_ID        # live connected-app client id
+        sync: false
+      - key: ACU_CLIENT_SECRET    # live connected-app shared secret
+        sync: false
+      - key: APP_PASSWORD         # login password for the tool
+        sync: false
+      - key: PUBLIC_URL           # the https URL Render gives this service
+        sync: false
+      - key: WAREHOUSE_ID         # optional ship-from warehouse (blank = sales order default)
+        sync: false
+      - key: SHIP_CONTAINER_FIELD # optional: shipment container UDF (from Diagnostics)
+        sync: false
+      - key: TOKEN_DIR
+        value: /var/data
+    disk:
+      name: ship-data
+      mountPath: /var/data
+      sizeGB: 1
