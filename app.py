@@ -198,6 +198,27 @@ def find_sales_orders(po):
                             "status": g("Status")})
     return matches, st, data
 
+def find_sales_orders_batch(pos, chunk=12):
+    """One query per ~chunk PO#s (OR'd together) instead of one per PO# — far fewer
+    round trips, so the slow 'contains' scan runs a handful of times, not 10-29."""
+    results = {p: [] for p in pos}
+    for i in range(0, len(pos), chunk):
+        grp = pos[i:i + chunk]
+        ors = " or ".join(f"substringof('{p}',CustomerOrderNbr) eq true" for p in grp)
+        q = (f"{ENTITY}/SalesOrder?$filter=({ors}) and Status eq 'Open'"
+             f"&$select=OrderType,OrderNbr,CustomerOrderNbr,Status,CustomerID")
+        st, data = api("GET", q)
+        if st == 200 and isinstance(data, list):
+            for so in data:
+                g = lambda k: (so.get(k) or {}).get("value")
+                m = {"order_type": g("OrderType"), "order_nbr": g("OrderNbr"),
+                     "cust_order": g("CustomerOrderNbr") or "", "customer": g("CustomerID"),
+                     "status": g("Status")}
+                for p in grp:
+                    if p in m["cust_order"]:
+                        results[p].append(m)
+    return results
+
 # ---------------- shipment creation (validate via /diag first) ----------------
 def _latest_shipment_for_order(order_nbr):
     st, data = api("GET", f"{ENTITY}/Shipment?$filter=substringof('{order_nbr}',OrderNbr) eq true&$select=ShipmentNbr&$top=1&$orderby=ShipmentNbr desc")
@@ -244,9 +265,10 @@ def process_file(path, dry_run=True, ship_date=None):
     parsed = parse_handover(path)
     containers = [c["container"] for c in parsed["containers"]]
     container_ref = ", ".join(containers)
+    matched = find_sales_orders_batch(parsed["po_numbers"])
     rows = []; to_create = 0; created = 0
     for po in parsed["po_numbers"]:
-        matches, st, _ = find_sales_orders(po)
+        matches = matched.get(po, [])
         if not matches:
             rows.append({"po": po, "confidence": "flag", "note": "no open sales order", "orders": []})
             continue
