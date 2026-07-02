@@ -241,6 +241,26 @@ def _latest_shipment_for_order(order_nbr):
         return (data[0].get("ShipmentNbr") or {}).get("value")
     return None
 
+def _failure_reason(order_type, order_nbr):
+    """When CreateShipment fails, look at the order to give a human reason
+    instead of Acumatica's generic 'Operation failed' stack trace."""
+    try:
+        st, d = api("GET", f"{ENTITY}/SalesOrder/{order_type}/{order_nbr}?$expand=Shipments")
+    except Exception:
+        return None
+    if st != 200 or not isinstance(d, dict):
+        return None
+    g = lambda k: (d.get(k) or {}).get("value")
+    if g("Hold"): return "Order is On Hold in Acumatica"
+    if g("CreditHold"): return "Customer is on Credit Hold"
+    shs = d.get("Shipments") or []
+    if any((s.get("ShipmentNbr") or {}).get("value") for s in shs):
+        return "A shipment already exists for this order"
+    stt = g("Status")
+    if stt and stt != "Open":
+        return f"Order status is '{stt}' — not shippable"
+    return "Nothing available to ship (backordered or no stock in the ship-from warehouse)"
+
 def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None):
     params = {}
     if ship_date: params["ShipmentDate"] = {"value": ship_date}
@@ -257,6 +277,7 @@ def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None):
         res["verified"] = bool(ship)
     else:
         res["error"] = resp if isinstance(resp, str) else json.dumps(resp)[:300]
+        res["reason"] = _failure_reason(order_type, order_nbr)
     return res
 
 # ---------------- run log ----------------
@@ -475,7 +496,7 @@ function render(d,dry){
    if(!row.orders.length){h+='<tr>'+td(dot)+td(row.po)+td('&mdash;')+td('&mdash;')+td(row.note)+'</tr>';continue;}
    for(const o of row.orders){
      let res=row.note||'';
-     if(row.result){res=row.result.created?('&#10003; '+(row.result.shipment_nbr||'created')):('&#9888; '+(row.result.error||'failed'));}
+     if(row.result){res=row.result.created?('&#10003; '+(row.result.shipment_nbr||'created')):('&#9888; '+(row.result.reason||row.result.error||'failed'));}
      h+='<tr>'+td(dot)+td(row.po)+td((o.order_type||'')+' '+(o.order_nbr||''))+td(o.customer||'')+td(res)+'</tr>';
    }
  }
