@@ -305,6 +305,41 @@ def process_file(path, dry_run=True, ship_date=None):
     return summary
 
 # ---------------- diagnostics ----------------
+def _stage(r):
+    """Derive the next-action stage from a pipeline record."""
+    if not r.get("shipment"): return "Create shipment"
+    sst = (r.get("shipment_status") or "").lower()
+    if "confirm" not in sst:  # Open / not yet confirmed
+        return "Confirm shipment"
+    if not r.get("invoice"): return "Create invoice"
+    ist = (r.get("invoice_status") or "").lower()
+    if "released" in ist and "unreleased" not in ist: return "Done"
+    return "Release invoice"
+
+def so_pipeline(po):
+    """For a PO#, return each matched sales order's shipment/invoice pipeline stage."""
+    flt = f"substringof('{po}', CustomerOrderNbr) eq true"
+    st, data = api("GET", f"{ENTITY}/SalesOrder?$filter={flt}&$select=OrderType,OrderNbr,CustomerOrderNbr,Status")
+    res = []
+    if st != 200 or not isinstance(data, list): return res
+    for so in data:
+        g = lambda k: (so.get(k) or {}).get("value")
+        ot, on = g("OrderType"), g("OrderNbr")
+        rec = {"po": po, "order": f"{ot} {on}", "order_status": g("Status"),
+               "shipment": None, "shipment_status": None, "invoice": None, "invoice_status": None}
+        est, ed = api("GET", f"{ENTITY}/SalesOrder/{ot}/{on}?$expand=Shipments")
+        if est == 200 and isinstance(ed, dict):
+            shs = ed.get("Shipments") or []
+            if shs:
+                sh = shs[-1]; gg = lambda k: (sh.get(k) or {}).get("value")
+                rec["shipment"] = gg("ShipmentNbr")
+                rec["shipment_status"] = gg("Status") or gg("ShipmentStatus")
+                rec["invoice"] = gg("InvoiceNbr")
+                rec["invoice_status"] = gg("InvoiceStatus")
+        rec["stage"] = _stage(rec)
+        res.append(rec)
+    return res
+
 def diagnostics(sample_po=None):
     out = {"connected": bool(access_token()), "tenant": CFG["tenant"],
            "container_field": CFG["container_field"] or "(not set)", "warehouse": CFG["warehouse"] or "(SO default)"}
@@ -312,6 +347,12 @@ def diagnostics(sample_po=None):
     if sample_po:
         matches, st, _ = find_sales_orders(sample_po)
         out["sample_po"] = sample_po; out["match_status"] = st; out["matches"] = matches[:5]
+        if matches:
+            m = matches[0]
+            est, ed = api("GET", f"{ENTITY}/SalesOrder/{m['order_type']}/{m['order_nbr']}?$expand=Shipments")
+            out["sample_so_keys"] = sorted(ed.keys()) if isinstance(ed, dict) else ed
+            out["sample_shipments"] = ed.get("Shipments") if isinstance(ed, dict) else None
+            out["sample_pipeline"] = so_pipeline(sample_po)
     st, schema = api("GET", f"{ENTITY}/Shipment/$adHocSchema")
     if st == 200 and isinstance(schema, dict):
         cands = []
@@ -444,6 +485,14 @@ class H(BaseHTTPRequestHandler):
                 except Exception as e:
                     return self._send(200, page(f"<div class=card>Token exchange failed: {e}</div>"))
             return self._send(400, page("<div class=card>Missing code</div>"))
+        if u.path == "/status":
+            qs = urllib.parse.parse_qs(u.query)
+            want = os.environ.get("STATUS_TOKEN", "")
+            if not want or qs.get("token", [""])[0] != want:
+                return self._send(403, json.dumps({"error": "bad token"}), "application/json")
+            pos = [p.strip() for p in qs.get("pos", [""])[0].split(",") if p.strip()][:250]
+            out = {p: so_pipeline(p) for p in pos}
+            return self._send(200, json.dumps(out), "application/json")
         if not self._authed():
             return self._send(200, LOGIN)
         if u.path == "/":
