@@ -86,7 +86,8 @@ def build_authorize_url():
     save_json(PKCE_PATH, {"verifier": verifier, "state": state})
     q = {"response_type": "code", "client_id": CFG["client_id"], "redirect_uri": REDIRECT_URI,
          "scope": "api offline_access", "code_challenge": challenge,
-         "code_challenge_method": "S256", "state": state}
+         "code_challenge_method": "S256", "state": state,
+         "prompt": "login"}  # force the Acumatica login prompt so it never silently reuses a personal SSO session
     return CFG["base_url"] + "/identity/connect/authorize?" + urllib.parse.urlencode(q)
 
 def _token_request(data):
@@ -100,18 +101,46 @@ def _token_request(data):
         body = e.read().decode("utf-8", "ignore")
         raise RuntimeError(f"HTTP {e.code} from token endpoint -> {body}")
 
+def _detect_user(tok):
+    """Best-effort: figure out which Acumatica user the token belongs to, for the
+    'Connected as ...' banner. Tries the JWT payload, then the userinfo endpoint.
+    Returns None if it can't tell (banner then just says 'Connected')."""
+    at = tok.get("access_token", "")
+    try:
+        parts = at.split(".")
+        if len(parts) >= 2:
+            pad = parts[1] + "=" * (-len(parts[1]) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(pad.encode()))
+            for k in ("preferred_username", "username", "unique_name", "name", "email", "sub"):
+                if payload.get(k): return str(payload[k])[:60]
+    except Exception: pass
+    try:
+        req = urllib.request.Request(CFG["base_url"] + "/identity/connect/userinfo",
+                                     headers={"Authorization": "Bearer " + at})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            info = json.loads(r.read())
+            for k in ("preferred_username", "name", "email", "sub"):
+                if info.get(k): return str(info[k])[:60]
+    except Exception: pass
+    return None
+
+def connected_user():
+    return (load_json(TOKEN_PATH) or {}).get("_user")
+
 def exchange_code(code):
     pk = _PKCE if _PKCE.get("verifier") else (load_json(PKCE_PATH) or {})
     tok = _token_request({"grant_type": "authorization_code", "code": code,
                           "redirect_uri": REDIRECT_URI, "client_id": CFG["client_id"],
                           "client_secret": CFG["client_secret"], "code_verifier": pk.get("verifier", "")})
-    tok["obtained"] = time.time(); save_json(TOKEN_PATH, tok); return tok
+    tok["obtained"] = time.time(); tok["_user"] = _detect_user(tok); save_json(TOKEN_PATH, tok); return tok
 
 def refresh_token(tok):
     new = _token_request({"grant_type": "refresh_token", "refresh_token": tok["refresh_token"],
                           "client_id": CFG["client_id"], "client_secret": CFG["client_secret"]})
     new["obtained"] = time.time()
-    new.setdefault("refresh_token", tok["refresh_token"]); save_json(TOKEN_PATH, new); return new
+    new.setdefault("refresh_token", tok["refresh_token"])
+    new["_user"] = tok.get("_user") or _detect_user(new)
+    save_json(TOKEN_PATH, new); return new
 
 def access_token():
     tok = load_json(TOKEN_PATH)
@@ -463,8 +492,18 @@ LOGIN = """<!doctype html><meta charset=utf-8><title>Sign in</title><style>%s
 
 def page(body):
     connected = bool(access_token())
-    badge = ('<span class=pill style="border-color:#5a7d5a">Connected to Acumatica</span>'
-             if connected else '<a class=pill href=/connect>Connect to Acumatica</a>')
+    if connected:
+        u = (connected_user() or "").replace("<", "").replace(">", "")
+        exp = os.environ.get("EXPECTED_ACU_USER", "").strip()
+        if exp and u and exp.lower() not in u.lower():
+            badge = ('<span class=pill style="border-color:#b0653a;color:#b0653a">&#9888; Connected as %s &mdash; expected %s</span>'
+                     ' <a class=pill href=/connect>Switch account</a>' % (u, exp))
+        else:
+            label = ("Connected as %s" % u) if u else "Connected to Acumatica"
+            badge = ('<span class=pill style="border-color:#5a7d5a">%s</span>'
+                     ' <a class=pill href=/connect>Switch account</a>' % label)
+    else:
+        badge = '<a class=pill href=/connect>Connect to Acumatica</a>'
     return """<!doctype html><meta charset=utf-8><title>Handover &#8594; Shipments</title><style>%s</style>
 <div class=wrap><div class=brand>SAND + FOG</div><h1>Handover Advice &#8594; Acumatica Shipments</h1>
 <p class=sub>%s &nbsp; <a class=pill href=/>Home</a> <a class=pill href=/history>History</a> <a class=pill href=/diag>Diagnostics</a></p>
