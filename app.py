@@ -41,6 +41,7 @@ TOKEN_DIR = cfg("TOKEN_DIR", HERE)
 TOKEN_PATH = os.path.join(TOKEN_DIR, "ship_token.json")
 PKCE_PATH = os.path.join(TOKEN_DIR, "ship_pkce.json")
 RUNS_PATH = os.path.join(TOKEN_DIR, "ship_runs.jsonl")
+SHIPDATES_PATH = os.path.join(TOKEN_DIR, "po_shipdates.json")  # {po: 'YYYY-MM-DD'} NRT pickup dates, pushed by the daily sync
 REDIRECT_URI = CFG["public_url"] + "/callback"
 COOKIE_SECRET = (CFG["app_password"] or "dev").encode() + b"::ship"
 SESSIONS = {}
@@ -261,13 +262,16 @@ def _failure_reason(order_type, order_nbr):
         return f"Order status is '{stt}' — not shippable"
     return "Nothing available to ship (backordered or no stock in the ship-from warehouse)"
 
-def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None):
+def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None, po=None):
+    # Date precedence: explicit field the user typed  >  this PO's NRT pickup date
+    # (pushed by the daily sync)  >  none (Acumatica defaults to today).
+    date = ship_date or ((load_json(SHIPDATES_PATH) or {}).get(po) if po else None)
     params = {}
-    if ship_date: params["ShipmentDate"] = {"value": ship_date}
+    if date: params["ShipmentDate"] = {"value": date}
     if CFG["warehouse"]: params["WarehouseID"] = {"value": CFG["warehouse"]}
     body = {"entity": {"OrderType": {"value": order_type}, "OrderNbr": {"value": order_nbr}}, "parameters": params}
     st, resp = api("POST", f"{ENTITY}/SalesOrder/CreateShipment", body)
-    res = {"order": f"{order_type} {order_nbr}", "invoke_status": st, "created": st in (200, 202, 204)}
+    res = {"order": f"{order_type} {order_nbr}", "invoke_status": st, "created": st in (200, 202, 204), "ship_date": date}
     if res["created"]:
         ship = _latest_shipment_for_order(order_nbr)
         res["shipment_nbr"] = ship
@@ -312,7 +316,7 @@ def process_file(path, dry_run=True, ship_date=None):
             to_create += 1
             row = {"po": po, "confidence": "ok", "orders": [m], "note": ""}
             if not dry_run:
-                res = create_shipment(m["order_type"], m["order_nbr"], container_ref, ship_date)
+                res = create_shipment(m["order_type"], m["order_nbr"], container_ref, ship_date, po=po)
                 row["result"] = res
                 if res.get("created"): created += 1
             rows.append(row)
@@ -471,7 +475,7 @@ HOME = """<div class=card>
 <p class=sub>Drop a Dachser handover-advice PDF. Preview the matched sales orders, then create shipments (left unconfirmed for a person to confirm in Acumatica).</p>
 <form id=f onsubmit="return false">
 <p><input type=file id=pdf accept="application/pdf"></p>
-<p style="max-width:240px"><label class=sub>Shipment date (optional)</label><input type=date id=sd></p>
+<p style="max-width:340px"><label class=sub>Shipment date (optional &mdash; leave blank to use each PO&#39;s NRT pickup date)</label><input type=date id=sd></p>
 <button class=fog onclick="go(true)">Preview</button>
 <button onclick="go(false)" id=create disabled>Create shipments</button>
 </form></div>
@@ -496,7 +500,7 @@ function render(d,dry){
    if(!row.orders.length){h+='<tr>'+td(dot)+td(row.po)+td('&mdash;')+td('&mdash;')+td(row.note)+'</tr>';continue;}
    for(const o of row.orders){
      let res=row.note||'';
-     if(row.result){res=row.result.created?('&#10003; '+(row.result.shipment_nbr||'created')):('&#9888; '+(row.result.reason||row.result.error||'failed'));}
+     if(row.result){res=row.result.created?('&#10003; '+(row.result.shipment_nbr||'created')+(row.result.ship_date?' &middot; '+row.result.ship_date:'')):('&#9888; '+(row.result.reason||row.result.error||'failed'));}
      h+='<tr>'+td(dot)+td(row.po)+td((o.order_type||'')+' '+(o.order_nbr||''))+td(o.customer||'')+td(res)+'</tr>';
    }
  }
@@ -551,6 +555,22 @@ class H(BaseHTTPRequestHandler):
             pos = [p.strip() for p in qs.get("pos", [""])[0].split(",") if p.strip()][:250]
             out = {p: so_pipeline(p) for p in pos}
             return self._send(200, json.dumps(out), "application/json")
+        if u.path == "/setshipdates":
+            # Daily sync pushes each PO's NRT pickup date here (chunked GET). Merges into
+            # po_shipdates.json; pass reset=1 on the first chunk to clear stale entries.
+            qs = urllib.parse.parse_qs(u.query)
+            want = os.environ.get("STATUS_TOKEN", "")
+            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            if not (token_ok or self._authed()):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            cur = {} if qs.get("reset", ["0"])[0] == "1" else (load_json(SHIPDATES_PATH) or {})
+            n = 0
+            for pr in qs.get("pairs", [""])[0].split(","):
+                if ":" in pr:
+                    k, v = pr.split(":", 1); k = k.strip(); v = v.strip()
+                    if k and v: cur[k] = v; n += 1
+            save_json(SHIPDATES_PATH, cur)
+            return self._send(200, json.dumps({"stored": n, "total": len(cur)}), "application/json")
         if not self._authed():
             return self._send(200, LOGIN)
         if u.path == "/":
