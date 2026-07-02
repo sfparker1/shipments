@@ -499,7 +499,7 @@ pre{background:#2b2b2b;color:#d7d2c6;padding:14px;border-radius:8px;overflow:aut
 LOGIN = """<!doctype html><meta charset=utf-8><title>Sign in</title><style>%s
 .box{max-width:340px;margin:12vh auto}</style><div class=wrap><div class="card box">
 <div class=brand>SAND + FOG</div><h1>Handover &#8594; Shipments</h1>
-<form method=post action=/login><p><input type=text name=user placeholder="Your name" autofocus></p>
+<form method=post action=/login><p><input type=text name=user placeholder="Username" autofocus></p>
 <p><input type=password name=pw placeholder="Password"></p>
 <button>Sign in</button></form></div></div>""" % CSS
 
@@ -519,7 +519,7 @@ def page(body):
         badge = '<a class=pill href=/connect>Connect to Acumatica</a>'
     return """<!doctype html><meta charset=utf-8><title>Handover &#8594; Shipments</title><style>%s</style>
 <div class=wrap><div class=brand>SAND + FOG</div><h1>Handover Advice &#8594; Acumatica Shipments</h1>
-<p class=sub>%s &nbsp; <a class=pill href=/>Home</a> <a class=pill href=/history>History</a> <a class=pill href=/diag>Diagnostics</a></p>
+<p class=sub>%s &nbsp; <a class=pill href=/>Home</a> <a class=pill href=/guide>Guide</a> <a class=pill href=/history>History</a> <a class=pill href=/diag>Diagnostics</a></p>
 %s</div>""" % (CSS, badge, body)
 
 HOME = """<div class=card>
@@ -562,6 +562,19 @@ function render(d,dry){
 }
 function td(x){return '<td>'+x+'</td>';}
 </script>"""
+
+GUIDE = """<div class=card>
+<h1 style="font-size:18px">User guide &mdash; how this tool works</h1>
+<p class=sub>It turns a Dachser handover advice into shipment records in Acumatica &mdash; with a person always in control of the revenue step.</p>
+<ol style="line-height:1.75;font-size:14px;padding-left:20px">
+<li><b>Connect as the shipments account.</b> Click <b>Switch account</b> (top) and sign in with the dedicated Acumatica login &mdash; not a personal one. The banner shows who&#39;s connected.</li>
+<li><b>Drop the handover advice.</b> On <b>Home</b>, choose the Dachser handover-advice PDF and click <b>Preview</b>.</li>
+<li><b>Review the matches.</b> The tool finds the open sales orders whose customer PO matches each PO on the advice, and shows them in a table.</li>
+<li><b>Create the shipments.</b> Click <b>Create shipments</b>. Each is created <b>unconfirmed</b> and dated to that PO&#39;s NRT pickup date.</li>
+<li><b>Confirm &amp; invoice in Acumatica.</b> A person confirms each shipment (this recognizes revenue), then creates and releases the invoice. <b>This tool never confirms</b> &mdash; that stays a human decision.</li>
+</ol>
+<p class=sub>If a line can&#39;t be created, the Result column explains why (e.g. nothing available to ship, order on hold). <a href=/history>History</a> lists past runs and who ran them.</p>
+</div>"""
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -636,6 +649,8 @@ class H(BaseHTTPRequestHandler):
                     '<form method=get action=/diag><p style="max-width:260px"><input type=text name=po placeholder="test a PO# e.g. 117256"></p>'
                     '<button class=fog>Run</button></form><pre>' + json.dumps(d, indent=2) + "</pre></div>")
             return self._send(200, page(body))
+        if u.path == "/guide":
+            return self._send(200, page(GUIDE))
         if u.path == "/history":
             rows = "".join(f"<tr><td>{h.get('ts','')}</td><td>{h.get('user','') or ''}</td><td>{h.get('reference','')}</td><td>{h.get('created','')}/{h.get('orders_matched','')}</td><td>{h.get('containers','')}</td></tr>" for h in history())
             body = f'<div class=card><h1 style="font-size:16px">Run history</h1><table><tr><th>When</th><th>By</th><th>Reference</th><th>Created/Matched</th><th>Containers</th></tr>{rows}</table></div>'
