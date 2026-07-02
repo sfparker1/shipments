@@ -36,6 +36,13 @@ CFG = {
     "container_field": cfg("SHIP_CONTAINER_FIELD", ""),
     "api_version":     cfg("ACU_API_VERSION", "20.200.001"),
 }
+# Optional per-user logins for attribution: APP_USERS="abby@x.com:pw,brenda@x.com:pw"
+CFG["users"] = {}
+for _pair in cfg("APP_USERS", "").split(","):
+    if ":" in _pair:
+        _u, _p = _pair.split(":", 1)
+        if _u.strip():
+            CFG["users"][_u.strip()] = _p.strip()
 PORT = int(cfg("PORT", cfg("WEBSITES_PORT", "8400")))
 TOKEN_DIR = cfg("TOKEN_DIR", HERE)
 TOKEN_PATH = os.path.join(TOKEN_DIR, "ship_token.json")
@@ -330,7 +337,7 @@ def history():
     return list(reversed(out))[:50]
 
 # ---------------- process a handover PDF ----------------
-def process_file(path, dry_run=True, ship_date=None):
+def process_file(path, dry_run=True, ship_date=None, user=None):
     parsed = parse_handover(path)
     containers = [c["container"] for c in parsed["containers"]]
     container_ref = ", ".join(containers)
@@ -355,7 +362,7 @@ def process_file(path, dry_run=True, ship_date=None):
                "orders_matched": to_create, "created": created, "dry_run": dry_run, "rows": rows}
     if not dry_run:
         log_run({"reference": parsed["dachser_reference"], "orders_matched": to_create,
-                 "created": created, "containers": container_ref})
+                 "created": created, "containers": container_ref, "user": user})
     return summary
 
 # ---------------- diagnostics ----------------
@@ -455,11 +462,16 @@ def diagnostics(sample_po=None):
     return out
 
 # ================= Web UI =================
-def make_session():
+def make_session(who="staff"):
     tok = secrets.token_hex(16)
     sig = hmac.new(COOKIE_SECRET, tok.encode(), hashlib.sha256).hexdigest()[:16]
-    SESSIONS[tok] = True
+    SESSIONS[tok] = who
     return f"{tok}.{sig}"
+
+def session_user(val):
+    if not val or "." not in val: return None
+    u = SESSIONS.get(val.rsplit(".", 1)[0])
+    return u if isinstance(u, str) else None
 
 def valid_session(val):
     if not val or "." not in val: return False
@@ -487,7 +499,8 @@ pre{background:#2b2b2b;color:#d7d2c6;padding:14px;border-radius:8px;overflow:aut
 LOGIN = """<!doctype html><meta charset=utf-8><title>Sign in</title><style>%s
 .box{max-width:340px;margin:12vh auto}</style><div class=wrap><div class="card box">
 <div class=brand>SAND + FOG</div><h1>Handover &#8594; Shipments</h1>
-<form method=post action=/login><p><input type=password name=pw placeholder="Password" autofocus></p>
+<form method=post action=/login><p><input type=text name=user placeholder="Your name" autofocus></p>
+<p><input type=password name=pw placeholder="Password"></p>
 <button>Sign in</button></form></div></div>""" % CSS
 
 def page(body):
@@ -624,8 +637,8 @@ class H(BaseHTTPRequestHandler):
                     '<button class=fog>Run</button></form><pre>' + json.dumps(d, indent=2) + "</pre></div>")
             return self._send(200, page(body))
         if u.path == "/history":
-            rows = "".join(f"<tr><td>{h.get('ts','')}</td><td>{h.get('reference','')}</td><td>{h.get('created','')}/{h.get('orders_matched','')}</td><td>{h.get('containers','')}</td></tr>" for h in history())
-            body = f'<div class=card><h1 style="font-size:16px">Run history</h1><table><tr><th>When</th><th>Reference</th><th>Created/Matched</th><th>Containers</th></tr>{rows}</table></div>'
+            rows = "".join(f"<tr><td>{h.get('ts','')}</td><td>{h.get('user','') or ''}</td><td>{h.get('reference','')}</td><td>{h.get('created','')}/{h.get('orders_matched','')}</td><td>{h.get('containers','')}</td></tr>" for h in history())
+            body = f'<div class=card><h1 style="font-size:16px">Run history</h1><table><tr><th>When</th><th>By</th><th>Reference</th><th>Created/Matched</th><th>Containers</th></tr>{rows}</table></div>'
             return self._send(200, page(body))
         return self._send(404, page("<div class=card>Not found</div>"))
 
@@ -635,8 +648,15 @@ class H(BaseHTTPRequestHandler):
             ln = int(self.headers.get("Content-Length", 0))
             data = urllib.parse.parse_qs(self.rfile.read(ln).decode())
             pw = data.get("pw", [""])[0]
-            if CFG["app_password"] and hmac.compare_digest(pw, CFG["app_password"]):
-                return self._send(302, "", cookie=make_session()) if False else self._redirect_with_cookie(make_session())
+            uname = (data.get("user", [""])[0] or "").strip()
+            ok = False; who = uname or "staff"
+            if CFG["users"]:  # per-user logins (APP_USERS): name + password must match
+                if uname in CFG["users"] and hmac.compare_digest(CFG["users"][uname], pw):
+                    ok = True; who = uname
+            elif CFG["app_password"] and hmac.compare_digest(pw, CFG["app_password"]):
+                ok = True; who = uname or "staff"  # single shared password; name is a label
+            if ok:
+                return self._redirect_with_cookie(make_session(who))
             return self._send(200, LOGIN)
         if not self._authed():
             return self._send(403, "forbidden", "text/plain")
@@ -656,7 +676,7 @@ class H(BaseHTTPRequestHandler):
             with open(tmp, "wb") as f:
                 f.write(filedata if isinstance(filedata, bytes) else filedata.encode())
             try:
-                out = process_file(tmp, dry_run=dry, ship_date=sd)
+                out = process_file(tmp, dry_run=dry, ship_date=sd, user=session_user(self._cookie()))
                 return self._send(200, json.dumps(out), "application/json")
             except Exception as e:
                 return self._send(200, json.dumps({"error": str(e)}), "application/json")
