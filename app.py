@@ -523,8 +523,10 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/status":
             qs = urllib.parse.parse_qs(u.query)
             want = os.environ.get("STATUS_TOKEN", "")
-            if not want or qs.get("token", [""])[0] != want:
-                return self._send(403, json.dumps({"error": "bad token"}), "application/json")
+            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            # Accept either a valid token (automated sync) or a logged-in session (browser).
+            if not (token_ok or self._authed()):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             pos = [p.strip() for p in qs.get("pos", [""])[0].split(",") if p.strip()][:250]
             out = {p: so_pipeline(p) for p in pos}
             return self._send(200, json.dumps(out), "application/json")
