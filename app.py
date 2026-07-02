@@ -651,9 +651,9 @@ class H(BaseHTTPRequestHandler):
             uname = (data.get("user", [""])[0] or "").strip()
             ok = False; who = uname or "staff"
             if CFG["users"]:  # per-user logins (APP_USERS): name + password must match
-                if uname in CFG["users"] and hmac.compare_digest(CFG["users"][uname], pw):
+                if uname in CFG["users"] and hmac.compare_digest(CFG["users"][uname].encode(), pw.encode()):
                     ok = True; who = uname
-            elif CFG["app_password"] and hmac.compare_digest(pw, CFG["app_password"]):
+            elif CFG["app_password"] and hmac.compare_digest(pw.encode(), CFG["app_password"].encode()):
                 ok = True; who = uname or "staff"  # single shared password; name is a label
             if ok:
                 return self._redirect_with_cookie(make_session(who))
