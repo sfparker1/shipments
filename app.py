@@ -306,14 +306,15 @@ def process_file(path, dry_run=True, ship_date=None):
 
 # ---------------- diagnostics ----------------
 def _stage(r):
-    """Derive the next-action stage from a pipeline record."""
+    """Derive the next-action stage from a pipeline record.
+    The order is still Open (so_pipeline only sees open orders); it leaves the
+    Open list once its invoice is released, so 'Done' is handled upstream as an
+    empty pipeline. Shipment 'Status' is Open until Confirmed/Completed."""
     if not r.get("shipment"): return "Create shipment"
     sst = (r.get("shipment_status") or "").lower()
-    if "confirm" not in sst:  # Open / not yet confirmed
+    if "confirm" not in sst and "complet" not in sst:  # still Open / not confirmed
         return "Confirm shipment"
     if not r.get("invoice"): return "Create invoice"
-    ist = (r.get("invoice_status") or "").lower()
-    if "released" in ist and "unreleased" not in ist: return "Done"
     return "Release invoice"
 
 def _sh_field(sh, *names):
@@ -324,31 +325,40 @@ def _sh_field(sh, *names):
             return v.get("value")
     return None
 
+def _order_pipeline(m, po=None):
+    """Build one pipeline record from an open-order match: read the order's
+    Shipments expand (GET-by-key, no substringof) and derive the stage."""
+    ot, on = m["order_type"], m["order_nbr"]
+    rec = {"po": po, "order": f"{ot} {on}".strip(), "order_status": m.get("status"),
+           "cust_order": m.get("cust_order"),
+           "shipment": None, "shipment_status": None, "invoice": None, "invoice_status": None}
+    est, ed = api("GET", f"{ENTITY}/SalesOrder/{ot}/{on}?$expand=Shipments")
+    if est == 200 and isinstance(ed, dict):
+        shs = ed.get("Shipments") or []
+        # Real shipment records carry a ShipmentNbr; credit-memo / auto-issue
+        # rows have an empty ShipmentNbr and are ignored for the shipment stage.
+        ship_recs = [s for s in shs if _sh_field(s, "ShipmentNbr")]
+        if ship_recs:
+            sh = ship_recs[-1]
+            rec["shipment"] = _sh_field(sh, "ShipmentNbr")
+            rec["shipment_status"] = _sh_field(sh, "Status", "ShipmentStatus")
+        # Invoice can appear on any of the rows (incl. the issue row).
+        for s in shs:
+            inv = _sh_field(s, "InvoiceNbr", "InvoiceRefNbr")
+            if inv:
+                rec["invoice"] = inv
+                rec["invoice_status"] = _sh_field(s, "InvoiceStatus")
+                break
+    rec["stage"] = _stage(rec)
+    return rec
+
 def so_pipeline(po):
     """For a PO#, return each matched sales order's shipment/invoice pipeline stage.
     Avoids substringof (500s on this tenant): matches the PO against the cached
     OPEN-order list client-side, then reads each order's shipments via GET-by-key.
     An order stays Open until fully invoiced, so a picked-up PO with no open match
     is already fully processed ('Done')."""
-    res = []
-    matches = find_sales_orders_batch([po]).get(po, [])
-    for m in matches:
-        ot, on = m["order_type"], m["order_nbr"]
-        rec = {"po": po, "order": f"{ot} {on}".strip(), "order_status": m.get("status"),
-               "cust_order": m.get("cust_order"),
-               "shipment": None, "shipment_status": None, "invoice": None, "invoice_status": None}
-        est, ed = api("GET", f"{ENTITY}/SalesOrder/{ot}/{on}?$expand=Shipments")
-        if est == 200 and isinstance(ed, dict):
-            shs = ed.get("Shipments") or []
-            if shs:
-                sh = shs[-1]
-                rec["shipment"] = _sh_field(sh, "ShipmentNbr")
-                rec["shipment_status"] = _sh_field(sh, "Status", "ShipmentStatus")
-                rec["invoice"] = _sh_field(sh, "InvoiceNbr", "InvoiceRefNbr")
-                rec["invoice_status"] = _sh_field(sh, "InvoiceStatus")
-        rec["stage"] = _stage(rec)
-        res.append(rec)
-    return res
+    return [_order_pipeline(m, po) for m in find_sales_orders_batch([po]).get(po, [])]
 
 def diagnostics(sample_po=None):
     out = {"connected": bool(access_token()), "tenant": CFG["tenant"],
@@ -369,6 +379,10 @@ def diagnostics(sample_po=None):
         out["shipment_keys"] = sorted(shd[0].keys())
     else:
         out["shipment_sample_status"] = shst
+    # Live pipeline sample: run the real stage logic against a few OPEN orders.
+    open_orders = load_open_orders()
+    out["open_orders_count"] = len(open_orders)
+    out["pipeline_sample"] = [_order_pipeline(o) for o in open_orders[:6]]
     if sample_po:
         matches = find_sales_orders_batch([sample_po]).get(sample_po, [])
         out["sample_po"] = sample_po
