@@ -186,15 +186,15 @@ def parse_handover(path):
 
 # ---------------- matching ----------------
 def find_sales_orders(po):
-    flt = f"substringof('{po}', CustomerOrderNbr) eq true and Status eq 'Open'"
-    q = f"{ENTITY}/SalesOrder?$filter={flt}&$select=OrderType,OrderNbr,CustomerOrderNbr,Status,CustomerID"
+    flt = f"substringof('{po}', CustomerOrder) eq true and Status eq 'Open'"
+    q = f"{ENTITY}/SalesOrder?$filter={flt}&$select=OrderType,OrderNbr,CustomerOrder,Status,CustomerID"
     st, data = api("GET", q)
     matches = []
     if st == 200 and isinstance(data, list):
         for so in data:
             g = lambda k: (so.get(k) or {}).get("value")
             matches.append({"order_type": g("OrderType"), "order_nbr": g("OrderNbr"),
-                            "cust_order": g("CustomerOrderNbr"), "customer": g("CustomerID"),
+                            "cust_order": g("CustomerOrder"), "customer": g("CustomerID"),
                             "status": g("Status")})
     return matches, st, data
 
@@ -209,13 +209,13 @@ def load_open_orders(force=False):
         return _OPEN_ORDERS["rows"]
     rows = []
     q = (f"{ENTITY}/SalesOrder?$filter=Status eq 'Open'"
-         f"&$select=OrderType,OrderNbr,CustomerOrderNbr,CustomerID,Status")
+         f"&$select=OrderType,OrderNbr,CustomerOrder,CustomerID,Status")
     st, data = api("GET", q)
     if st == 200 and isinstance(data, list):
         for so in data:
             g = lambda k: (so.get(k) or {}).get("value")
             rows.append({"order_type": g("OrderType"), "order_nbr": g("OrderNbr"),
-                         "cust_order": g("CustomerOrderNbr") or "", "customer": g("CustomerID"),
+                         "cust_order": g("CustomerOrder") or "", "customer": g("CustomerID"),
                          "status": g("Status")})
         _OPEN_ORDERS["rows"] = rows
         _OPEN_ORDERS["ts"] = now
