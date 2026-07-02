@@ -316,26 +316,36 @@ def _stage(r):
     if "released" in ist and "unreleased" not in ist: return "Done"
     return "Release invoice"
 
+def _sh_field(sh, *names):
+    """Read the first present field 'value' from a Shipments sub-record."""
+    for n in names:
+        v = sh.get(n)
+        if isinstance(v, dict) and v.get("value") not in (None, ""):
+            return v.get("value")
+    return None
+
 def so_pipeline(po):
-    """For a PO#, return each matched sales order's shipment/invoice pipeline stage."""
-    flt = f"substringof('{po}', CustomerOrderNbr) eq true"
-    st, data = api("GET", f"{ENTITY}/SalesOrder?$filter={flt}&$select=OrderType,OrderNbr,CustomerOrderNbr,Status")
+    """For a PO#, return each matched sales order's shipment/invoice pipeline stage.
+    Avoids substringof (500s on this tenant): matches the PO against the cached
+    OPEN-order list client-side, then reads each order's shipments via GET-by-key.
+    An order stays Open until fully invoiced, so a picked-up PO with no open match
+    is already fully processed ('Done')."""
     res = []
-    if st != 200 or not isinstance(data, list): return res
-    for so in data:
-        g = lambda k: (so.get(k) or {}).get("value")
-        ot, on = g("OrderType"), g("OrderNbr")
-        rec = {"po": po, "order": f"{ot} {on}", "order_status": g("Status"),
+    matches = find_sales_orders_batch([po]).get(po, [])
+    for m in matches:
+        ot, on = m["order_type"], m["order_nbr"]
+        rec = {"po": po, "order": f"{ot} {on}".strip(), "order_status": m.get("status"),
+               "cust_order": m.get("cust_order"),
                "shipment": None, "shipment_status": None, "invoice": None, "invoice_status": None}
         est, ed = api("GET", f"{ENTITY}/SalesOrder/{ot}/{on}?$expand=Shipments")
         if est == 200 and isinstance(ed, dict):
             shs = ed.get("Shipments") or []
             if shs:
-                sh = shs[-1]; gg = lambda k: (sh.get(k) or {}).get("value")
-                rec["shipment"] = gg("ShipmentNbr")
-                rec["shipment_status"] = gg("Status") or gg("ShipmentStatus")
-                rec["invoice"] = gg("InvoiceNbr")
-                rec["invoice_status"] = gg("InvoiceStatus")
+                sh = shs[-1]
+                rec["shipment"] = _sh_field(sh, "ShipmentNbr")
+                rec["shipment_status"] = _sh_field(sh, "Status", "ShipmentStatus")
+                rec["invoice"] = _sh_field(sh, "InvoiceNbr", "InvoiceRefNbr")
+                rec["invoice_status"] = _sh_field(sh, "InvoiceStatus")
         rec["stage"] = _stage(rec)
         res.append(rec)
     return res
@@ -344,15 +354,26 @@ def diagnostics(sample_po=None):
     out = {"connected": bool(access_token()), "tenant": CFG["tenant"],
            "container_field": CFG["container_field"] or "(not set)", "warehouse": CFG["warehouse"] or "(SO default)"}
     if not out["connected"]: return out
+    # Structural samples (no substringof — that operator 500s on this tenant).
+    # A single order with its Shipments expand reveals the real field names.
+    sst, sso = api("GET", f"{ENTITY}/SalesOrder?$top=1&$expand=Shipments")
+    if sst == 200 and isinstance(sso, list) and sso:
+        so0 = sso[0]
+        out["so_keys"] = sorted(so0.keys())
+        shs = so0.get("Shipments")
+        out["so_shipments_sample"] = (shs[0] if isinstance(shs, list) and shs else shs)
+    else:
+        out["so_sample_status"] = sst
+    shst, shd = api("GET", f"{ENTITY}/Shipment?$top=1")
+    if shst == 200 and isinstance(shd, list) and shd:
+        out["shipment_keys"] = sorted(shd[0].keys())
+    else:
+        out["shipment_sample_status"] = shst
     if sample_po:
-        matches, st, _ = find_sales_orders(sample_po)
-        out["sample_po"] = sample_po; out["match_status"] = st; out["matches"] = matches[:5]
-        if matches:
-            m = matches[0]
-            est, ed = api("GET", f"{ENTITY}/SalesOrder/{m['order_type']}/{m['order_nbr']}?$expand=Shipments")
-            out["sample_so_keys"] = sorted(ed.keys()) if isinstance(ed, dict) else ed
-            out["sample_shipments"] = ed.get("Shipments") if isinstance(ed, dict) else None
-            out["sample_pipeline"] = so_pipeline(sample_po)
+        matches = find_sales_orders_batch([sample_po]).get(sample_po, [])
+        out["sample_po"] = sample_po
+        out["open_matches"] = matches[:5]
+        out["sample_pipeline"] = so_pipeline(sample_po)
     st, schema = api("GET", f"{ENTITY}/Shipment/$adHocSchema")
     if st == 200 and isinstance(schema, dict):
         cands = []
