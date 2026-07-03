@@ -49,6 +49,7 @@ TOKEN_PATH = os.path.join(TOKEN_DIR, "ship_token.json")
 PKCE_PATH = os.path.join(TOKEN_DIR, "ship_pkce.json")
 RUNS_PATH = os.path.join(TOKEN_DIR, "ship_runs.jsonl")
 SHIPDATES_PATH = os.path.join(TOKEN_DIR, "po_shipdates.json")  # {po: 'YYYY-MM-DD'} NRT pickup dates, pushed by the daily sync
+CONTAINERDATES_PATH = os.path.join(TOKEN_DIR, "container_dates.json")  # {container: 'YYYY-MM-DD'} NRT pickup (email) dates, pushed by the daily sync
 REDIRECT_URI = CFG["public_url"] + "/callback"
 COOKIE_SECRET = (CFG["app_password"] or "dev").encode() + b"::ship"
 SESSIONS = {}
@@ -343,6 +344,10 @@ def process_file(path, dry_run=True, ship_date=None, user=None):
     parsed = parse_handover(path)
     containers = [c["container"] for c in parsed["containers"]]
     container_ref = ", ".join(containers)
+    _cont_dates = load_json(CONTAINERDATES_PATH) or {}
+    _adv_dates = [_cont_dates[c] for c in containers if _cont_dates.get(c)]
+    advice_ship_date = max(_adv_dates) if _adv_dates else None
+    _shipdates = load_json(SHIPDATES_PATH) or {}
     matched = find_sales_orders_batch(parsed["po_numbers"])
     rows = []; to_create = 0; created = 0
     for po in parsed["po_numbers"]:
@@ -354,7 +359,8 @@ def process_file(path, dry_run=True, ship_date=None, user=None):
             to_create += 1
             row = {"po": po, "confidence": "ok", "orders": [m], "note": ""}
             if not dry_run:
-                res = create_shipment(m["order_type"], m["order_nbr"], container_ref, ship_date, po=po)
+                eff = ship_date or advice_ship_date or _shipdates.get(po)
+                res = create_shipment(m["order_type"], m["order_nbr"], container_ref, eff, po=po)
                 row["result"] = res
                 if res.get("created"): created += 1
             rows.append(row)
@@ -637,6 +643,20 @@ class H(BaseHTTPRequestHandler):
                     k, v = pr.split(":", 1); k = k.strip(); v = v.strip()
                     if k and v: cur[k] = v; n += 1
             save_json(SHIPDATES_PATH, cur)
+            return self._send(200, json.dumps({"stored": n, "total": len(cur)}), "application/json")
+        if u.path == "/setcontainerdates":
+            qs = urllib.parse.parse_qs(u.query)
+            want = os.environ.get("STATUS_TOKEN", "")
+            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            if not (token_ok or self._authed()):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            cur = {} if qs.get("reset", ["0"])[0] == "1" else (load_json(CONTAINERDATES_PATH) or {})
+            n = 0
+            for pr in qs.get("pairs", [""])[0].split(","):
+                if ":" in pr:
+                    k, v = pr.split(":", 1); k = k.strip(); v = v.strip()
+                    if k and v: cur[k] = v; n += 1
+            save_json(CONTAINERDATES_PATH, cur)
             return self._send(200, json.dumps({"stored": n, "total": len(cur)}), "application/json")
         if not self._authed():
             return self._send(200, LOGIN)
