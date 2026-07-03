@@ -359,7 +359,7 @@ def process_file(path, dry_run=True, ship_date=None, user=None):
             to_create += 1
             row = {"po": po, "confidence": "ok", "orders": [m], "note": ""}
             if not dry_run:
-                eff = ship_date or advice_ship_date or _shipdates.get(po)
+                eff = ship_date or _shipdates.get(po) or advice_ship_date  # per-PO packing-list date first; advice-level only as last resort
                 res = create_shipment(m["order_type"], m["order_nbr"], container_ref, eff, po=po)
                 row["result"] = res
                 if res.get("created"): created += 1
