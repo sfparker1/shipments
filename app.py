@@ -55,6 +55,21 @@ SESSIONS = {}
 _PKCE = {}   # in-memory PKCE state (primary); disk is a backup
 ENTITY = f"/entity/Default/{CFG['api_version']}"
 
+# ---------------- login rate limiting ----------------
+_LOGIN_ATTEMPTS = {}      # ip -> [timestamps of recent failed logins]
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_WINDOW_SEC = 600    # look back 10 minutes
+LOGIN_LOCKOUT_SEC = 900   # lock out for 15 minutes once tripped
+
+def _login_blocked(ip):
+    now = time.time()
+    attempts = [t for t in _LOGIN_ATTEMPTS.get(ip, []) if now - t < LOGIN_WINDOW_SEC]
+    _LOGIN_ATTEMPTS[ip] = attempts
+    return len(attempts) >= LOGIN_MAX_ATTEMPTS and (now - attempts[-1]) < LOGIN_LOCKOUT_SEC
+
+def _record_login_failure(ip):
+    _LOGIN_ATTEMPTS.setdefault(ip, []).append(time.time())
+
 # ---------------- helpers ----------------
 def b64url(b): return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
@@ -222,19 +237,6 @@ def parse_handover(path):
             "po_numbers": pos}
 
 # ---------------- matching ----------------
-def find_sales_orders(po):
-    flt = f"substringof('{po}', CustomerOrder) eq true and Status eq 'Open'"
-    q = f"{ENTITY}/SalesOrder?$filter={flt}&$select=OrderType,OrderNbr,CustomerOrder,Status,CustomerID"
-    st, data = api("GET", q)
-    matches = []
-    if st == 200 and isinstance(data, list):
-        for so in data:
-            g = lambda k: (so.get(k) or {}).get("value")
-            matches.append({"order_type": g("OrderType"), "order_nbr": g("OrderNbr"),
-                            "cust_order": g("CustomerOrder"), "customer": g("CustomerID"),
-                            "status": g("Status")})
-    return matches, st, data
-
 _OPEN_ORDERS = {"rows": None, "ts": 0}
 OPEN_TTL = 600   # cache open sales orders for 10 min
 
@@ -660,6 +662,9 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
         if u.path == "/login":
+            ip = self.client_address[0]
+            if _login_blocked(ip):
+                return self._send(429, "<!doctype html><meta charset=utf-8><p>Too many failed sign-in attempts. Please wait a few minutes and try again.</p>")
             ln = int(self.headers.get("Content-Length", 0))
             data = urllib.parse.parse_qs(self.rfile.read(ln).decode())
             pw = data.get("pw", [""])[0]
@@ -672,6 +677,7 @@ class H(BaseHTTPRequestHandler):
                 ok = True; who = uname or "staff"  # single shared password; name is a label
             if ok:
                 return self._redirect_with_cookie(make_session(who))
+            _record_login_failure(ip)
             return self._send(200, LOGIN)
         if not self._authed():
             return self._send(403, "forbidden", "text/plain")
@@ -687,7 +693,7 @@ class H(BaseHTTPRequestHandler):
             sd = (fields.get("sd") or "") or None
             if not filedata:
                 return self._send(400, json.dumps({"error": "no file"}), "application/json")
-            tmp = os.path.join(TOKEN_DIR, "_ship_upload.pdf")
+            tmp = os.path.join(TOKEN_DIR, "_ship_upload_%s.pdf" % secrets.token_hex(8))
             with open(tmp, "wb") as f:
                 f.write(filedata if isinstance(filedata, bytes) else filedata.encode())
             try:
@@ -695,6 +701,11 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(out), "application/json")
             except Exception as e:
                 return self._send(200, json.dumps({"error": str(e)}), "application/json")
+            finally:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
         return self._send(404, json.dumps({"error": "not found"}), "application/json")
 
     def _redirect_with_cookie(self, cookie):
