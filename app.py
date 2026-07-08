@@ -87,7 +87,9 @@ def load_json(path):
 
 def parse_multipart(body, boundary):
     """Minimal multipart/form-data parser (replaces the removed stdlib `cgi`).
-    Returns {name: bytes} for file parts and {name: str} for text parts."""
+    Returns {name: bytes} for file parts and {name: str} for text parts.
+    For file parts, also stashes the original filename under "_fn_<name>" (used
+    for the run-history log so it shows what document was processed)."""
     fields = {}
     for part in body.split(b"--" + boundary):
         if not part or part.strip() in (b"", b"--"): continue
@@ -96,8 +98,14 @@ def parse_multipart(body, boundary):
         head_s = head.decode("utf-8", "ignore")
         m = re.search(r'name="([^"]+)"', head_s)
         if not m: continue
+        name = m.group(1)
         if data.endswith(b"\r\n"): data = data[:-2]
-        fields[m.group(1)] = data if 'filename="' in head_s else data.decode("utf-8", "ignore")
+        if 'filename="' in head_s:
+            fn = re.search(r'filename="([^"]*)"', head_s)
+            fields["_fn_" + name] = (fn.group(1) if fn else "") or ""
+            fields[name] = data
+        else:
+            fields[name] = data.decode("utf-8", "ignore")
     return fields
 
 # ---------------- OAuth (Auth Code + PKCE; state persisted to disk) ----------------
@@ -302,9 +310,10 @@ def _failure_reason(order_type, order_nbr):
     return "Nothing available to ship (backordered or no stock in the ship-from warehouse)"
 
 def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None, po=None):
-    # Date precedence: explicit field the user typed  >  this PO's NRT pickup date
-    # (pushed by the daily sync)  >  none (Acumatica defaults to today).
-    date = ship_date or ((load_json(SHIPDATES_PATH) or {}).get(po) if po else None)
+    # ship_date is required by the caller (process_file hard-stops before this
+    # point if it's missing) -- no more silent fallback to a synced date or to
+    # "today". po is accepted for logging only.
+    date = ship_date
     params = {}
     if date: params["ShipmentDate"] = {"value": date}
     if CFG["warehouse"]: params["WarehouseID"] = {"value": CFG["warehouse"]}
@@ -331,46 +340,66 @@ def log_run(entry):
         with open(RUNS_PATH, "a") as f: f.write(json.dumps(entry) + "\n")
     except Exception: pass
 
-def history():
+def history(limit=200):
+    """Every non-dry-run process runs through here permanently (ship_runs.jsonl
+    on the persistent disk) -- nothing is ever deleted from the file itself.
+    `limit` only caps how many rows a given caller wants back."""
     out = []
     try:
         with open(RUNS_PATH) as f:
             out = [json.loads(l) for l in f if l.strip()]
     except Exception: pass
-    return list(reversed(out))[:50]
+    out = list(reversed(out))
+    return out[:limit] if limit else out
 
 # ---------------- process a handover PDF ----------------
-def process_file(path, dry_run=True, ship_date=None, user=None):
+def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None):
+    # Hard stop: creation requires a typed Shipment date. No more silent fallback
+    # to a per-PO/advice date or to "today" -- if it's blank, nothing is created.
+    # (Preview / dry_run is unaffected -- you can preview matches before typing a date.)
+    if not dry_run and not ship_date:
+        return {"error": "Shipment date is required. Enter the NRT pickup date before creating shipments."}
+
     parsed = parse_handover(path)
     containers = [c["container"] for c in parsed["containers"]]
     container_ref = ", ".join(containers)
-    _cont_dates = load_json(CONTAINERDATES_PATH) or {}
-    _adv_dates = [_cont_dates[c] for c in containers if _cont_dates.get(c)]
-    advice_ship_date = max(_adv_dates) if _adv_dates else None
-    _shipdates = load_json(SHIPDATES_PATH) or {}
     matched = find_sales_orders_batch(parsed["po_numbers"])
-    rows = []; to_create = 0; created = 0
+    rows = []; log_orders = []; to_create = 0; created = 0
     for po in parsed["po_numbers"]:
         matches = matched.get(po, [])
         if not matches:
             rows.append({"po": po, "confidence": "flag", "note": "no open sales order", "orders": []})
+            if not dry_run:
+                log_orders.append({"po": po, "order": None, "shipment_nbr": None,
+                                    "created": False, "reason": "no open sales order"})
             continue
         for m in matches:
             to_create += 1
             row = {"po": po, "confidence": "ok", "orders": [m], "note": ""}
             if not dry_run:
-                eff = ship_date or _shipdates.get(po) or advice_ship_date  # per-PO packing-list date first; advice-level only as last resort
-                res = create_shipment(m["order_type"], m["order_nbr"], container_ref, eff, po=po)
+                res = create_shipment(m["order_type"], m["order_nbr"], container_ref, ship_date, po=po)
                 row["result"] = res
                 if res.get("created"): created += 1
+                log_orders.append({"po": po, "order": f"{m['order_type']} {m['order_nbr']}".strip(),
+                                    "shipment_nbr": res.get("shipment_nbr"), "created": res.get("created"),
+                                    "ship_date": res.get("ship_date"), "reason": res.get("reason") or res.get("error")})
             rows.append(row)
     summary = {"dachser_reference": parsed["dachser_reference"],
                "route": f'{parsed["pol"]} -> {parsed["pod"]}', "eta": parsed["eta"],
                "containers": containers, "po_count": len(parsed["po_numbers"]),
                "orders_matched": to_create, "created": created, "dry_run": dry_run, "rows": rows}
     if not dry_run:
-        log_run({"reference": parsed["dachser_reference"], "orders_matched": to_create,
-                 "created": created, "containers": container_ref, "user": user})
+        if to_create == 0:
+            status = "no_matches"
+        elif created == to_create:
+            status = "ok"
+        elif created > 0:
+            status = "partial"
+        else:
+            status = "failed"
+        log_run({"reference": parsed["dachser_reference"], "document": source_name or os.path.basename(path),
+                 "user": user, "status": status, "orders_matched": to_create, "created": created,
+                 "containers": container_ref, "ship_date": ship_date, "orders": log_orders})
     return summary
 
 # ---------------- diagnostics ----------------
@@ -535,7 +564,7 @@ HOME = """<div class=card>
 <p class=sub>Drop a Dachser handover-advice PDF. Preview the matched sales orders, then create shipments (left unconfirmed for a person to confirm in Acumatica).</p>
 <form id=f onsubmit="return false">
 <p><input type=file id=pdf accept="application/pdf"></p>
-<p style="max-width:340px"><label class=sub>Shipment date (optional &mdash; leave blank to use each PO&#39;s NRT pickup date)</label><input type=date id=sd></p>
+<p style="max-width:340px"><label class=sub>Shipment date (required &mdash; type the NRT pickup date)</label><input type=date id=sd required></p>
 <button class=fog onclick="go(true)">Preview</button>
 <button onclick="go(false)" id=create disabled>Create shipments</button>
 </form></div>
@@ -544,7 +573,9 @@ HOME = """<div class=card>
 let last=null;
 async function go(dry){
  const f=document.getElementById('pdf').files[0]; if(!f){alert('Choose a PDF');return;}
- const fd=new FormData(); fd.append('pdf',f); fd.append('dry',dry?'1':'0'); fd.append('sd',document.getElementById('sd').value);
+ const sdVal=document.getElementById('sd').value;
+ if(!dry && !sdVal){alert('Enter the Shipment date before creating shipments.');return;}
+ const fd=new FormData(); fd.append('pdf',f); fd.append('dry',dry?'1':'0'); fd.append('sd',sdVal);
  document.getElementById('out').innerHTML='<div class=card>Working...</div>';
  const r=await fetch('/process',{method:'POST',body:fd}); const d=await r.json(); render(d,dry);
 }
@@ -578,7 +609,7 @@ GUIDE = """<div class=card>
 <li><b>Connect as the shipments account.</b> Click <b>Switch account</b> (top) and sign in with the dedicated Acumatica login &mdash; not a personal one. The banner shows who&#39;s connected.</li>
 <li><b>Drop the handover advice.</b> On <b>Home</b>, choose the Dachser handover-advice PDF and click <b>Preview</b>.</li>
 <li><b>Review the matches.</b> The tool finds the open sales orders whose customer PO matches each PO on the advice, and shows them in a table.</li>
-<li><b>Create the shipments.</b> Click <b>Create shipments</b>. Each is created <b>unconfirmed</b> and dated to that PO&#39;s NRT pickup date.</li>
+<li><b>Type the Shipment date, then create.</b> Enter the NRT pickup date in <b>Shipment date</b> (required) and click <b>Create shipments</b>. Each is created <b>unconfirmed</b>, dated as typed.</li>
 <li><b>Confirm &amp; invoice in Acumatica.</b> A person confirms each shipment (this recognizes revenue), then creates and releases the invoice. <b>This tool never confirms</b> &mdash; that stays a human decision.</li>
 </ol>
 <p class=sub>If a line can&#39;t be created, the Result column explains why (e.g. nothing available to ship, order on hold). <a href=/history>History</a> lists past runs and who ran them.</p>
@@ -674,8 +705,31 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/guide":
             return self._send(200, page(GUIDE))
         if u.path == "/history":
-            rows = "".join(f"<tr><td>{h.get('ts','')}</td><td>{h.get('user','') or ''}</td><td>{h.get('reference','')}</td><td>{h.get('created','')}/{h.get('orders_matched','')}</td><td>{h.get('containers','')}</td></tr>" for h in history())
-            body = f'<div class=card><h1 style="font-size:16px">Run history</h1><table><tr><th>When</th><th>By</th><th>Reference</th><th>Created/Matched</th><th>Containers</th></tr>{rows}</table></div>'
+            _badge = {"ok": "#5a7d5a", "partial": "#b0653a", "failed": "#b06a5a", "no_matches": "#7d7363"}
+            def _hrow(h):
+                status = h.get("status") or ""
+                pill = f'<span class=pill style="border-color:{_badge.get(status, "#c9c0ad")}">{status or "&mdash;"}</span>'
+                orders = h.get("orders") or []
+                if orders:
+                    detail = "".join(
+                        "<div>%s &rarr; %s &mdash; %s</div>" % (
+                            o.get("po", ""), o.get("order") or "&mdash;",
+                            ("&#10003; " + (o.get("shipment_nbr") or "created")) if o.get("created")
+                            else ("&#9888; " + (o.get("reason") or "not created")))
+                        for o in orders)
+                    detail_cell = f"<details><summary>{len(orders)} order(s)</summary>{detail}</details>"
+                else:
+                    detail_cell = "&mdash;"
+                return (f"<tr><td>{h.get('ts','')}</td><td>{h.get('user','') or ''}</td>"
+                        f"<td>{h.get('document','') or ''}</td><td>{h.get('reference','')}</td>"
+                        f"<td>{pill}</td><td>{h.get('created','')}/{h.get('orders_matched','')}</td>"
+                        f"<td>{h.get('containers','')}</td><td>{detail_cell}</td></tr>")
+            rows = "".join(_hrow(h) for h in history())
+            body = ('<div class=card><h1 style="font-size:16px">Run history</h1>'
+                    '<p class=sub>Every shipment-creation run, kept permanently on the tool&#39;s disk (not just this session). '
+                    'Expand the last column for per-order/shipment detail.</p>'
+                    '<table><tr><th>When</th><th>By</th><th>Document</th><th>Reference</th><th>Status</th>'
+                    '<th>Created/Matched</th><th>Containers</th><th>Orders</th></tr>' + rows + '</table></div>')
             return self._send(200, page(body))
         return self._send(404, page("<div class=card>Not found</div>"))
 
@@ -709,15 +763,19 @@ class H(BaseHTTPRequestHandler):
             ln = int(self.headers.get("Content-Length", 0))
             fields = parse_multipart(self.rfile.read(ln), boundary)
             filedata = fields.get("pdf")
+            orig_name = fields.get("_fn_pdf") or None
             dry = (fields.get("dry") or "1") == "1"
             sd = (fields.get("sd") or "") or None
             if not filedata:
                 return self._send(400, json.dumps({"error": "no file"}), "application/json")
+            # Hard stop before we even write the temp file: no typed ship date, no creation.
+            if not dry and not sd:
+                return self._send(200, json.dumps({"error": "Shipment date is required. Enter the NRT pickup date before creating shipments."}), "application/json")
             tmp = os.path.join(TOKEN_DIR, "_ship_upload_%s.pdf" % secrets.token_hex(8))
             with open(tmp, "wb") as f:
                 f.write(filedata if isinstance(filedata, bytes) else filedata.encode())
             try:
-                out = process_file(tmp, dry_run=dry, ship_date=sd, user=session_user(self._cookie()))
+                out = process_file(tmp, dry_run=dry, ship_date=sd, user=session_user(self._cookie()), source_name=orig_name)
                 return self._send(200, json.dumps(out), "application/json")
             except Exception as e:
                 return self._send(200, json.dumps({"error": str(e)}), "application/json")
