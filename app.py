@@ -9,8 +9,15 @@ Acumatica, since confirming triggers invoicing / revenue recognition.
 Mirrors the PO-Receipts tool: OAuth (Auth Code + PKCE), preview -> confirm,
 read-back verification, reconciliation certificate, run-history log. Runs on
 Render (always-on) alongside the receipts tool. Config via env vars.
+
+Most containers on a real advice do NOT list PO#s in the text (often only one
+container out of many does) -- see containers_to_pos(). Each container's POs
+are resolved via Acumatica PO Receipts: container -> PurchaseReceipt -> Sand+Fog's
+internal PO# -> that PO's VendorRef (where the retail PO text lives) -> match
+against Sales Orders. Optional env overrides: RECEIPT_CONTAINER_FIELD /
+RECEIPT_CONTAINER_VIEW (skip auto-discovery), RECEIPT_LOOKBACK_DAYS (default 180).
 """
-import os, re, json, time, base64, hashlib, hmac, secrets
+import os, re, json, time, base64, hashlib, hmac, secrets, datetime
 import urllib.parse, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -207,32 +214,47 @@ _SKIP_MARK = ("CUBE", "STANDARD", "REEFER", "HIGH", "N/M", "CONTAINER", "40'", "
 
 def parse_handover(path):
     if pdfplumber is None: raise RuntimeError("pdfplumber not installed")
-    ref = None; ports = []; dates = []; containers = {}; pos = []
+    # NOTE: most containers on a real advice do NOT list PO#s in Description of
+    # Goods -- often only one container out of many does (confirmed against a
+    # real 10-container advice). `po_numbers` below is best-effort text parsing
+    # and is known-incomplete; process_file() fills the gap by resolving each
+    # container's POs via Acumatica PO Receipts (see containers_to_pos()).
+    ref = None; ports = []; dates = []; containers = {}; pos = []; text_pos_by_container = {}
     with pdfplumber.open(path) as pdf:
         full = ""
         for pg in pdf.pages:
             full += (pg.extract_text() or "") + "\n"
+            # Column mapping for the current "Container No / Marks / Description of
+            # Goods" block on this page. Scanned per ROW (not per-table t[0] only):
+            # pdfplumber sometimes merges a container's header+data into the same
+            # table object as a leftover "Pieces/SLAC" row from the *previous*
+            # container (different column count), which shifts the real header
+            # off row 0 and silently drops that container if we only look at t[0].
+            ci = mi = di = None
             for t in pg.extract_tables():
-                if not t or not t[0]: continue
-                hdr = t[0]
-                if any((c or "") == "Container No" for c in hdr) and any((c or "") == "Marks" for c in hdr):
-                    ci = [i for i, c in enumerate(hdr) if (c or "") == "Container No"][0]
-                    mi = [i for i, c in enumerate(hdr) if (c or "") == "Marks"][0]
-                    dd = [i for i, c in enumerate(hdr) if (c or "") == "Description of Goods"]
-                    di = dd[0] if dd else None
-                    for row in t[1:]:
-                        cont = (row[ci].strip() if ci < len(row) and row[ci] else "")
-                        if not re.match(r"^[A-Z]{4}\d{7}$", cont): continue
-                        containers.setdefault(cont, None)
-                        if mi < len(row) and row[mi]:
-                            for ln in row[mi].split("\n"):
-                                s = ln.strip().rstrip(",").strip()
-                                if not s or any(k in s.upper() for k in _SKIP_MARK): continue
-                                if re.match(r"^[A-Za-z]{0,3}\d{5,9}$", s) and s not in pos: pos.append(s)
-                        if di is not None and di < len(row) and row[di] and "PO#" in row[di]:
-                            for blk in re.findall(r"PO#\s*(.*?)(?:Q'ty|HS code|In Gate|Total NW|$)", row[di], re.DOTALL):
-                                for n in re.findall(r"\b(\d{6})\b", blk):
-                                    if n not in pos: pos.append(n)
+                if not t: continue
+                for row in t:
+                    if any((c or "") == "Container No" for c in row) and any((c or "") == "Marks" for c in row):
+                        ci = [i for i, c in enumerate(row) if (c or "") == "Container No"][0]
+                        mi = [i for i, c in enumerate(row) if (c or "") == "Marks"][0]
+                        dd = [i for i, c in enumerate(row) if (c or "") == "Description of Goods"]
+                        di = dd[0] if dd else None
+                        continue  # header row itself, not a data row
+                    if ci is None: continue
+                    cont = (row[ci].strip() if ci < len(row) and row[ci] else "")
+                    if not re.match(r"^[A-Z]{4}\d{7}$", cont): continue
+                    containers.setdefault(cont, None)
+                    if mi is not None and mi < len(row) and row[mi]:
+                        for ln in row[mi].split("\n"):
+                            s = ln.strip().rstrip(",").strip()
+                            if not s or any(k in s.upper() for k in _SKIP_MARK): continue
+                            if re.match(r"^[A-Za-z]{0,3}\d{5,9}$", s) and s not in pos: pos.append(s)
+                    if di is not None and di < len(row) and row[di] and "PO#" in row[di]:
+                        for blk in re.findall(r"PO#\s*(.*?)(?:Q'ty|HS code|In Gate|Total NW|$)", row[di], re.DOTALL):
+                            for n in re.findall(r"\b(\d{6})\b", blk):
+                                if n not in pos: pos.append(n)
+                                cset = text_pos_by_container.setdefault(cont, [])
+                                if n not in cset: cset.append(n)
         for c, p, w in re.findall(r"\b([A-Z]{4}\d{7})\b\s+\d+\s+([\d,]+)\s+([\d,\.]+)", full):
             containers.setdefault(c, None); containers[c] = int(p.replace(",", ""))
         m = re.search(r"\b(\d{11})\b", full); ref = m.group(1) if m else None
@@ -242,8 +264,128 @@ def parse_handover(path):
             if d not in dates: dates.append(d)
     return {"dachser_reference": ref, "pol": ports[0] if ports else None,
             "pod": ports[1] if len(ports) > 1 else None, "eta": dates[-1] if dates else None,
-            "containers": [{"container": c, "pieces": containers[c]} for c in containers],
+            "containers": [{"container": c, "pieces": containers[c],
+                             "po_numbers_text": text_pos_by_container.get(c, [])} for c in containers],
             "po_numbers": pos}
+
+# ---------------- container -> PO resolution (Acumatica PO Receipts) ----------------
+# The advice text only lists PO#s for a container "sometimes" (see the note in
+# parse_handover). The reliable source is Acumatica: the PO-receipts tool tags
+# each PurchaseReceipt with the container number, and each receipt line carries
+# Sand+Fog's own internal PO# (POOrderNbr). That internal PO's VendorRef field
+# is where the retail PO text ("MS 117256", "TJX 117261") actually lives -- it's
+# the same field the PO-receipts tool itself searches when matching a packing
+# list to a PO. So: container -> PurchaseReceipt -> internal PO# -> VendorRef ->
+# extract retail PO digits -> match against Sales Orders exactly as before.
+#
+# Server-side filtering on the container custom field is deliberately avoided --
+# unproven on this tenant (see the substringof-500 note for SalesOrder). Instead
+# this fetches a bounded, date-limited set of receipts using only proven
+# standard-field filters, then matches container/PO values client-side.
+_RCPT_CONTAINER_FIELD = {"field": None, "view": None, "checked": False}
+_RECEIPTS_CACHE = {"rows": None, "ts": 0}
+RECEIPTS_TTL = 600  # 10 min, same as the open-orders cache
+RECEIPT_LOOKBACK_DAYS = int(cfg("RECEIPT_LOOKBACK_DAYS", "180"))
+
+def _fetch_all_pages(path, page_size=500, max_pages=10):
+    """GET with $top/$skip paging, capped at max_pages as a safety limit."""
+    rows = []
+    sep = "&" if "?" in path else "?"
+    for page in range(max_pages):
+        q = f"{path}{sep}$top={page_size}&$skip={page * page_size}"
+        st, data = api("GET", q)
+        if st != 200 or not isinstance(data, list):
+            break
+        rows.extend(data)
+        if len(data) < page_size:
+            break
+    return rows
+
+def discover_receipt_container_field():
+    """Find the container-number custom/UDF field on PurchaseReceipt -- the
+    PO-receipts tool writes this same field (mirrors its own discovery logic)."""
+    if _RCPT_CONTAINER_FIELD["checked"]:
+        return _RCPT_CONTAINER_FIELD["field"], _RCPT_CONTAINER_FIELD["view"]
+    _RCPT_CONTAINER_FIELD["checked"] = True  # only ever hit the schema endpoint once per process
+    env_f = cfg("RECEIPT_CONTAINER_FIELD")
+    if env_f:
+        _RCPT_CONTAINER_FIELD.update(field=env_f, view=cfg("RECEIPT_CONTAINER_VIEW", "Document"))
+        return _RCPT_CONTAINER_FIELD["field"], _RCPT_CONTAINER_FIELD["view"]
+    st, data = api("GET", f"{ENTITY}/PurchaseReceipt/$adHocSchema")
+    if st == 200 and isinstance(data, dict):
+        for view, fields in (data.get("custom") or {}).items():
+            for fname, meta in fields.items():
+                label = ((meta or {}).get("displayName") or "") + " " + fname
+                if re.search(r"contain|ctnr|cont(\.|\s)*no", label, re.I) and not re.search(r"\beta\b|arriv|estimat", label, re.I):
+                    _RCPT_CONTAINER_FIELD.update(field=fname, view=view)
+                    return fname, view
+    return None, None
+
+def load_recent_receipts(force=False):
+    """Fetch recent PurchaseReceipts (bounded to RECEIPT_LOOKBACK_DAYS) with the
+    container UDF and each line's internal PO# expanded. Cached briefly."""
+    now = time.time()
+    if not force and _RECEIPTS_CACHE["rows"] is not None and now - _RECEIPTS_CACHE["ts"] < RECEIPTS_TTL:
+        return _RECEIPTS_CACHE["rows"]
+    field, view = discover_receipt_container_field()
+    if not field:
+        return []
+    cutoff = (datetime.date.today() - datetime.timedelta(days=RECEIPT_LOOKBACK_DAYS)).isoformat()
+    path = (f"{ENTITY}/PurchaseReceipt?$filter=Date ge datetimevalue'{cutoff}'"
+            f"&$select=ReceiptNbr,Date,{view}.{field},Details/POOrderNbr&$expand=Details")
+    data = _fetch_all_pages(path, page_size=500, max_pages=6)
+    rows = []
+    for r in data:
+        cont = ((r.get("custom") or {}).get(view, {}).get(field) or {}).get("value")
+        if not cont:
+            continue
+        internal_pos = sorted({(d.get("POOrderNbr") or {}).get("value") for d in (r.get("Details") or [])
+                                if (d.get("POOrderNbr") or {}).get("value")})
+        if internal_pos:
+            rows.append({"container": cont.strip().upper(),
+                         "receipt_nbr": (r.get("ReceiptNbr") or {}).get("value"), "internal_pos": internal_pos})
+    _RECEIPTS_CACHE.update(rows=rows, ts=now)
+    return rows
+
+def load_po_vendor_refs(order_nbrs):
+    """Given Sand+Fog's internal PO numbers, fetch their VendorRef values from
+    Acumatica's PurchaseOrder entity -- equality filters only, batched into
+    OR-chains (substringof is avoided; see the SalesOrder 500 note)."""
+    order_nbrs = sorted({n for n in order_nbrs if n})
+    out = {}
+    for i in range(0, len(order_nbrs), 25):
+        chunk = order_nbrs[i:i + 25]
+        flt = " or ".join("OrderNbr eq '%s'" % n.replace("'", "''") for n in chunk)
+        q = f"{ENTITY}/PurchaseOrder?$filter=({flt})&$select=OrderNbr,VendorRef"
+        st, data = api("GET", q)
+        if st == 200 and isinstance(data, list):
+            for po in data:
+                nbr = (po.get("OrderNbr") or {}).get("value")
+                ref = (po.get("VendorRef") or {}).get("value")
+                if nbr:
+                    out[nbr] = ref or ""
+    return out
+
+def containers_to_pos(containers):
+    """Resolve each advice container to the retail PO#s inside it via Acumatica
+    (container -> PO Receipt -> internal PO# -> VendorRef -> retail PO digits).
+    Returns {container: [po, ...]}; an empty list means the chain didn't resolve
+    (no receipt yet, or no VendorRef match) -- callers should flag these rather
+    than silently drop them."""
+    containers = [c.strip().upper() for c in containers if c]
+    if not containers:
+        return {}
+    receipts = load_recent_receipts()
+    all_internal_pos = {p for r in receipts for p in r["internal_pos"]}
+    vendor_refs = load_po_vendor_refs(all_internal_pos)
+    by_container = {}
+    for r in receipts:
+        pos = by_container.setdefault(r["container"], set())
+        for internal_po in r["internal_pos"]:
+            ref = vendor_refs.get(internal_po, "")
+            for n in re.findall(r"\b(\d{6})\b", ref):
+                pos.add(n)
+    return {c: sorted(by_container.get(c, [])) for c in containers}
 
 # ---------------- matching ----------------
 _OPEN_ORDERS = {"rows": None, "ts": 0}
@@ -363,9 +505,22 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
     parsed = parse_handover(path)
     containers = [c["container"] for c in parsed["containers"]]
     container_ref = ", ".join(containers)
-    matched = find_sales_orders_batch(parsed["po_numbers"])
+
+    # Most containers don't list PO#s in the advice text (see parse_handover) --
+    # resolve the gap via Acumatica PO Receipts, and merge with whatever the
+    # advice text did give us (belt-and-suspenders; text PO#s still count).
+    text_pos_by_container = {c["container"]: (c.get("po_numbers_text") or []) for c in parsed["containers"]}
+    receipt_pos_by_container = containers_to_pos(containers)
+    all_pos = list(parsed["po_numbers"])
+    for c in containers:
+        for p in receipt_pos_by_container.get(c, []):
+            if p not in all_pos: all_pos.append(p)
+    unresolved_containers = [c for c in containers
+                              if not receipt_pos_by_container.get(c) and not text_pos_by_container.get(c)]
+
+    matched = find_sales_orders_batch(all_pos)
     rows = []; log_orders = []; to_create = 0; created = 0
-    for po in parsed["po_numbers"]:
+    for po in all_pos:
         matches = matched.get(po, [])
         if not matches:
             rows.append({"po": po, "confidence": "flag", "note": "no open sales order", "orders": []})
@@ -386,7 +541,8 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
             rows.append(row)
     summary = {"dachser_reference": parsed["dachser_reference"],
                "route": f'{parsed["pol"]} -> {parsed["pod"]}', "eta": parsed["eta"],
-               "containers": containers, "po_count": len(parsed["po_numbers"]),
+               "containers": containers, "po_count": len(all_pos),
+               "unresolved_containers": unresolved_containers,
                "orders_matched": to_create, "created": created, "dry_run": dry_run, "rows": rows}
     if not dry_run:
         if to_create == 0:
@@ -399,7 +555,8 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
             status = "failed"
         log_run({"reference": parsed["dachser_reference"], "document": source_name or os.path.basename(path),
                  "user": user, "status": status, "orders_matched": to_create, "created": created,
-                 "containers": container_ref, "ship_date": ship_date, "orders": log_orders})
+                 "containers": container_ref, "unresolved_containers": unresolved_containers,
+                 "ship_date": ship_date, "orders": log_orders})
     return summary
 
 # ---------------- diagnostics ----------------
@@ -458,7 +615,7 @@ def so_pipeline(po):
     is already fully processed ('Done')."""
     return [_order_pipeline(m, po) for m in find_sales_orders_batch([po]).get(po, [])]
 
-def diagnostics(sample_po=None):
+def diagnostics(sample_po=None, sample_container=None):
     out = {"connected": bool(access_token()), "tenant": CFG["tenant"],
            "container_field": CFG["container_field"] or "(not set)", "warehouse": CFG["warehouse"] or "(SO default)"}
     if not out["connected"]: return out
@@ -496,6 +653,17 @@ def diagnostics(sample_po=None):
         out["container_field_candidates"] = cands
     else:
         out["schema_status"] = st
+    # PO Receipt -> internal PO -> VendorRef chain (see containers_to_pos()).
+    rc_field, rc_view = discover_receipt_container_field()
+    out["receipt_container_field"] = f"{rc_view}.{rc_field}" if rc_field else "(not found)"
+    if sample_container:
+        sc = sample_container.strip().upper()
+        receipts = [r for r in load_recent_receipts() if r["container"] == sc]
+        out["sample_container"] = sc
+        out["sample_container_receipts"] = receipts
+        internal_pos = {p for r in receipts for p in r["internal_pos"]}
+        out["sample_container_vendor_refs"] = load_po_vendor_refs(internal_pos)
+        out["sample_container_resolved_pos"] = containers_to_pos([sc]).get(sc, [])
     return out
 
 # ================= Web UI =================
@@ -583,8 +751,11 @@ function render(d,dry){
  if(d.error){document.getElementById('out').innerHTML='<div class=card>Error: '+d.error+'</div>';return;}
  let h='<div class=card><h1 style="font-size:16px">'+(dry?'Preview':'Result')+' &mdash; ref '+(d.dachser_reference||'?')+'</h1>';
  h+='<p class=sub>'+d.route+' &nbsp; ETA '+(d.eta||'?')+'</p>';
- h+='<p>'+d.containers.map(c=>'<span class=pill>'+c+'</span>').join('')+'</p>';
- h+='<p class=sub>'+d.po_count+' PO#s parsed &middot; '+d.orders_matched+' open sales orders matched'+(dry?'':' &middot; '+d.created+' shipments created')+'</p>';
+ h+='<p>'+d.containers.map(c=>'<span class=pill'+((d.unresolved_containers||[]).includes(c)?' style="border-color:#b06a5a;color:#b06a5a"':'')+'>'+c+'</span>').join('')+'</p>';
+ if((d.unresolved_containers||[]).length){
+   h+='<p class=sub style="color:#b06a5a">&#9888; No PO could be found for '+d.unresolved_containers.length+' container(s) ('+d.unresolved_containers.join(', ')+') -- checked both the advice text and PO Receipts. Verify manually (e.g. against the packing list) before assuming this handover is fully covered.</p>';
+ }
+ h+='<p class=sub>'+d.po_count+' PO#s found (advice text + PO Receipts) &middot; '+d.orders_matched+' open sales orders matched'+(dry?'':' &middot; '+d.created+' shipments created')+'</p>';
  h+='<table><tr><th></th><th>PO#</th><th>Sales order</th><th>Customer</th><th>Result</th></tr>';
  for(const row of d.rows){
    const dot='<span class="dot '+(row.confidence=='ok'?'ok':'flag')+'"></span>';
@@ -608,7 +779,7 @@ GUIDE = """<div class=card>
 <ol style="line-height:1.75;font-size:14px;padding-left:20px">
 <li><b>Connect as the shipments account.</b> Click <b>Switch account</b> (top) and sign in with the dedicated Acumatica login &mdash; not a personal one. The banner shows who&#39;s connected.</li>
 <li><b>Drop the handover advice.</b> On <b>Home</b>, choose the Dachser handover-advice PDF and click <b>Preview</b>.</li>
-<li><b>Review the matches.</b> The tool finds the open sales orders whose customer PO matches each PO on the advice, and shows them in a table.</li>
+<li><b>Review the matches.</b> Most containers don&#39;t list PO#s in the advice text itself, so the tool also resolves each container&#39;s POs via Acumatica PO Receipts (container &rarr; receipt &rarr; internal PO &rarr; VendorRef &rarr; retail PO#). If a container can&#39;t be resolved either way, it&#39;s flagged in red &mdash; check it manually (e.g. against the packing list) before creating.</li>
 <li><b>Type the Shipment date, then create.</b> Enter the NRT pickup date in <b>Shipment date</b> (required) and click <b>Create shipments</b>. Each is created <b>unconfirmed</b>, dated as typed.</li>
 <li><b>Confirm &amp; invoice in Acumatica.</b> A person confirms each shipment (this recognizes revenue), then creates and releases the invoice. <b>This tool never confirms</b> &mdash; that stays a human decision.</li>
 </ol>
@@ -697,9 +868,11 @@ class H(BaseHTTPRequestHandler):
             self.send_response(302); self.send_header("Location", build_authorize_url()); self.end_headers(); return
         if u.path == "/diag":
             qs = urllib.parse.parse_qs(u.query)
-            d = diagnostics(qs.get("po", [None])[0])
+            d = diagnostics(qs.get("po", [None])[0], qs.get("container", [None])[0])
             body = ('<div class=card><h1 style="font-size:16px">Diagnostics</h1>'
-                    '<form method=get action=/diag><p style="max-width:260px"><input type=text name=po placeholder="test a PO# e.g. 117256"></p>'
+                    '<form method=get action=/diag>'
+                    '<p style="max-width:260px"><input type=text name=po placeholder="test a PO# e.g. 117256"></p>'
+                    '<p style="max-width:260px"><input type=text name=container placeholder="test a container e.g. FBIU5261330"></p>'
                     '<button class=fog>Run</button></form><pre>' + json.dumps(d, indent=2) + "</pre></div>")
             return self._send(200, page(body))
         if u.path == "/guide":
@@ -720,10 +893,14 @@ class H(BaseHTTPRequestHandler):
                     detail_cell = f"<details><summary>{len(orders)} order(s)</summary>{detail}</details>"
                 else:
                     detail_cell = "&mdash;"
+                unresolved = h.get("unresolved_containers") or []
+                cont_cell = h.get("containers", "")
+                if unresolved:
+                    cont_cell += f' <span class=pill style="border-color:#b06a5a;color:#b06a5a">&#9888; unresolved: {", ".join(unresolved)}</span>'
                 return (f"<tr><td>{h.get('ts','')}</td><td>{h.get('user','') or ''}</td>"
                         f"<td>{h.get('document','') or ''}</td><td>{h.get('reference','')}</td>"
                         f"<td>{pill}</td><td>{h.get('created','')}/{h.get('orders_matched','')}</td>"
-                        f"<td>{h.get('containers','')}</td><td>{detail_cell}</td></tr>")
+                        f"<td>{cont_cell}</td><td>{detail_cell}</td></tr>")
             rows = "".join(_hrow(h) for h in history())
             body = ('<div class=card><h1 style="font-size:16px">Run history</h1>'
                     '<p class=sub>Every shipment-creation run, kept permanently on the tool&#39;s disk (not just this session). '
