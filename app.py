@@ -62,9 +62,11 @@ PKCE_PATH = os.path.join(TOKEN_DIR, "ship_pkce.json")
 RUNS_PATH = os.path.join(TOKEN_DIR, "ship_runs.jsonl")
 SHIPDATES_PATH = os.path.join(TOKEN_DIR, "po_shipdates.json")  # {po: 'YYYY-MM-DD'} NRT pickup dates, pushed by the daily sync
 CONTAINERDATES_PATH = os.path.join(TOKEN_DIR, "container_dates.json")  # {container: 'YYYY-MM-DD'} NRT pickup (email) dates, pushed by the daily sync
+WATCHLIST_PATH = os.path.join(TOKEN_DIR, "maersk_watchlist.json")  # {container: {pos, port_of_loading, receipt_no, vessel, status, date_added, ...}}
+WATCHLIST_SLA_DAYS = int(cfg("WATCHLIST_SLA_DAYS", "45"))  # containers watching longer than this without a Load-on event are flagged, not silently left open
 AUTOSHIP_TOKEN = cfg("AUTOSHIP_TOKEN", "")  # separate, write-capable token for /autoship -- keep distinct from STATUS_TOKEN (read-only)
 FCR_TOKEN = cfg("FCR_TOKEN", "") or AUTOSHIP_TOKEN  # token for /parsefcr (read-only parse, no Acumatica writes); falls back to AUTOSHIP_TOKEN if not set separately
-MAERSK_TOKEN = cfg("MAERSK_TOKEN", "") or FCR_TOKEN  # token for /checkmaersk (read-only, no Acumatica calls -- just fetches Maersk's public tracking page)
+MAERSK_TOKEN = cfg("MAERSK_TOKEN", "") or FCR_TOKEN  # token for /checkmaersk and the watch-list endpoints (no Acumatica writes -- /autoship is the only endpoint that creates real records)
 REDIRECT_URI = CFG["public_url"] + "/callback"
 COOKIE_SECRET = (CFG["app_password"] or "dev").encode() + b"::ship"
 SESSIONS = {}
@@ -99,6 +101,67 @@ def load_json(path):
     try:
         with open(path) as f: return json.load(f)
     except Exception: return None
+
+# ---------------- Maersk watch-list (state store for the local checker script) ----------------
+# Render can't reliably reach maersk.com itself (Akamai blocks the cloud/datacenter IP range
+# it deploys from -- confirmed live: browser launches fine, page load times out). So the
+# actual page-check runs from a local script on a normal network instead; this app just
+# holds the shared state (what's being watched, what's resolved) the same way it already
+# holds po_shipdates.json/container_dates.json, so everything stays centrally auditable.
+def watchlist_add(container, pos=None, port_of_loading=None, receipt_no=None, vessel=None, source=None):
+    """Idempotent -- re-adding an already-watched container updates its fields (e.g. a
+    corrected FCR re-send) rather than creating a duplicate entry."""
+    container = (container or "").strip().upper()
+    if not container:
+        return None
+    wl = load_json(WATCHLIST_PATH) or {}
+    existing = wl.get(container, {})
+    entry = {
+        "pos": pos if pos is not None else existing.get("pos", []),
+        "port_of_loading": port_of_loading or existing.get("port_of_loading"),
+        "receipt_no": receipt_no or existing.get("receipt_no"),
+        "vessel": vessel or existing.get("vessel"),
+        "source": source or existing.get("source"),
+        "status": existing.get("status", "watching"),
+        "date_added": existing.get("date_added", datetime.datetime.now(datetime.timezone.utc).isoformat()),
+    }
+    wl[container] = entry
+    save_json(WATCHLIST_PATH, wl)
+    return entry
+
+def watchlist_resolve(container, status, note=None, ship_date=None):
+    container = (container or "").strip().upper()
+    wl = load_json(WATCHLIST_PATH) or {}
+    if container not in wl:
+        return None
+    wl[container]["status"] = status
+    wl[container]["resolved_date"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if note: wl[container]["note"] = note
+    if ship_date: wl[container]["ship_date"] = ship_date
+    save_json(WATCHLIST_PATH, wl)
+    return wl[container]
+
+def watchlist_check_sla():
+    """Flip 'watching' entries past WATCHLIST_SLA_DAYS to 'alert' in place -- a container
+    that never shows a Load-on event shouldn't just sit silent forever. Runs on every
+    /watchlist/list call so the local checker always sees current status, no separate cron."""
+    wl = load_json(WATCHLIST_PATH) or {}
+    now = datetime.datetime.now(datetime.timezone.utc)
+    changed = False
+    for container, entry in wl.items():
+        if entry.get("status") != "watching":
+            continue
+        try:
+            added = datetime.datetime.fromisoformat(entry["date_added"])
+        except Exception:
+            continue
+        if (now - added).days > WATCHLIST_SLA_DAYS:
+            entry["status"] = "alert"
+            entry["alert_reason"] = f"no Load-on event found after {WATCHLIST_SLA_DAYS} days"
+            changed = True
+    if changed:
+        save_json(WATCHLIST_PATH, wl)
+    return wl
 
 def parse_multipart(body, boundary):
     """Minimal multipart/form-data parser (replaces the removed stdlib `cgi`).
@@ -1053,6 +1116,20 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(out), "application/json")
             except Exception as e:
                 return self._send(200, json.dumps({"error": str(e)}), "application/json")
+        if u.path == "/watchlist/list":
+            # Read for the local Maersk-checker script. Runs the SLA sweep on every call so
+            # a container that's been watching too long shows up as "alert" without a
+            # separate scheduled job.
+            qs = urllib.parse.parse_qs(u.query)
+            want = MAERSK_TOKEN
+            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            if not (token_ok or self._authed()):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            wl = watchlist_check_sla()
+            status_filter = qs.get("status", [""])[0].strip()
+            if status_filter:
+                wl = {c: e for c, e in wl.items() if e.get("status") == status_filter}
+            return self._send(200, json.dumps(wl), "application/json")
         if u.path == "/setshipdates":
             # Daily sync pushes each PO's NRT pickup date here (chunked GET). Merges into
             # po_shipdates.json; pass reset=1 on the first chunk to clear stale entries.
@@ -1160,6 +1237,47 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(out), "application/json")
             except Exception as e:
                 return self._send(200, json.dumps({"error": str(e)}), "application/json")
+        if u.path == "/watchlist/add":
+            # Called by the FCR-intake Power Automate flow after /parsefcr. No Acumatica
+            # calls here -- just records what to watch for.
+            want = MAERSK_TOKEN
+            got = (self.headers.get("Authorization", "") or "").removeprefix("Bearer ").strip()
+            if not (want and hmac.compare_digest(got.encode(), want.encode())):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            ln = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(ln).decode() or "{}")
+            except Exception:
+                return self._send(400, json.dumps({"error": "invalid JSON body"}), "application/json")
+            container = body.get("container")
+            if not container:
+                return self._send(400, json.dumps({"error": "container is required"}), "application/json")
+            entry = watchlist_add(container, pos=body.get("pos"), port_of_loading=body.get("port_of_loading"),
+                                   receipt_no=body.get("receipt_no"), vessel=body.get("vessel"),
+                                   source=body.get("source"))
+            return self._send(200, json.dumps({"container": container.strip().upper(), "entry": entry}), "application/json")
+        if u.path == "/watchlist/resolve":
+            # Called by the local Maersk-checker script once it finds the anchored Load-on
+            # event (status="resolved") or a container sits unresolved past a manual review
+            # decision (status="alert" is normally set automatically by the SLA sweep, but
+            # this lets a person clear/override it too).
+            want = MAERSK_TOKEN
+            got = (self.headers.get("Authorization", "") or "").removeprefix("Bearer ").strip()
+            if not (want and hmac.compare_digest(got.encode(), want.encode())):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            ln = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(ln).decode() or "{}")
+            except Exception:
+                return self._send(400, json.dumps({"error": "invalid JSON body"}), "application/json")
+            container = body.get("container")
+            status = body.get("status")
+            if not container or not status:
+                return self._send(400, json.dumps({"error": "container and status are required"}), "application/json")
+            entry = watchlist_resolve(container, status, note=body.get("note"), ship_date=body.get("ship_date"))
+            if entry is None:
+                return self._send(404, json.dumps({"error": "container not on watch-list"}), "application/json")
+            return self._send(200, json.dumps({"container": container.strip().upper(), "entry": entry}), "application/json")
         if u.path == "/parsefcr":
             # Token-authenticated, read-only: parses an FCR PDF and returns container#/PO#s/
             # Port of Loading. No Acumatica calls here -- the caller (Power Automate) feeds
