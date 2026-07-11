@@ -22,6 +22,10 @@ services:
         sync: false
       - key: SHIP_CONTAINER_FIELD # optional: shipment container UDF (from Diagnostics)
         sync: false
+      - key: AUTOSHIP_TOKEN       # write-capable bearer token for /autoship (NRT + Maersk/FCR automation) -- keep separate from any read-only token
+        sync: false
+      - key: FCR_TOKEN            # bearer token for /parsefcr (read-only PDF parse, no Acumatica writes); falls back to AUTOSHIP_TOKEN if unset
+        sync: false
       - key: TOKEN_DIR
         value: /var/data
     disk:
