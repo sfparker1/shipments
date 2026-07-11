@@ -3,7 +3,15 @@ services:
     name: handover-shipments
     runtime: python
     plan: starter            # always-on, so the OAuth flow never cold-starts mid-login
-    buildCommand: pip install -r requirements.txt && python -m playwright install --with-deps chromium
+    # NOTE: no --with-deps here -- that flag needs apt/root access to install OS-level
+    # shared libraries, which Render's native Python build environment doesn't grant (it
+    # tried `su` and got an authentication failure on first attempt). This installs just
+    # the browser binary; if /checkmaersk fails at RUNTIME (not build time) with a missing
+    # shared-library error, this environment can't satisfy Playwright's system deps and the
+    # next step is switching this service to a Docker deploy using Microsoft's official
+    # Playwright image (mcr.microsoft.com/playwright/python), which ships everything
+    # preinstalled -- a bigger change, don't attempt until this simpler option is ruled out.
+    buildCommand: pip install -r requirements.txt && python -m playwright install chromium
     startCommand: python app.py
     envVars:
       - key: ACU_BASE_URL
