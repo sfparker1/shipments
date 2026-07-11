@@ -1,1 +1,2 @@
 pdfplumber>=0.11
+playwright>=1.48

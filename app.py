@@ -26,6 +26,11 @@ try:
 except ImportError:
     pdfplumber = None
 
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    sync_playwright = None
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------- Config ----------------
@@ -59,6 +64,7 @@ SHIPDATES_PATH = os.path.join(TOKEN_DIR, "po_shipdates.json")  # {po: 'YYYY-MM-D
 CONTAINERDATES_PATH = os.path.join(TOKEN_DIR, "container_dates.json")  # {container: 'YYYY-MM-DD'} NRT pickup (email) dates, pushed by the daily sync
 AUTOSHIP_TOKEN = cfg("AUTOSHIP_TOKEN", "")  # separate, write-capable token for /autoship -- keep distinct from STATUS_TOKEN (read-only)
 FCR_TOKEN = cfg("FCR_TOKEN", "") or AUTOSHIP_TOKEN  # token for /parsefcr (read-only parse, no Acumatica writes); falls back to AUTOSHIP_TOKEN if not set separately
+MAERSK_TOKEN = cfg("MAERSK_TOKEN", "") or FCR_TOKEN  # token for /checkmaersk (read-only, no Acumatica calls -- just fetches Maersk's public tracking page)
 REDIRECT_URI = CFG["public_url"] + "/callback"
 COOKIE_SECRET = (CFG["app_password"] or "dev").encode() + b"::ship"
 SESSIONS = {}
@@ -680,6 +686,83 @@ def parse_fcr(path):
     return {"receipt_no": receipt_no, "container": container, "port_of_loading": port_of_loading,
             "vessel": vessel, "pos": pos}
 
+# ---------------- Maersk tracking check (origin Load-on-vessel event) ----------------
+# No login needed for maersk.com/tracking/{container} (confirmed live) -- but its backing
+# JSON API (api.maersk.com/synergy/tracking/...) is Akamai-protected even from the page's
+# own JS, so this drives a real headless page load and reads the rendered text, same as a
+# person would, rather than trying to call that API directly.
+_MAERSK_DATE_RE = re.compile(r'^\d{1,2} [A-Za-z]{3}\.?,? \d{4} \d{2}:\d{2}$')
+_MAERSK_LOAD_ON_RE = re.compile(r'^Load on\b', re.I)
+
+def parse_maersk_timeline(text):
+    """Ordered [(location, event_desc, date_str), ...] from the tracking page's rendered
+    text. Structure (confirmed against a real multi-leg container MNBU3690916): a location
+    line, a facility-name line, then repeating (event, date) line pairs until the next
+    location. State machine, not per-line dead-reckoning: whenever the line after the
+    "current" one fails to look like a date, that current line is actually the start of a
+    new location block, not an event with a missing date."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    for idx, l in enumerate(lines):
+        if l.lower().startswith("note: all times are given"):
+            lines = lines[idx + 1:]
+            break
+    events = []
+    i, n = 0, len(lines)
+    location = None
+    expect = "location"
+    while i < n:
+        line = lines[i]
+        if expect == "location":
+            location = line
+            i += 1
+            if i < n:
+                i += 1  # facility name line, not needed
+            expect = "event"
+            continue
+        if i + 1 < n and _MAERSK_DATE_RE.match(lines[i + 1]):
+            events.append((location, line, lines[i + 1]))
+            i += 2
+        else:
+            expect = "location"
+    return events
+
+def _maersk_iso_date(s):
+    return datetime.datetime.strptime(s, "%d %b %Y %H:%M").strftime("%Y-%m-%d")
+
+def find_origin_load_on(text, port_of_loading):
+    """The correct revenue-recognition anchor for these accounts: the "Load on [vessel]"
+    event at the location matching the FCR's Port of Loading -- NOT the first Load-on event
+    overall, since transshipping containers show a second, later one at the hub port that
+    must be ignored. Returns None if that container hasn't shown this event yet (keep
+    watching) -- distinguish from a parse failure by checking the caller's own error field."""
+    port = (port_of_loading or "").strip().upper()
+    if not port:
+        return None
+    for location, desc, date_str in parse_maersk_timeline(text):
+        if port in location.upper() and _MAERSK_LOAD_ON_RE.match(desc):
+            return {"matched_location": location, "event": desc, "date": _maersk_iso_date(date_str)}
+    return None
+
+def check_maersk_container(container, port_of_loading, timeout_ms=20000):
+    """Headless page load of maersk.com/tracking/{container}; returns find_origin_load_on's
+    result (or None if not found yet) plus a bit of context for the caller to log."""
+    if sync_playwright is None:
+        raise RuntimeError("playwright not installed")
+    container = (container or "").strip().upper()
+    url = f"https://www.maersk.com/tracking/{container}"
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+            page.wait_for_selector("text=Note: All times are given", timeout=timeout_ms)
+            text = page.inner_text("body")
+        finally:
+            browser.close()
+    result = find_origin_load_on(text, port_of_loading)
+    return {"container": container, "port_of_loading": port_of_loading, "found": result is not None,
+            "match": result}
+
 # ---------------- diagnostics ----------------
 def _stage(r):
     """Derive the next-action stage from a pipeline record.
@@ -951,6 +1034,25 @@ class H(BaseHTTPRequestHandler):
             pos = [p.strip() for p in qs.get("pos", [""])[0].split(",") if p.strip()][:250]
             out = {p: so_pipeline(p) for p in pos}
             return self._send(200, json.dumps(out), "application/json")
+        if u.path == "/checkmaersk":
+            # Read-only: no Acumatica calls, just fetches Maersk's public tracking page.
+            # Called by the Maersk Watch List Power Automate flow on a schedule -- it owns
+            # deciding what to do with the result (call /autoship, update the SharePoint
+            # row, or leave it watching another cycle).
+            qs = urllib.parse.parse_qs(u.query)
+            want = MAERSK_TOKEN
+            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            if not (token_ok or self._authed()):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            container = qs.get("container", [""])[0].strip()
+            port = qs.get("port", [""])[0].strip()
+            if not container or not port:
+                return self._send(400, json.dumps({"error": "container and port are required"}), "application/json")
+            try:
+                out = check_maersk_container(container, port)
+                return self._send(200, json.dumps(out), "application/json")
+            except Exception as e:
+                return self._send(200, json.dumps({"error": str(e)}), "application/json")
         if u.path == "/setshipdates":
             # Daily sync pushes each PO's NRT pickup date here (chunked GET). Merges into
             # po_shipdates.json; pass reset=1 on the first chunk to clear stale entries.
