@@ -34,8 +34,10 @@ services:
         sync: false
       - key: FCR_TOKEN            # bearer token for /parsefcr (read-only PDF parse, no Acumatica writes); falls back to AUTOSHIP_TOKEN if unset
         sync: false
-      - key: MAERSK_TOKEN         # bearer token for /checkmaersk (read-only, no Acumatica calls); falls back to FCR_TOKEN if unset
+      - key: MAERSK_TOKEN         # bearer token for /checkmaersk + /watchlist/* (read-only, no Acumatica calls); falls back to FCR_TOKEN if unset
         sync: false
+      - key: WATCHLIST_SLA_DAYS   # containers watching longer than this without a Load-on event flip to "alert" -- default 45
+        value: "45"
       # =0 installs the browser INSIDE the playwright package (site-packages) instead of a
       # separate ~/.cache dir -- the cache dir doesn't survive Render's build->run boundary,
       # site-packages does. Not a secret, so a fixed value (not sync: false) is correct here.

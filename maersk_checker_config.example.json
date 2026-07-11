@@ -1,0 +1,5 @@
+{
+  "base_url": "https://shipments-ynyx.onrender.com",
+  "maersk_token": "REPLACE_ME",
+  "autoship_token": "REPLACE_ME"
+}
