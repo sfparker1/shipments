@@ -36,6 +36,11 @@ services:
         sync: false
       - key: MAERSK_TOKEN         # bearer token for /checkmaersk (read-only, no Acumatica calls); falls back to FCR_TOKEN if unset
         sync: false
+      # =0 installs the browser INSIDE the playwright package (site-packages) instead of a
+      # separate ~/.cache dir -- the cache dir doesn't survive Render's build->run boundary,
+      # site-packages does. Not a secret, so a fixed value (not sync: false) is correct here.
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: "0"
       - key: TOKEN_DIR
         value: /var/data
     disk:
