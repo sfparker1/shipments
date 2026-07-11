@@ -3,7 +3,7 @@ services:
     name: handover-shipments
     runtime: python
     plan: starter            # always-on, so the OAuth flow never cold-starts mid-login
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && python -m playwright install --with-deps chromium
     startCommand: python app.py
     envVars:
       - key: ACU_BASE_URL
@@ -25,6 +25,8 @@ services:
       - key: AUTOSHIP_TOKEN       # write-capable bearer token for /autoship (NRT + Maersk/FCR automation) -- keep separate from any read-only token
         sync: false
       - key: FCR_TOKEN            # bearer token for /parsefcr (read-only PDF parse, no Acumatica writes); falls back to AUTOSHIP_TOKEN if unset
+        sync: false
+      - key: MAERSK_TOKEN         # bearer token for /checkmaersk (read-only, no Acumatica calls); falls back to FCR_TOKEN if unset
         sync: false
       - key: TOKEN_DIR
         value: /var/data
