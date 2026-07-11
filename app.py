@@ -57,6 +57,8 @@ PKCE_PATH = os.path.join(TOKEN_DIR, "ship_pkce.json")
 RUNS_PATH = os.path.join(TOKEN_DIR, "ship_runs.jsonl")
 SHIPDATES_PATH = os.path.join(TOKEN_DIR, "po_shipdates.json")  # {po: 'YYYY-MM-DD'} NRT pickup dates, pushed by the daily sync
 CONTAINERDATES_PATH = os.path.join(TOKEN_DIR, "container_dates.json")  # {container: 'YYYY-MM-DD'} NRT pickup (email) dates, pushed by the daily sync
+AUTOSHIP_TOKEN = cfg("AUTOSHIP_TOKEN", "")  # separate, write-capable token for /autoship -- keep distinct from STATUS_TOKEN (read-only)
+FCR_TOKEN = cfg("FCR_TOKEN", "") or AUTOSHIP_TOKEN  # token for /parsefcr (read-only parse, no Acumatica writes); falls back to AUTOSHIP_TOKEN if not set separately
 REDIRECT_URI = CFG["public_url"] + "/callback"
 COOKIE_SECRET = (CFG["app_password"] or "dev").encode() + b"::ship"
 SESSIONS = {}
@@ -559,6 +561,125 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
                  "ship_date": ship_date, "orders": log_orders})
     return summary
 
+# ---------------- automated trigger (no PDF): NRT email / Maersk+FCR watch-list ----------------
+def process_manual(container, ship_date, pos=None, user=None, source=None, dry_run=False):
+    """Programmatic twin of process_file() for automated triggers that never see a
+    handover PDF. Two calling shapes:
+      - container only (NRT path: the pickup email has no PO info) -> resolve PO#s the
+        same way process_file() does, via containers_to_pos() (container -> Acumatica
+        PurchaseReceipt -> internal PO# -> VendorRef -> retail PO#).
+      - container + pos (Maersk/FCR path: the FCR already lists the PO#s under that
+        container) -> use the given PO#s directly, skipping containers_to_pos() entirely
+        so this doesn't depend on a PO Receipt already existing in Acumatica by the time
+        the vessel-loading event fires.
+    Same creation path as process_file(): create_shipment() (unconfirmed, human Confirms
+    in Acumatica) + log_run() to the same permanent audit log. `source` is a free-text tag
+    (e.g. "nrt" / "maersk-fcr") recorded in the run history so History shows where each
+    automated run came from.
+    """
+    if not dry_run and not ship_date:
+        return {"error": "Shipment date is required."}
+    container = (container or "").strip().upper()
+    if not container:
+        return {"error": "container is required."}
+
+    if pos:
+        all_pos = list(dict.fromkeys(p.strip() for p in pos if p and p.strip()))
+        unresolved = False
+    else:
+        resolved = containers_to_pos([container]).get(container, [])
+        all_pos = resolved
+        unresolved = not resolved
+
+    matched = find_sales_orders_batch(all_pos)
+    rows = []; log_orders = []; to_create = 0; created = 0
+    for po in all_pos:
+        matches = matched.get(po, [])
+        if not matches:
+            rows.append({"po": po, "confidence": "flag", "note": "no open sales order", "orders": []})
+            if not dry_run:
+                log_orders.append({"po": po, "order": None, "shipment_nbr": None,
+                                    "created": False, "reason": "no open sales order"})
+            continue
+        for m in matches:
+            to_create += 1
+            row = {"po": po, "confidence": "ok", "orders": [m], "note": ""}
+            if not dry_run:
+                res = create_shipment(m["order_type"], m["order_nbr"], container, ship_date, po=po)
+                row["result"] = res
+                if res.get("created"): created += 1
+                log_orders.append({"po": po, "order": f"{m['order_type']} {m['order_nbr']}".strip(),
+                                    "shipment_nbr": res.get("shipment_nbr"), "created": res.get("created"),
+                                    "ship_date": res.get("ship_date"), "reason": res.get("reason") or res.get("error")})
+            rows.append(row)
+
+    unresolved_containers = [container] if (unresolved and not all_pos) else []
+    summary = {"container": container, "source": source, "po_count": len(all_pos),
+               "unresolved_containers": unresolved_containers,
+               "orders_matched": to_create, "created": created, "dry_run": dry_run, "rows": rows}
+    if not dry_run:
+        if to_create == 0:
+            status = "no_matches"
+        elif created == to_create:
+            status = "ok"
+        elif created > 0:
+            status = "partial"
+        else:
+            status = "failed"
+        log_run({"reference": None, "document": f"auto:{source or 'unknown'}",
+                 "user": user or f"auto:{source or 'unknown'}", "status": status,
+                 "orders_matched": to_create, "created": created, "containers": container,
+                 "unresolved_containers": unresolved_containers, "ship_date": ship_date,
+                 "orders": log_orders})
+    return summary
+
+# ---------------- FCR (Forwarder's Cargo Receipt) parser -- Maersk/origin-title path ----------------
+_FCR_SKIP = ("SHIPPER", "CONSIGNEE", "NOTIFY PARTY")
+
+def parse_fcr(path):
+    """Extract container#, the PO#s under it, and Port of Loading from a Forwarder's
+    Cargo Receipt PDF. Port of Loading is the anchor used later to pick the correct
+    "Load on [vessel]" event on the Maersk tracking timeline (containers that transship
+    through a hub port show a second, later "Load on" event elsewhere that must be
+    ignored -- matching the named origin location, not "take the first one", resolves
+    this). Confirmed against a real FCR (receipt HPH1337209, Light Forever -> Winners):
+    header table has "PORT AND COUNTRY OF ORIGIN" / port of loading in one grid, and the
+    container/PO list appears on a later page as "MNBU0506461/ ... PO# <one per line>".
+    """
+    if pdfplumber is None:
+        raise RuntimeError("pdfplumber not installed")
+    receipt_no = None; port_of_loading = None; vessel = None
+    container = None; pos = []
+    with pdfplumber.open(path) as pdf:
+        full = ""
+        for pg in pdf.pages:
+            full += (pg.extract_text() or "") + "\n"
+    m = re.search(r"RECEIPT\s*NO\.?\s*:?\s*([A-Z0-9]+)", full, re.I)
+    if m: receipt_no = m.group(1)
+    # The header grid flattens to one label line ("PLACE OF RECEIPT / PORT OF LOADING /
+    # PORT OF DISCHARGE / PLACE OF DELIVERY", sometimes "PLACEOF" with no space from PDF
+    # kerning) followed by one value line with the same 4 slots -- Port of Loading is the
+    # 2nd token. Confirmed against a real FCR (receipt HPH1337209); single-word port names
+    # only so far -- revisit if a multi-word port name shows up.
+    m = re.search(r"PLACE\s*OF\s+RECEIPT\s+PORT\s+OF\s+LOADING\s+PORT\s+OF\s+DISCHARGE\s+"
+                  r"PLACE\s*OF\s+DELIVERY\s*\n\s*(\S+)\s+(\S+)\s+(\S+)\s+(\S+)", full, re.I)
+    if m: port_of_loading = m.group(2).strip()
+    m = re.search(r"VESSEL\s*:?\s*([A-Z0-9 ]{3,30})", full, re.I)
+    if m: vessel = m.group(1).strip()
+    m = re.search(r"\b([A-Z]{4}\d{7})\s*/", full)   # ISO container no. immediately before "/ PO#" or "/ <ref>"
+    if m: container = m.group(1)
+    po_block = re.search(r"PO#\s*\n(.*?)\n\s*(?:PCS|TOTAL|\*\*)", full, re.S)
+    if po_block:
+        for line in po_block.group(1).splitlines():
+            # PO# can share its line with other reference text (e.g. "ML-VN1607577
+            # 3500315493", "40HREF 3500322381") -- take the trailing digit run, not the
+            # whole line.
+            t = re.search(r"(\d{8,12})\s*$", line.strip())
+            if t and t.group(1) not in pos:
+                pos.append(t.group(1))
+    return {"receipt_no": receipt_no, "container": container, "port_of_loading": port_of_loading,
+            "vessel": vessel, "pos": pos}
+
 # ---------------- diagnostics ----------------
 def _stage(r):
     """Derive the next-action stage from a pipeline record.
@@ -912,6 +1033,61 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
+        if u.path == "/autoship":
+            # Token-authenticated (not a browser session) -- called by the NRT Power
+            # Automate flow and the Maersk/FCR watch-list checker. Separate token from
+            # the read-only STATUS_TOKEN since this one creates real Acumatica shipments.
+            want = AUTOSHIP_TOKEN
+            got = (self.headers.get("Authorization", "") or "").removeprefix("Bearer ").strip()
+            if not (want and hmac.compare_digest(got.encode(), want.encode())):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            ln = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(ln).decode() or "{}")
+            except Exception:
+                return self._send(400, json.dumps({"error": "invalid JSON body"}), "application/json")
+            container = body.get("container")
+            ship_date = (body.get("ship_date") or "").strip() or None
+            pos = body.get("pos")
+            source = (body.get("source") or "unknown").strip()
+            dry = bool(body.get("dry_run"))
+            if not container:
+                return self._send(400, json.dumps({"error": "container is required"}), "application/json")
+            try:
+                out = process_manual(container, ship_date, pos=pos, source=source, dry_run=dry)
+                return self._send(200, json.dumps(out), "application/json")
+            except Exception as e:
+                return self._send(200, json.dumps({"error": str(e)}), "application/json")
+        if u.path == "/parsefcr":
+            # Token-authenticated, read-only: parses an FCR PDF and returns container#/PO#s/
+            # Port of Loading. No Acumatica calls here -- the caller (Power Automate) feeds
+            # the result into /autoship separately once it has a ship date to attach.
+            want = FCR_TOKEN
+            got = (self.headers.get("Authorization", "") or "").removeprefix("Bearer ").strip()
+            if not (want and hmac.compare_digest(got.encode(), want.encode())):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            ctype = self.headers.get("Content-Type", "")
+            if "multipart/form-data" not in ctype or "boundary=" not in ctype:
+                return self._send(400, json.dumps({"error": "expected upload"}), "application/json")
+            boundary = ctype.split("boundary=", 1)[1].strip().strip('"').encode()
+            ln = int(self.headers.get("Content-Length", 0))
+            fields = parse_multipart(self.rfile.read(ln), boundary)
+            filedata = fields.get("pdf")
+            if not filedata:
+                return self._send(400, json.dumps({"error": "no file"}), "application/json")
+            tmp = os.path.join(TOKEN_DIR, "_fcr_upload_%s.pdf" % secrets.token_hex(8))
+            with open(tmp, "wb") as f:
+                f.write(filedata if isinstance(filedata, bytes) else filedata.encode())
+            try:
+                out = parse_fcr(tmp)
+                return self._send(200, json.dumps(out), "application/json")
+            except Exception as e:
+                return self._send(200, json.dumps({"error": str(e)}), "application/json")
+            finally:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
         if u.path == "/login":
             ip = self.client_address[0]
             if _login_blocked(ip):
