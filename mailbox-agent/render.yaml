@@ -20,10 +20,6 @@ services:
         sync: false
       - key: AUTOSHIP_TOKEN       # must match AUTOSHIP_TOKEN on the shipments service (/autoship)
         sync: false
-      - key: FCR_TOKEN            # must match FCR_TOKEN on shipments (defaults to AGENT_TOKEN if unset)
-        sync: false
-      - key: MAERSK_TOKEN         # must match MAERSK_TOKEN on shipments (/watchlist/add; defaults to AGENT_TOKEN)
-        sync: false
       - key: ANTHROPIC_API_KEY    # Claude API key
         sync: false
       # Shadow mode ON by default -- the agent reasons and logs what it WOULD do but
