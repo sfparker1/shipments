@@ -627,6 +627,59 @@ def agent_log_read(limit=200, exceptions_only=False, message_id=None):
         out = [r for r in out if r.get("exception_flag")]
     return out[:limit] if limit else out
 
+def agent_summary(hours=24):
+    """Roll up the last `hours` of agent decisions for the notification digest:
+    counts, the flagged-exception list (flat rows, ready for Power Automate's
+    'Create HTML table'), plus queue depth and last-decision time so the digest
+    also reveals job-silence (agent stopped) or a backing-up queue."""
+    def _epoch(r):
+        try:
+            return time.mktime(time.strptime(r.get("ts", ""), "%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            return 0.0
+    all_rows = agent_log_read(limit=0)  # newest-first, all rows
+    cutoff = time.time() - hours * 3600
+    rows = [r for r in all_rows if _epoch(r) >= cutoff]
+    by_class = {}
+    prepared = flagged = no_action = 0
+    exceptions = []
+    for r in rows:
+        c = r.get("classification") or "unknown"
+        by_class[c] = by_class.get(c, 0) + 1
+        if r.get("action_taken") == "create_shipment":
+            prepared += 1
+        else:
+            no_action += 1
+        if r.get("exception_flag"):
+            flagged += 1
+            exceptions.append({
+                "when": r.get("ts"), "subject": (r.get("subject") or "")[:80],
+                "classification": c, "reason": r.get("exception_reason") or "(none)",
+                "message_id": r.get("message_id") or "",
+            })
+    live = sum(1 for r in rows if r.get("mode") == "live")
+    if not rows:
+        mode = "n/a"
+    elif live == 0:
+        mode = "shadow"
+    elif live == len(rows):
+        mode = "live"
+    else:
+        mode = "mixed"
+    return {
+        "window_hours": hours,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "decisions": len(rows),
+        "shipments_prepared": prepared,   # in shadow these are "would-be"; see mode
+        "flagged": flagged,
+        "no_action": no_action,
+        "mode": mode,
+        "by_classification": by_class,
+        "exceptions": exceptions,
+        "queue_depth": len(ingest_list()),
+        "last_decision_at": all_rows[0].get("ts") if all_rows else None,
+    }
+
 # ---------------- ingest queue (Power Automate push -> agent pull) ----------------
 # The Graph app-only approach was blocked (Global Admin wouldn't grant tenant-wide
 # Mail.Read). Instead a Power Automate flow, running under the user's own O365 login,
@@ -1330,6 +1383,19 @@ class H(BaseHTTPRequestHandler):
             if qs.get("view", [""])[0] == "html" or self._authed():
                 return self._send(200, page(_agent_log_html(rows, exc_only), favicon=AGENT_FAVICON))
             return self._send(200, json.dumps(rows), "application/json")
+        if u.path == "/agent/summary":
+            # Rollup for the notification digest (a scheduled Power Automate flow reads
+            # this and emails/Teams-messages Parker). AGENT_TOKEN-authed. ?hours=N window.
+            qs = urllib.parse.parse_qs(u.query)
+            want = AGENT_TOKEN
+            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            if not (token_ok or self._authed()):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            try:
+                hours = int(qs.get("hours", ["24"])[0])
+            except Exception:
+                hours = 24
+            return self._send(200, json.dumps(agent_summary(hours)), "application/json")
         if u.path == "/ingest/list":
             # The mailbox-agent cron job pulls the queue of pushed emails here.
             qs = urllib.parse.parse_qs(u.query)
