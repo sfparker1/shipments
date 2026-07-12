@@ -38,7 +38,9 @@ services:
         sync: false
       - key: WATCHLIST_SLA_DAYS   # containers watching longer than this without a Load-on event flip to "alert" -- default 45
         value: "45"
-      - key: AGENT_TOKEN          # bearer token the mailbox-agent uses for /agent/log (decision audit trail); falls back to MAERSK_TOKEN if unset
+      - key: AGENT_TOKEN          # bearer token the mailbox-agent uses for /agent/log + /ingest/list|delete; falls back to MAERSK_TOKEN if unset
+        sync: false
+      - key: INGEST_TOKEN         # bearer token Power Automate uses to POST /ingest (pushes raw emails to the queue); falls back to AGENT_TOKEN if unset
         sync: false
       # =0 installs the browser INSIDE the playwright package (site-packages) instead of a
       # separate ~/.cache dir -- the cache dir doesn't survive Render's build->run boundary,

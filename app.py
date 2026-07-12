@@ -65,10 +65,12 @@ CONTAINERDATES_PATH = os.path.join(TOKEN_DIR, "container_dates.json")  # {contai
 WATCHLIST_PATH = os.path.join(TOKEN_DIR, "maersk_watchlist.json")  # {container: {pos, port_of_loading, receipt_no, vessel, status, date_added, ...}}
 WATCHLIST_SLA_DAYS = int(cfg("WATCHLIST_SLA_DAYS", "45"))  # containers watching longer than this without a Load-on event are flagged, not silently left open
 AGENTLOG_PATH = os.path.join(TOKEN_DIR, "agent_log.jsonl")  # one row per agent DECISION (not per LLM turn) -- the mailbox-agent's human-reviewable audit trail
+INGEST_DIR = os.path.join(TOKEN_DIR, "ingest_queue")  # Power Automate pushes raw emails here (one JSON file each); the agent cron job drains it
 AUTOSHIP_TOKEN = cfg("AUTOSHIP_TOKEN", "")  # separate, write-capable token for /autoship -- keep distinct from STATUS_TOKEN (read-only)
 FCR_TOKEN = cfg("FCR_TOKEN", "") or AUTOSHIP_TOKEN  # token for /parsefcr (read-only parse, no Acumatica writes); falls back to AUTOSHIP_TOKEN if not set separately
 MAERSK_TOKEN = cfg("MAERSK_TOKEN", "") or FCR_TOKEN  # token for /checkmaersk and the watch-list endpoints (no Acumatica writes -- /autoship is the only endpoint that creates real records)
-AGENT_TOKEN = cfg("AGENT_TOKEN", "") or MAERSK_TOKEN  # token the mailbox-agent uses for /agent/log; falls back to MAERSK_TOKEN if not set separately
+AGENT_TOKEN = cfg("AGENT_TOKEN", "") or MAERSK_TOKEN  # token the mailbox-agent uses for /agent/log and /ingest/list|delete; falls back to MAERSK_TOKEN if not set separately
+INGEST_TOKEN = cfg("INGEST_TOKEN", "") or AGENT_TOKEN  # token Power Automate uses to POST /ingest; falls back to AGENT_TOKEN if not set separately
 REDIRECT_URI = CFG["public_url"] + "/callback"
 COOKIE_SECRET = (CFG["app_password"] or "dev").encode() + b"::ship"
 SESSIONS = {}
@@ -606,6 +608,55 @@ def agent_log_read(limit=200, exceptions_only=False, message_id=None):
     if exceptions_only:
         out = [r for r in out if r.get("exception_flag")]
     return out[:limit] if limit else out
+
+# ---------------- ingest queue (Power Automate push -> agent pull) ----------------
+# The Graph app-only approach was blocked (Global Admin wouldn't grant tenant-wide
+# Mail.Read). Instead a Power Automate flow, running under the user's own O365 login,
+# PUSHES each new NRT/FCR email (metadata + body + any attachments, base64) to /ingest.
+# Those land here as one JSON file per email on the persistent disk; the mailbox-agent
+# cron job drains them on its schedule. This keeps the agent a scheduled batch job and
+# decouples it from Power Automate's timing -- if the agent is down or mid-run, items
+# just wait in the queue. Dedup is by the email's internetMessageId so a Power Automate
+# retry can't enqueue the same message twice while it's still waiting.
+def ingest_enqueue(payload):
+    os.makedirs(INGEST_DIR, exist_ok=True)
+    msg_id = (payload.get("message_id") or "").strip()
+    if msg_id:
+        for fn in os.listdir(INGEST_DIR):
+            if not fn.endswith(".json"):
+                continue
+            existing = load_json(os.path.join(INGEST_DIR, fn)) or {}
+            if existing.get("message_id") == msg_id:
+                return existing.get("id"), True  # already queued -> idempotent no-op
+    item_id = base64.urlsafe_b64encode(hashlib.sha256(
+        (msg_id or repr(payload.get("subject"))).encode()).digest()).decode().rstrip("=")[:20]
+    item = dict(payload)
+    item["id"] = item_id
+    item["enqueued_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    save_json(os.path.join(INGEST_DIR, item_id + ".json"), item)
+    return item_id, False
+
+def ingest_list():
+    out = []
+    try:
+        for fn in sorted(os.listdir(INGEST_DIR)):
+            if fn.endswith(".json"):
+                item = load_json(os.path.join(INGEST_DIR, fn))
+                if item:
+                    out.append(item)
+    except Exception:
+        pass
+    return out
+
+def ingest_delete(item_id):
+    """Agent calls this after it has fully processed an item (logged its decision +
+    called any tools). Returns True if a file was removed."""
+    path = os.path.join(INGEST_DIR, os.path.basename(item_id) + ".json")
+    try:
+        os.remove(path)
+        return True
+    except Exception:
+        return False
 
 def _agent_log_html(rows, exc_only):
     """Scannable decision table -- one row per decision, exceptions highlighted. Matches
@@ -1237,6 +1288,14 @@ class H(BaseHTTPRequestHandler):
             if qs.get("view", [""])[0] == "html" or self._authed():
                 return self._send(200, page(_agent_log_html(rows, exc_only)))
             return self._send(200, json.dumps(rows), "application/json")
+        if u.path == "/ingest/list":
+            # The mailbox-agent cron job pulls the queue of pushed emails here.
+            qs = urllib.parse.parse_qs(u.query)
+            want = AGENT_TOKEN
+            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            if not (token_ok or self._authed()):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            return self._send(200, json.dumps(ingest_list()), "application/json")
         if u.path == "/setshipdates":
             # Daily sync pushes each PO's NRT pickup date here (chunked GET). Merges into
             # po_shipdates.json; pass reset=1 on the first chunk to clear stale entries.
@@ -1360,6 +1419,37 @@ class H(BaseHTTPRequestHandler):
                 return self._send(400, json.dumps({"error": "invalid JSON body"}), "application/json")
             row = agent_log(body)
             return self._send(200, json.dumps({"logged": row}), "application/json")
+        if u.path == "/ingest":
+            # Power Automate pushes a raw email here (metadata + body + attachments).
+            # Just enqueues -- no parsing/judgment (that's the agent's job when it drains).
+            want = INGEST_TOKEN
+            got = (self.headers.get("Authorization", "") or "").removeprefix("Bearer ").strip()
+            if not (want and hmac.compare_digest(got.encode(), want.encode())):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            ln = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(ln).decode() or "{}")
+            except Exception:
+                return self._send(400, json.dumps({"error": "invalid JSON body"}), "application/json")
+            if not body.get("message_id") and not body.get("subject"):
+                return self._send(400, json.dumps({"error": "message_id or subject required"}), "application/json")
+            item_id, existed = ingest_enqueue(body)
+            return self._send(200, json.dumps({"id": item_id, "already_queued": existed}), "application/json")
+        if u.path == "/ingest/delete":
+            # The agent calls this once it has fully processed a queue item.
+            want = AGENT_TOKEN
+            got = (self.headers.get("Authorization", "") or "").removeprefix("Bearer ").strip()
+            if not (want and hmac.compare_digest(got.encode(), want.encode())):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            ln = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(ln).decode() or "{}")
+            except Exception:
+                return self._send(400, json.dumps({"error": "invalid JSON body"}), "application/json")
+            item_id = body.get("id")
+            if not item_id:
+                return self._send(400, json.dumps({"error": "id is required"}), "application/json")
+            return self._send(200, json.dumps({"deleted": ingest_delete(item_id)}), "application/json")
         if u.path == "/watchlist/add":
             # Called by the FCR-intake Power Automate flow after /parsefcr. No Acumatica
             # calls here -- just records what to watch for.
