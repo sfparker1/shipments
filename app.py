@@ -406,13 +406,14 @@ def load_recent_receipts(force=False):
     if not field:
         return []
     cutoff = (datetime.date.today() - datetime.timedelta(days=RECEIPT_LOOKBACK_DAYS)).isoformat()
-    # The container field is a CUSTOM field / attribute (AttributeCONTAINER). Acumatica's
-    # contract API only returns custom fields when requested via $custom= -- NOT $select=
-    # (which silently omits them, so the value came back empty and nothing resolved). This
-    # matches how the packing-list app reads the same customs. Keep it out of $select.
+    # NO $select. Two contract-API rules bit us here:
+    #  1. custom fields/attributes (AttributeCONTAINER) come back only via $custom=, not $select.
+    #  2. $select cannot reach a nested detail field ("Details/POOrderNbr") -- including it made
+    #     the whole list query return nothing. $expand=Details already returns POOrderNbr in full.
+    # So: filter by Date (bounds the set so paging covers it), expand Details, pull the container
+    # via $custom, and let the records come back whole.
     path = (f"{ENTITY}/PurchaseReceipt?$filter=Date ge datetimevalue'{cutoff}'"
-            f"&$select=ReceiptNbr,Date,Details/POOrderNbr&$expand=Details"
-            f"&$custom={view}.{field}")
+            f"&$expand=Details&$custom={view}.{field}")
     data = _fetch_all_pages(path, page_size=500, max_pages=6)
     rows = []
     for r in data:
@@ -1158,11 +1159,14 @@ def diagnostics(sample_po=None, sample_container=None, sample_receipt=None):
         out["receipts_loaded"] = len(recs)
         out["receipts_with_container"] = sum(1 for r in recs if r.get("containers"))
         out["receipts_sample"] = recs[:3]
-        lst_st, lst = api("GET", f"{ENTITY}/PurchaseReceipt?$top=3&$orderby=Date desc"
-                                  f"&$expand=Details&$custom={rc_view}.{rc_field}")
-        out["raw_list_custom_sample"] = ([{"ReceiptNbr": (r.get("ReceiptNbr") or {}).get("value"),
-                                           "custom": r.get("custom")} for r in lst]
-                                         if isinstance(lst, list) else {"status": lst_st, "data": lst})
+        # Status probe of the EXACT load-shape query (top 5) -- if receipts_loaded is 0 this
+        # shows whether the query errored (status != 200) or genuinely returned nothing.
+        cutoff = (datetime.date.today() - datetime.timedelta(days=RECEIPT_LOOKBACK_DAYS)).isoformat()
+        pst, pdata = api("GET", f"{ENTITY}/PurchaseReceipt?$filter=Date ge datetimevalue'{cutoff}'"
+                                f"&$expand=Details&$custom={rc_view}.{rc_field}&$top=5")
+        out["load_shape_probe"] = {"status": pst,
+                                   "count": (len(pdata) if isinstance(pdata, list) else None),
+                                   "error": (None if isinstance(pdata, list) else pdata)}
     # FULL custom-field inventory on PurchaseReceipt (all views, every field name) --
     # so if auto-discovery picked the wrong container field we can see the real one
     # (e.g. the "Container Tracking" field) and its exact contract-API name/view to set
