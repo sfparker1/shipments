@@ -1135,14 +1135,28 @@ a{color:var(--fog)}.pill{background:var(--sand);border:1px solid var(--line);bor
 pre{background:#2b2b2b;color:#d7d2c6;padding:14px;border-radius:8px;overflow:auto;font-size:12px}
 """
 
-LOGIN = """<!doctype html><meta charset=utf-8><title>Sign in</title><style>%s
+# ---- Personalized browser-tab icons (Sand + Fog stone/fog palette). Base64 data-URI
+# SVGs so no external file / URL-encoding fuss. Ship-container for the shipments tool;
+# a distinct robot for the agent decision log so the two tabs are tellable apart.
+def _favicon(svg):
+    return '<link rel="icon" href="data:image/svg+xml;base64,%s">' % base64.b64encode(svg.encode()).decode()
+SHIP_FAVICON = _favicon('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    '<rect x="3" y="11" width="26" height="13" rx="2" fill="#5d7682"/>'
+    '<path d="M8 11v13M14 11v13M20 11v13M26 11v13" stroke="#efece3" stroke-width="1.6"/></svg>')
+AGENT_FAVICON = _favicon('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    '<rect x="6" y="10" width="20" height="15" rx="4" fill="#5d7682"/>'
+    '<rect x="15" y="3" width="2" height="5" rx="1" fill="#7d7363"/><circle cx="16" cy="6" r="2" fill="#7d7363"/>'
+    '<circle cx="12" cy="17" r="2.3" fill="#efece3"/><circle cx="20" cy="17" r="2.3" fill="#efece3"/></svg>')
+
+LOGIN = """<!doctype html><meta charset=utf-8><title>Sign in</title>%s<style>%s
 .box{max-width:340px;margin:12vh auto}</style><div class=wrap><div class="card box">
 <div class=brand>SAND + FOG</div><h1>Handover &#8594; Shipments</h1>
 <form method=post action=/login><p><input type=text name=user placeholder="Username" autofocus></p>
 <p><input type=password name=pw placeholder="Password"></p>
-<button>Sign in</button></form></div></div>""" % CSS
+<button>Sign in</button></form></div></div>""" % (SHIP_FAVICON, CSS)
 
-def page(body):
+def page(body, favicon=None):
+    favicon = favicon or SHIP_FAVICON
     connected = bool(access_token())
     if connected:
         u = (connected_user() or "").replace("<", "").replace(">", "")
@@ -1156,10 +1170,10 @@ def page(body):
                      ' <a class=pill href=/connect>Switch account</a>' % label)
     else:
         badge = '<a class=pill href=/connect>Connect to Acumatica</a>'
-    return """<!doctype html><meta charset=utf-8><title>Handover &#8594; Shipments</title><style>%s</style>
+    return """<!doctype html><meta charset=utf-8><title>Handover &#8594; Shipments</title>%s<style>%s</style>
 <div class=wrap><div class=brand>SAND + FOG</div><h1>Handover Advice &#8594; Acumatica Shipments</h1>
 <p class=sub>%s &nbsp; <a class=pill href=/>Home</a> <a class=pill href=/guide>Guide</a> <a class=pill href=/history>History</a> <a class=pill href=/diag>Diagnostics</a></p>
-%s</div>""" % (CSS, badge, body)
+%s</div>""" % (favicon, CSS, badge, body)
 
 HOME = """<div class=card>
 <h1 style="font-size:18px">Create shipments from a handover advice</h1>
@@ -1314,7 +1328,7 @@ class H(BaseHTTPRequestHandler):
                 limit = 200
             rows = agent_log_read(limit=limit, exceptions_only=exc_only, message_id=msg_id)
             if qs.get("view", [""])[0] == "html" or self._authed():
-                return self._send(200, page(_agent_log_html(rows, exc_only)))
+                return self._send(200, page(_agent_log_html(rows, exc_only), favicon=AGENT_FAVICON))
             return self._send(200, json.dumps(rows), "application/json")
         if u.path == "/ingest/list":
             # The mailbox-agent cron job pulls the queue of pushed emails here.
