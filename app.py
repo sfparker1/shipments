@@ -406,8 +406,13 @@ def load_recent_receipts(force=False):
     if not field:
         return []
     cutoff = (datetime.date.today() - datetime.timedelta(days=RECEIPT_LOOKBACK_DAYS)).isoformat()
+    # The container field is a CUSTOM field / attribute (AttributeCONTAINER). Acumatica's
+    # contract API only returns custom fields when requested via $custom= -- NOT $select=
+    # (which silently omits them, so the value came back empty and nothing resolved). This
+    # matches how the packing-list app reads the same customs. Keep it out of $select.
     path = (f"{ENTITY}/PurchaseReceipt?$filter=Date ge datetimevalue'{cutoff}'"
-            f"&$select=ReceiptNbr,Date,{view}.{field},Details/POOrderNbr&$expand=Details")
+            f"&$select=ReceiptNbr,Date,Details/POOrderNbr&$expand=Details"
+            f"&$custom={view}.{field}")
     data = _fetch_all_pages(path, page_size=500, max_pages=6)
     rows = []
     for r in data:
@@ -1164,13 +1169,11 @@ def diagnostics(sample_po=None, sample_container=None, sample_receipt=None):
         out["sample_container_vendor_refs"] = load_po_vendor_refs(internal_pos)
         out["sample_container_resolved_pos"] = containers_to_pos([sc]).get(sc, [])
     if sample_receipt:
-        # Raw contract-API view of one receipt as THIS connection sees it -- reveals which
-        # field actually holds the container value (request common container-ish customs so
-        # they come back even though custom fields aren't returned by default).
-        customs = ",".join("Document.%s" % f for f in
-                           ("AttributeCONTAINER", "ContainerTracking", "UsrContainerTracking", "AttributeCNTR"))
-        q = (f"{ENTITY}/PurchaseReceipt?$filter=ReceiptNbr eq '{sample_receipt}'"
-             f"&$expand=Details&$custom={customs}")
+        # Raw contract-API view of one receipt as THIS connection sees it, requesting the
+        # discovered container field via $custom (the correct way to get custom fields).
+        cust = ("%s.%s" % (rc_view, rc_field)) if rc_field else ""
+        q = (f"{ENTITY}/PurchaseReceipt?$filter=ReceiptNbr eq '{sample_receipt}'&$expand=Details"
+             + (f"&$custom={cust}" if cust else ""))
         rrst, rr = api("GET", q)
         out["sample_receipt"] = sample_receipt
         out["sample_receipt_raw"] = (rr[0] if (rrst == 200 and isinstance(rr, list) and rr)
