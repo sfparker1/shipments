@@ -1102,7 +1102,7 @@ def so_pipeline(po):
     is already fully processed ('Done')."""
     return [_order_pipeline(m, po) for m in find_sales_orders_batch([po]).get(po, [])]
 
-def diagnostics(sample_po=None, sample_container=None):
+def diagnostics(sample_po=None, sample_container=None, sample_receipt=None):
     out = {"connected": bool(access_token()), "tenant": CFG["tenant"],
            "container_field": CFG["container_field"] or "(not set)", "warehouse": CFG["warehouse"] or "(SO default)"}
     if not out["connected"]: return out
@@ -1143,14 +1143,38 @@ def diagnostics(sample_po=None, sample_container=None):
     # PO Receipt -> internal PO -> VendorRef chain (see containers_to_pos()).
     rc_field, rc_view = discover_receipt_container_field()
     out["receipt_container_field"] = f"{rc_view}.{rc_field}" if rc_field else "(not found)"
+    # FULL custom-field inventory on PurchaseReceipt (all views, every field name) --
+    # so if auto-discovery picked the wrong container field we can see the real one
+    # (e.g. the "Container Tracking" field) and its exact contract-API name/view to set
+    # RECEIPT_CONTAINER_FIELD / RECEIPT_CONTAINER_VIEW. Also the standard field keys.
+    rst, rsch = api("GET", f"{ENTITY}/PurchaseReceipt/$adHocSchema")
+    if rst == 200 and isinstance(rsch, dict):
+        out["receipt_all_custom_fields"] = {v: sorted(fs.keys()) for v, fs in (rsch.get("custom", {}) or {}).items()}
+    else:
+        out["receipt_schema_status"] = rst
+    rkst, rk = api("GET", f"{ENTITY}/PurchaseReceipt?$top=1")
+    if rkst == 200 and isinstance(rk, list) and rk:
+        out["receipt_standard_keys"] = sorted(rk[0].keys())
     if sample_container:
         sc = sample_container.strip().upper()
-        receipts = [r for r in load_recent_receipts() if r["container"] == sc]
+        receipts = [r for r in load_recent_receipts() if sc in r.get("containers", [])]
         out["sample_container"] = sc
         out["sample_container_receipts"] = receipts
         internal_pos = {p for r in receipts for p in r["internal_pos"]}
         out["sample_container_vendor_refs"] = load_po_vendor_refs(internal_pos)
         out["sample_container_resolved_pos"] = containers_to_pos([sc]).get(sc, [])
+    if sample_receipt:
+        # Raw contract-API view of one receipt as THIS connection sees it -- reveals which
+        # field actually holds the container value (request common container-ish customs so
+        # they come back even though custom fields aren't returned by default).
+        customs = ",".join("Document.%s" % f for f in
+                           ("AttributeCONTAINER", "ContainerTracking", "UsrContainerTracking", "AttributeCNTR"))
+        q = (f"{ENTITY}/PurchaseReceipt?$filter=ReceiptNbr eq '{sample_receipt}'"
+             f"&$expand=Details&$custom={customs}")
+        rrst, rr = api("GET", q)
+        out["sample_receipt"] = sample_receipt
+        out["sample_receipt_raw"] = (rr[0] if (rrst == 200 and isinstance(rr, list) and rr)
+                                     else {"status": rrst, "data": rr})
     return out
 
 # ================= Web UI =================
@@ -1442,11 +1466,12 @@ class H(BaseHTTPRequestHandler):
             self.send_response(302); self.send_header("Location", build_authorize_url()); self.end_headers(); return
         if u.path == "/diag":
             qs = urllib.parse.parse_qs(u.query)
-            d = diagnostics(qs.get("po", [None])[0], qs.get("container", [None])[0])
+            d = diagnostics(qs.get("po", [None])[0], qs.get("container", [None])[0], qs.get("receipt", [None])[0])
             body = ('<div class=card><h1 style="font-size:16px">Diagnostics</h1>'
                     '<form method=get action=/diag>'
                     '<p style="max-width:260px"><input type=text name=po placeholder="test a PO# e.g. 117256"></p>'
                     '<p style="max-width:260px"><input type=text name=container placeholder="test a container e.g. FBIU5261330"></p>'
+                    '<p style="max-width:260px"><input type=text name=receipt placeholder="dump a receipt e.g. 007068"></p>'
                     '<button class=fog>Run</button></form><pre>' + json.dumps(d, indent=2) + "</pre></div>")
             return self._send(200, page(body))
         if u.path == "/guide":
