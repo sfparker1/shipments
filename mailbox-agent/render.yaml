@@ -1,0 +1,34 @@
+# Separate Render service from handover-shipments -- a scheduled Cron Job, not a
+# web service. It wakes on the schedule, drains the /ingest queue on the shipments
+# service, processes each email, and exits. Point this service's Root Directory at
+# `mailbox-agent/` so an agent change doesn't rebuild the Acumatica web service.
+services:
+  - type: cron
+    name: mailbox-agent
+    runtime: python
+    rootDir: mailbox-agent
+    # :17 (not :00) to avoid the top-of-hour load spike. Every 3 hours keeps NRT
+    # "Available for Pickup" shipments current for month-end cutoff without over-running.
+    # Daily is also fine (transit takes days) -- tune to taste.
+    schedule: "17 */3 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python agent.py
+    envVars:
+      - key: SHIPMENTS_BASE_URL   # e.g. https://shipments-ynyx.onrender.com
+        sync: false
+      - key: AGENT_TOKEN          # must match AGENT_TOKEN on the shipments service (/agent/log, /ingest/*)
+        sync: false
+      - key: AUTOSHIP_TOKEN       # must match AUTOSHIP_TOKEN on the shipments service (/autoship)
+        sync: false
+      - key: FCR_TOKEN            # must match FCR_TOKEN on shipments (defaults to AGENT_TOKEN if unset)
+        sync: false
+      - key: MAERSK_TOKEN         # must match MAERSK_TOKEN on shipments (/watchlist/add; defaults to AGENT_TOKEN)
+        sync: false
+      - key: ANTHROPIC_API_KEY    # Claude API key
+        sync: false
+      # Shadow mode ON by default -- the agent reasons and logs what it WOULD do but
+      # creates nothing. Flip to "0" to go live, one tool at a time, after review.
+      - key: SHADOW_MODE
+        value: "1"
+      - key: MODEL
+        value: claude-opus-4-8
