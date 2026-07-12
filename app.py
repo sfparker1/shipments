@@ -1148,6 +1148,21 @@ def diagnostics(sample_po=None, sample_container=None, sample_receipt=None):
     # PO Receipt -> internal PO -> VendorRef chain (see containers_to_pos()).
     rc_field, rc_view = discover_receipt_container_field()
     out["receipt_container_field"] = f"{rc_view}.{rc_field}" if rc_field else "(not found)"
+    # DECISIVE PROBE: does the container ($custom field) come back on a LIST GET the way it
+    # does on a single-entity GET? Compare how many recent receipts load_recent_receipts
+    # actually loaded vs how many carry a container, and dump the raw custom block from a
+    # small list query. If list rows have empty custom{} but the single-receipt fetch had
+    # the value, that's the Acumatica quirk (custom returned per-entity, not per-list).
+    if rc_field:
+        recs = load_recent_receipts(force=True)
+        out["receipts_loaded"] = len(recs)
+        out["receipts_with_container"] = sum(1 for r in recs if r.get("containers"))
+        out["receipts_sample"] = recs[:3]
+        lst_st, lst = api("GET", f"{ENTITY}/PurchaseReceipt?$top=3&$orderby=Date desc"
+                                  f"&$expand=Details&$custom={rc_view}.{rc_field}")
+        out["raw_list_custom_sample"] = ([{"ReceiptNbr": (r.get("ReceiptNbr") or {}).get("value"),
+                                           "custom": r.get("custom")} for r in lst]
+                                         if isinstance(lst, list) else {"status": lst_st, "data": lst})
     # FULL custom-field inventory on PurchaseReceipt (all views, every field name) --
     # so if auto-discovery picked the wrong container field we can see the real one
     # (e.g. the "Container Tracking" field) and its exact contract-API name/view to set
