@@ -64,9 +64,11 @@ SHIPDATES_PATH = os.path.join(TOKEN_DIR, "po_shipdates.json")  # {po: 'YYYY-MM-D
 CONTAINERDATES_PATH = os.path.join(TOKEN_DIR, "container_dates.json")  # {container: 'YYYY-MM-DD'} NRT pickup (email) dates, pushed by the daily sync
 WATCHLIST_PATH = os.path.join(TOKEN_DIR, "maersk_watchlist.json")  # {container: {pos, port_of_loading, receipt_no, vessel, status, date_added, ...}}
 WATCHLIST_SLA_DAYS = int(cfg("WATCHLIST_SLA_DAYS", "45"))  # containers watching longer than this without a Load-on event are flagged, not silently left open
+AGENTLOG_PATH = os.path.join(TOKEN_DIR, "agent_log.jsonl")  # one row per agent DECISION (not per LLM turn) -- the mailbox-agent's human-reviewable audit trail
 AUTOSHIP_TOKEN = cfg("AUTOSHIP_TOKEN", "")  # separate, write-capable token for /autoship -- keep distinct from STATUS_TOKEN (read-only)
 FCR_TOKEN = cfg("FCR_TOKEN", "") or AUTOSHIP_TOKEN  # token for /parsefcr (read-only parse, no Acumatica writes); falls back to AUTOSHIP_TOKEN if not set separately
 MAERSK_TOKEN = cfg("MAERSK_TOKEN", "") or FCR_TOKEN  # token for /checkmaersk and the watch-list endpoints (no Acumatica writes -- /autoship is the only endpoint that creates real records)
+AGENT_TOKEN = cfg("AGENT_TOKEN", "") or MAERSK_TOKEN  # token the mailbox-agent uses for /agent/log; falls back to MAERSK_TOKEN if not set separately
 REDIRECT_URI = CFG["public_url"] + "/callback"
 COOKIE_SECRET = (CFG["app_password"] or "dev").encode() + b"::ship"
 SESSIONS = {}
@@ -564,6 +566,92 @@ def history(limit=200):
     except Exception: pass
     out = list(reversed(out))
     return out[:limit] if limit else out
+
+# ---------------- agent decision log ----------------
+# The mailbox-agent (separate Claude Agent SDK service) posts ONE row per decision it
+# makes about a mailbox item -- not per LLM turn. This is its durable, human-reviewable
+# audit trail, kept on the same persistent disk as everything else so there's one place
+# to look. It ALSO doubles as the idempotency check: the agent logs a row (with the
+# source message_id) BEFORE calling any write tool, so a crash between "called /autoship"
+# and "marked the email handled in Graph" is recoverable -- the next run sees the row and
+# doesn't double-act. append-only; nothing is ever deleted.
+_AGENTLOG_FIELDS = ("run_id", "source_mailbox", "message_id", "subject", "message_date",
+                    "classification", "action_taken", "tool_args", "tool_result",
+                    "rationale", "mode", "exception_flag", "exception_reason")
+
+def agent_log(entry):
+    """Append one decision row. Server stamps 'ts'. Returns the stored row."""
+    row = {k: entry.get(k) for k in _AGENTLOG_FIELDS}
+    row["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        os.makedirs(TOKEN_DIR, exist_ok=True)
+        with open(AGENTLOG_PATH, "a") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
+    return row
+
+def agent_log_read(limit=200, exceptions_only=False, message_id=None):
+    """Newest-first. exceptions_only filters to flagged rows for quick review;
+    message_id returns every row for one source email (the idempotency lookup)."""
+    out = []
+    try:
+        with open(AGENTLOG_PATH) as f:
+            out = [json.loads(l) for l in f if l.strip()]
+    except Exception:
+        pass
+    if message_id is not None:
+        return [r for r in out if r.get("message_id") == message_id]
+    out = list(reversed(out))
+    if exceptions_only:
+        out = [r for r in out if r.get("exception_flag")]
+    return out[:limit] if limit else out
+
+def _agent_log_html(rows, exc_only):
+    """Scannable decision table -- one row per decision, exceptions highlighted. Matches
+    the low-tooling HTML style used by /history."""
+    def esc(v):
+        s = "" if v is None else str(v)
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    _mode = {"shadow": "#7d7363", "live": "#5a7d5a"}
+    def _row(r):
+        flagged = bool(r.get("exception_flag"))
+        rowstyle = ' style="background:#f6ece8"' if flagged else ""
+        mode = r.get("mode") or ""
+        mode_pill = f'<span class=pill style="border-color:{_mode.get(mode, "#c9c0ad")}">{esc(mode) or "&mdash;"}</span>'
+        cls = esc(r.get("classification") or "")
+        action = esc(r.get("action_taken") or "&mdash;")
+        args = r.get("tool_args")
+        result = r.get("tool_result")
+        detail = ""
+        if args is not None or result is not None:
+            detail = (f"<details><summary>args/result</summary>"
+                      f"<div><b>args:</b> {esc(json.dumps(args))}</div>"
+                      f"<div><b>result:</b> {esc(json.dumps(result))}</div></details>")
+        note = esc(r.get("rationale") or "")
+        if flagged:
+            note = (f'<span style="color:#b06a5a">&#9888; {esc(r.get("exception_reason") or "exception")}</span>'
+                    f'<br>{note}' if note else
+                    f'<span style="color:#b06a5a">&#9888; {esc(r.get("exception_reason") or "exception")}</span>')
+        subj = esc(r.get("subject") or "")
+        if len(subj) > 60:
+            subj = subj[:60] + "&hellip;"
+        return (f"<tr{rowstyle}><td>{esc(r.get('ts',''))}</td>"
+                f"<td>{esc(r.get('source_mailbox') or '')}</td>"
+                f"<td title=\"{esc(r.get('message_id') or '')}\">{subj}</td>"
+                f"<td>{cls}</td><td>{action}</td><td>{mode_pill}</td>"
+                f"<td>{note}</td><td>{detail}</td></tr>")
+    body_rows = "".join(_row(r) for r in rows)
+    title = "Agent decisions" + (" &mdash; exceptions only" if exc_only else "")
+    toggle = ('<a class=pill href="/agent/log">all</a> '
+              '<a class=pill href="/agent/log?exceptions_only=1">exceptions only</a>')
+    return ('<div class=card><h1 style="font-size:16px">%s</h1>'
+            '<p class=sub>One row per decision the mailbox-agent made (not per LLM turn). '
+            'Flagged rows are highlighted. %s</p>'
+            '<table><tr><th>When</th><th>Mailbox</th><th>Subject</th><th>Class</th>'
+            '<th>Action</th><th>Mode</th><th>Rationale / exception</th><th>Detail</th></tr>'
+            '%s</table></div>') % (title, toggle, body_rows or
+            '<tr><td colspan=8 class=sub>No decisions logged yet.</td></tr>')
 
 # ---------------- process a handover PDF ----------------
 def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None):
@@ -1130,6 +1218,25 @@ class H(BaseHTTPRequestHandler):
             if status_filter:
                 wl = {c: e for c, e in wl.items() if e.get("status") == status_filter}
             return self._send(200, json.dumps(wl), "application/json")
+        if u.path == "/agent/log":
+            # The mailbox-agent's decision audit trail. JSON for the agent's own
+            # idempotency check (?message_id=...) and programmatic reads; a rendered HTML
+            # table (?view=html) for a person to scan a day's decisions in under a minute.
+            qs = urllib.parse.parse_qs(u.query)
+            want = AGENT_TOKEN
+            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            if not (token_ok or self._authed()):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            msg_id = qs.get("message_id", [""])[0].strip() or None
+            exc_only = qs.get("exceptions_only", ["0"])[0] == "1"
+            try:
+                limit = int(qs.get("limit", ["200"])[0])
+            except Exception:
+                limit = 200
+            rows = agent_log_read(limit=limit, exceptions_only=exc_only, message_id=msg_id)
+            if qs.get("view", [""])[0] == "html" or self._authed():
+                return self._send(200, page(_agent_log_html(rows, exc_only)))
+            return self._send(200, json.dumps(rows), "application/json")
         if u.path == "/setshipdates":
             # Daily sync pushes each PO's NRT pickup date here (chunked GET). Merges into
             # po_shipdates.json; pass reset=1 on the first chunk to clear stale entries.
@@ -1237,6 +1344,22 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(out), "application/json")
             except Exception as e:
                 return self._send(200, json.dumps({"error": str(e)}), "application/json")
+        if u.path == "/agent/log":
+            # The mailbox-agent posts one decision row here. No Acumatica calls -- pure
+            # audit logging. Kept deliberately permissive on field shape (whatever the
+            # agent sends in the known fields is recorded) so the log format can evolve
+            # with the agent's prompt without a coordinated deploy.
+            want = AGENT_TOKEN
+            got = (self.headers.get("Authorization", "") or "").removeprefix("Bearer ").strip()
+            if not (want and hmac.compare_digest(got.encode(), want.encode())):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            ln = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(ln).decode() or "{}")
+            except Exception:
+                return self._send(400, json.dumps({"error": "invalid JSON body"}), "application/json")
+            row = agent_log(body)
+            return self._send(200, json.dumps({"logged": row}), "application/json")
         if u.path == "/watchlist/add":
             # Called by the FCR-intake Power Automate flow after /parsefcr. No Acumatica
             # calls here -- just records what to watch for.

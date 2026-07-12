@@ -38,6 +38,8 @@ services:
         sync: false
       - key: WATCHLIST_SLA_DAYS   # containers watching longer than this without a Load-on event flip to "alert" -- default 45
         value: "45"
+      - key: AGENT_TOKEN          # bearer token the mailbox-agent uses for /agent/log (decision audit trail); falls back to MAERSK_TOKEN if unset
+        sync: false
       # =0 installs the browser INSIDE the playwright package (site-packages) instead of a
       # separate ~/.cache dir -- the cache dir doesn't survive Render's build->run boundary,
       # site-packages does. Not a secret, so a fixed value (not sync: false) is correct here.
