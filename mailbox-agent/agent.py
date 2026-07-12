@@ -35,10 +35,8 @@ Config (env vars):
     SHIPMENTS_BASE_URL   e.g. https://shipments-ynyx.onrender.com
     AGENT_TOKEN          bearer token for /agent/log, /ingest/list, /ingest/delete
     AUTOSHIP_TOKEN       bearer token for /autoship (create shipment on Hold)
-    FCR_TOKEN            bearer token for /parsefcr (defaults to AGENT_TOKEN if unset)
-    MAERSK_TOKEN         bearer token for /watchlist/add (defaults to AGENT_TOKEN if unset)
     ANTHROPIC_API_KEY    Claude API key
-    SHADOW_MODE          "1" (default) = intercept the write tools, log what WOULD
+    SHADOW_MODE          "1" (default) = intercept the write tool, log what WOULD
                          have happened, create nothing. Flip to "0" to go live.
                          Keep this flag permanently -- re-use it after prompt/tool changes.
     MODEL                default "claude-opus-4-8"
@@ -53,8 +51,6 @@ import anthropic
 BASE = os.environ.get("SHIPMENTS_BASE_URL", "").rstrip("/")
 AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "")
 AUTOSHIP_TOKEN = os.environ.get("AUTOSHIP_TOKEN", "")
-FCR_TOKEN = os.environ.get("FCR_TOKEN", "") or AGENT_TOKEN
-MAERSK_TOKEN = os.environ.get("MAERSK_TOKEN", "") or AGENT_TOKEN
 SHADOW_MODE = os.environ.get("SHADOW_MODE", "1") != "0"
 MODEL = os.environ.get("MODEL", "claude-opus-4-8")
 MAX_ITEMS_PER_RUN = int(os.environ.get("MAX_ITEMS_PER_RUN", "50"))
@@ -64,23 +60,11 @@ def _require(name, val):
         raise SystemExit(f"ERROR: {name} is required (set the env var).")
 
 # ---------------- HTTP to the shipments service ----------------
-def _http(method, path, token, body=None, multipart=None, timeout=120):
+def _http(method, path, token, body=None, timeout=120):
     url = BASE + path
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     data = None
-    if multipart is not None:
-        boundary = "----mailboxagent" + base64.urlsafe_b64encode(os.urandom(9)).decode()
-        parts = []
-        fname, content = multipart
-        parts.append(("--" + boundary).encode())
-        parts.append((f'Content-Disposition: form-data; name="pdf"; filename="{fname}"').encode())
-        parts.append(b"Content-Type: application/pdf")
-        parts.append(b"")
-        parts.append(content)
-        parts.append(("--" + boundary + "--").encode())
-        data = b"\r\n".join(parts)
-        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
-    elif body is not None:
+    if body is not None:
         data = json.dumps(body).encode()
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -131,33 +115,21 @@ def strip_html(body):
     b = re.sub(r"\n\s*\n\s*\n+", "\n\n", b)
     return b.strip()
 
-def first_pdf(item):
-    for att in item.get("attachments") or []:
-        name = (att.get("name") or "").lower()
-        if name.endswith(".pdf") and att.get("content_b64"):
-            return att["name"], base64.b64decode(att["content_b64"])
-    return None, None
-
 # ---------------- tool definitions (the agent's action surface) ----------------
-# These are the ONLY side-effectful things the agent can do -- each maps to an
-# already-scoped endpoint. parse_fcr is read-only; create_shipment and
-# add_to_watchlist are the writes intercepted in shadow mode; finish records the
-# decision and ends the loop.
+# The ONLY things the agent can do. create_shipment is the single write (maps to the
+# already-scoped /autoship; intercepted in shadow mode); finish records the decision to
+# /agent/log and ends the loop. This narrow surface means the NRT agent literally cannot
+# create a PO receipt or anything else -- the overseas PO-receipt path is a separate agent.
 TOOLS = [
-    {
-        "name": "parse_fcr",
-        "description": "Extract container number, PO numbers, and Port of Loading from the "
-                       "PDF attachment on the current email (a Forwarder's Cargo Receipt). "
-                       "Read-only -- makes no Acumatica changes. Use this for FCR emails before "
-                       "add_to_watchlist. Returns {container, pos, port_of_loading, receipt_no, vessel}.",
-        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
-    },
     {
         "name": "create_shipment",
         "description": "Create an UNCONFIRMED (On Hold) Acumatica shipment for the given container. "
                        "Use ONLY for NRT emails whose status is 'Available for Pickup'. ship_date "
                        "must be the date the email was received (provided in the email metadata). "
-                       "Never releases/confirms -- a clerk does that in Acumatica.",
+                       "Never releases/confirms -- a clerk does that in Acumatica. The result may come "
+                       "back with needs_review=true (e.g. the container shares a PO Receipt with other "
+                       "containers, or no open sales order resolved / created=0) -- when that happens, "
+                       "do NOT treat it as done: call finish with exception=true and explain.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -169,37 +141,21 @@ TOOLS = [
         },
     },
     {
-        "name": "add_to_watchlist",
-        "description": "Add a container to the Maersk watch-list (for later origin vessel-loading "
-                       "lookup). Use for FCR emails, after parse_fcr. Pass the values parse_fcr returned.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "container": {"type": "string"},
-                "pos": {"type": "array", "items": {"type": "string"}},
-                "port_of_loading": {"type": "string"},
-                "receipt_no": {"type": "string"},
-                "vessel": {"type": "string"},
-            },
-            "required": ["container"],
-            "additionalProperties": False,
-        },
-    },
-    {
         "name": "finish",
         "description": "Record the final decision for this email and end. Call this exactly once, "
-                       "after any other tool calls (or immediately, if no action is warranted). "
-                       "Set exception=true for anything a human should look at: ambiguous emails, "
-                       "an NRT status you don't recognize, a create_shipment/parse failure, missing "
-                       "data, or anything that didn't fit the normal path.",
+                       "after create_shipment (or immediately, if no action is warranted). "
+                       "Set exception=true for anything a human should look at: an NRT status you don't "
+                       "recognize, a create_shipment that came back needs_review or created nothing, "
+                       "missing/unclear data, a non-NRT email that landed in this folder, or anything "
+                       "that didn't fit the normal path.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "classification": {
                     "type": "string",
-                    "enum": ["nrt_available_for_pickup", "nrt_other_status", "fcr", "ambiguous", "skip"],
+                    "enum": ["nrt_available_for_pickup", "nrt_other_status", "not_nrt", "ambiguous", "skip"],
                 },
-                "action_summary": {"type": "string", "description": "One phrase, e.g. 'created shipment' / 'added to watchlist' / 'no action'"},
+                "action_summary": {"type": "string", "description": "One phrase, e.g. 'created shipment' / 'no action'"},
                 "rationale": {"type": "string", "description": "1-2 sentences explaining the decision"},
                 "exception": {"type": "boolean"},
                 "exception_reason": {"type": "string"},
@@ -211,50 +167,40 @@ TOOLS = [
 ]
 
 SYSTEM_PROMPT = """\
-You are the mailbox agent for Sand + Fog's container-pickup automation. Each turn you \
-are given ONE email that landed in a shared Outlook folder (pushed to you by Power \
-Automate). Your job: decide what it is, and PREPARE the right Acumatica-adjacent action \
-by calling the provided tools. You never release or confirm anything -- shipments are \
-created On Hold and a human confirms them in Acumatica. A clerk reviews your work.
+You are the NRT mailbox agent for Sand + Fog's container-pickup automation. Each turn \
+you are given ONE email that landed in the NRT container-status folder (pushed to you by \
+Power Automate). Your job: read it and, when it's a pickup trigger, PREPARE an unconfirmed \
+Acumatica shipment by calling create_shipment. You never release or confirm anything -- \
+shipments are created On Hold and a clerk confirms them in Acumatica.
 
-Two email types matter:
+These are NRT container-status emails (from noreply@nrsonline.com, subject "Status Update \
+- Container # XXXX"). The subject is ALWAYS the generic "Status Update" line -- the actual \
+STATUS is only in the email body, so you must read the body to know what this email means.
 
-1. NRT container-status emails (from noreply@nrsonline.com, subject "Status Update - \
-Container # XXXX"). The subject is always generic -- the STATUS is only in the body. \
-Read the body:
-   - If the status is "Available for Pickup" (allow minor wording variants like \
+- If the body status is "Available for Pickup" (allow minor wording variants like \
 "Available to Pickup"): this is the revenue/shipment trigger. Call create_shipment with \
-the container number and ship_date = the email's received date (given in the metadata, \
-NOT any date in the body, NOT today).
-   - Any OTHER status (in transit, arrived, delayed, on hold, etc.): do NOT create a \
-shipment. Classify as nrt_other_status, no action.
+the container number (from the subject/body) and ship_date = the email's received date \
+(given in the metadata -- NOT any date in the body, NOT today). Then call finish. \
+Acumatica resolves which sales orders that container maps to; you don't need to.
+   - If create_shipment comes back with needs_review=true or created=0 (e.g. the \
+container shares a PO Receipt with other containers, or no open sales order resolved), \
+do NOT treat it as done -- call finish with exception=true and explain.
+- Any OTHER status (in transit, arrived at port, delayed, on hold, empty returned, etc.): \
+do NOT create a shipment. Call finish with classification nrt_other_status, no action.
 
-2. FCR emails (Forwarder's Cargo Receipt) with a PDF attachment. Call parse_fcr to \
-extract the container / PO numbers / Port of Loading, then call add_to_watchlist with \
-those values. These seed a later Maersk origin-vessel-loading lookup; they do NOT create \
-a shipment now.
+If the email isn't an NRT status email at all (wrong sender, no container number, some \
+other message that landed in this folder), or anything is unclear or conflicting: do NOT \
+guess. Call finish with classification not_nrt or ambiguous and exception=true. Never \
+invent a container number or a date -- if the required data isn't clearly present, flag it.
 
-Anything else, or anything you're unsure about -- an unfamiliar sender, a malformed \
-email, no container number where you expect one, a tool call that fails, conflicting \
-signals -- classify as ambiguous or skip and set exception=true on finish. Err toward \
-flagging for a human rather than guessing on financial records. Do not invent a \
-container number or a date; if the required data isn't clearly present, flag it.
-
-Always call finish exactly once to record your decision. Be concise in rationale.\
+Always call finish exactly once to record your decision. Keep rationale to 1-2 sentences.\
 """
 
 # ---------------- tool execution (with shadow-mode interception) ----------------
 def run_tool(name, args, item, decision):
     """Execute a tool call. Returns (result_for_model, did_write). Records enough on
-    `decision` to build the audit-log row. In shadow mode, create_shipment and
-    add_to_watchlist are intercepted: logged as 'would have called', nothing sent."""
-    if name == "parse_fcr":
-        fname, content = first_pdf(item)
-        if not content:
-            return {"error": "no PDF attachment on this email"}, False
-        st, data = _http("POST", "/parsefcr", FCR_TOKEN, multipart=(fname, content))
-        return (data if st == 200 else {"error": f"parsefcr HTTP {st}", "detail": data}), False
-
+    `decision` to build the audit-log row. In shadow mode the write (create_shipment) is
+    intercepted: logged as 'would have called', nothing sent."""
     if name == "create_shipment":
         decision["action_taken"] = "create_shipment"
         decision["tool_args"] = args
@@ -265,19 +211,6 @@ def run_tool(name, args, item, decision):
         st, data = _http("POST", "/autoship", AUTOSHIP_TOKEN, body=body)
         decision["tool_result"] = {"status": st, "data": data}
         return (data if st == 200 else {"error": f"autoship HTTP {st}", "detail": data}), True
-
-    if name == "add_to_watchlist":
-        decision["action_taken"] = "add_to_watchlist"
-        decision["tool_args"] = args
-        if SHADOW_MODE:
-            decision["shadow_intercepted"] = True
-            return {"shadow_mode": True, "note": "would have added to watch-list; nothing sent"}, False
-        st, data = _http("POST", "/watchlist/add", MAERSK_TOKEN, body={
-            "container": args.get("container"), "pos": args.get("pos"),
-            "port_of_loading": args.get("port_of_loading"), "receipt_no": args.get("receipt_no"),
-            "vessel": args.get("vessel"), "source": "fcr-agent"})
-        decision["tool_result"] = {"status": st, "data": data}
-        return (data if st == 200 else {"error": f"watchlist/add HTTP {st}", "detail": data}), True
 
     return {"error": f"unknown tool {name}"}, False
 

@@ -414,10 +414,16 @@ def load_recent_receipts(force=False):
         cont = ((r.get("custom") or {}).get(view, {}).get(field) or {}).get("value")
         if not cont:
             continue
+        # One receipt's container UDF can list SEVERAL containers (confirmed by Parker).
+        # Parse out each ISO container token (4 letters + 6-7 digits) so a single-container
+        # query matches a multi-container receipt, and so callers can tell when a receipt
+        # spans more than one container (the ~3% split case that must be flagged, not
+        # auto-shipped). Fall back to the raw string if no ISO token is found.
+        conts = [m.upper() for m in re.findall(r"[A-Z]{4}\d{6,7}", cont.upper())] or [cont.strip().upper()]
         internal_pos = sorted({(d.get("POOrderNbr") or {}).get("value") for d in (r.get("Details") or [])
                                 if (d.get("POOrderNbr") or {}).get("value")})
         if internal_pos:
-            rows.append({"container": cont.strip().upper(),
+            rows.append({"containers": conts, "container_raw": cont.strip(),
                          "receipt_nbr": (r.get("ReceiptNbr") or {}).get("value"), "internal_pos": internal_pos})
     _RECEIPTS_CACHE.update(rows=rows, ts=now)
     return rows
@@ -455,12 +461,24 @@ def containers_to_pos(containers):
     vendor_refs = load_po_vendor_refs(all_internal_pos)
     by_container = {}
     for r in receipts:
-        pos = by_container.setdefault(r["container"], set())
-        for internal_po in r["internal_pos"]:
-            ref = vendor_refs.get(internal_po, "")
-            for n in re.findall(r"\b(\d{6})\b", ref):
-                pos.add(n)
+        for c in r["containers"]:
+            pos = by_container.setdefault(c, set())
+            for internal_po in r["internal_pos"]:
+                ref = vendor_refs.get(internal_po, "")
+                for n in re.findall(r"\b(\d{6})\b", ref):
+                    pos.add(n)
     return {c: sorted(by_container.get(c, [])) for c in containers}
+
+def container_multi_flags(containers):
+    """For each queried container, True if it appears on a PO Receipt that also lists
+    OTHER containers. A multi-container receipt means picking up one container doesn't
+    imply the whole PO/SO is available to ship -- the NRT auto-ship path refuses these
+    and flags for a human (the ~3% split case) rather than shipping items still afloat."""
+    receipts = load_recent_receipts()
+    flags = {}
+    for c in [x.strip().upper() for x in containers if x]:
+        flags[c] = any(c in r["containers"] and len(r["containers"]) > 1 for r in receipts)
+    return flags
 
 # ---------------- matching ----------------
 _OPEN_ORDERS = {"rows": None, "ts": 0}
@@ -795,6 +813,16 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         all_pos = list(dict.fromkeys(p.strip() for p in pos if p and p.strip()))
         unresolved = False
     else:
+        # NRT path: refuse to auto-create when the container's PO Receipt also covers
+        # OTHER containers. Picking up one container of a multi-container receipt doesn't
+        # mean the whole PO/SO is available to ship -- surface it for a clerk instead of
+        # shipping goods that may still be afloat. Authoritative here (not just in the
+        # agent) so the guard can't be bypassed.
+        if not dry_run and container_multi_flags([container]).get(container):
+            return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
+                    "reason": "multi_container_receipt",
+                    "note": "container shares a PO Receipt with other containers; a clerk should "
+                            "confirm which orders are actually available before shipping"}
         resolved = containers_to_pos([container]).get(container, [])
         all_pos = resolved
         unresolved = not resolved
@@ -1107,14 +1135,28 @@ a{color:var(--fog)}.pill{background:var(--sand);border:1px solid var(--line);bor
 pre{background:#2b2b2b;color:#d7d2c6;padding:14px;border-radius:8px;overflow:auto;font-size:12px}
 """
 
-LOGIN = """<!doctype html><meta charset=utf-8><title>Sign in</title><style>%s
+# ---- Personalized browser-tab icons (Sand + Fog stone/fog palette). Base64 data-URI
+# SVGs so no external file / URL-encoding fuss. Ship-container for the shipments tool;
+# a distinct robot for the agent decision log so the two tabs are tellable apart.
+def _favicon(svg):
+    return '<link rel="icon" href="data:image/svg+xml;base64,%s">' % base64.b64encode(svg.encode()).decode()
+SHIP_FAVICON = _favicon('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    '<rect x="3" y="11" width="26" height="13" rx="2" fill="#5d7682"/>'
+    '<path d="M8 11v13M14 11v13M20 11v13M26 11v13" stroke="#efece3" stroke-width="1.6"/></svg>')
+AGENT_FAVICON = _favicon('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    '<rect x="6" y="10" width="20" height="15" rx="4" fill="#5d7682"/>'
+    '<rect x="15" y="3" width="2" height="5" rx="1" fill="#7d7363"/><circle cx="16" cy="6" r="2" fill="#7d7363"/>'
+    '<circle cx="12" cy="17" r="2.3" fill="#efece3"/><circle cx="20" cy="17" r="2.3" fill="#efece3"/></svg>')
+
+LOGIN = """<!doctype html><meta charset=utf-8><title>Sign in</title>%s<style>%s
 .box{max-width:340px;margin:12vh auto}</style><div class=wrap><div class="card box">
 <div class=brand>SAND + FOG</div><h1>Handover &#8594; Shipments</h1>
 <form method=post action=/login><p><input type=text name=user placeholder="Username" autofocus></p>
 <p><input type=password name=pw placeholder="Password"></p>
-<button>Sign in</button></form></div></div>""" % CSS
+<button>Sign in</button></form></div></div>""" % (SHIP_FAVICON, CSS)
 
-def page(body):
+def page(body, favicon=None):
+    favicon = favicon or SHIP_FAVICON
     connected = bool(access_token())
     if connected:
         u = (connected_user() or "").replace("<", "").replace(">", "")
@@ -1128,10 +1170,10 @@ def page(body):
                      ' <a class=pill href=/connect>Switch account</a>' % label)
     else:
         badge = '<a class=pill href=/connect>Connect to Acumatica</a>'
-    return """<!doctype html><meta charset=utf-8><title>Handover &#8594; Shipments</title><style>%s</style>
+    return """<!doctype html><meta charset=utf-8><title>Handover &#8594; Shipments</title>%s<style>%s</style>
 <div class=wrap><div class=brand>SAND + FOG</div><h1>Handover Advice &#8594; Acumatica Shipments</h1>
 <p class=sub>%s &nbsp; <a class=pill href=/>Home</a> <a class=pill href=/guide>Guide</a> <a class=pill href=/history>History</a> <a class=pill href=/diag>Diagnostics</a></p>
-%s</div>""" % (CSS, badge, body)
+%s</div>""" % (favicon, CSS, badge, body)
 
 HOME = """<div class=card>
 <h1 style="font-size:18px">Create shipments from a handover advice</h1>
@@ -1286,7 +1328,7 @@ class H(BaseHTTPRequestHandler):
                 limit = 200
             rows = agent_log_read(limit=limit, exceptions_only=exc_only, message_id=msg_id)
             if qs.get("view", [""])[0] == "html" or self._authed():
-                return self._send(200, page(_agent_log_html(rows, exc_only)))
+                return self._send(200, page(_agent_log_html(rows, exc_only), favicon=AGENT_FAVICON))
             return self._send(200, json.dumps(rows), "application/json")
         if u.path == "/ingest/list":
             # The mailbox-agent cron job pulls the queue of pushed emails here.
