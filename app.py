@@ -679,7 +679,13 @@ def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None, p
                 update.setdefault("custom", {}).setdefault("Document", {})[CFG["container_field"]] = \
                     {"type": "CustomStringField", "value": container_ref}
             if update:
-                api("PUT", f"{ENTITY}/Shipment/{ship}", update)
+                pst, presp = api("PUT", f"{ENTITY}/Shipment/{ship}", update)
+                if pst not in (200, 204):
+                    # Surface WHY the write itself was rejected (e.g. a business rule
+                    # locking ShipmentDate) instead of only reporting the date mismatch
+                    # with no clue as to the cause.
+                    res["ship_date_put_status"] = pst
+                    res["ship_date_put_error"] = presp if isinstance(presp, str) else json.dumps(presp)[:500]
                 # Verify the date write actually stuck instead of trusting it -- the
                 # CreateShipment action parameter already proved unreliable once.
                 vst, vdata = api("GET", f"{ENTITY}/Shipment/{ship}?$select=ShipmentDate")
