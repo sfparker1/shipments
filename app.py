@@ -416,7 +416,13 @@ def load_recent_receipts(force=False):
     # container attribute comes via $custom.
     path = (f"{ENTITY}/PurchaseReceipt?$filter=Date ge datetimeoffset'{cutoff}T00:00:00Z'"
             f"&$custom={view}.{field}")
-    data = _fetch_all_pages(path, page_size=500, max_pages=6)
+    # The list comes back oldest-first (ascending ReceiptNbr) and $orderby is IGNORED by this
+    # endpoint, so the receipts we care about (recent pickups = highest ReceiptNbr) are at the
+    # END. Page through the WHOLE date-bounded window -- the Date filter caps the total, so
+    # paging stops naturally when a short page arrives; max_pages is just a runaway guard. Rows
+    # are header-only now, so deep paging is cheap. (Was max_pages=6 -> capped at 3000 -> missed
+    # everything recent.)
+    data = _fetch_all_pages(path, page_size=500, max_pages=40)
     rows = []
     for r in data:
         cont = ((r.get("custom") or {}).get(view, {}).get(field) or {}).get("value")
