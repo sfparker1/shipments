@@ -594,10 +594,19 @@ def find_sales_orders_batch(pos):
     return results
 
 # ---------------- shipment creation (validate via /diag first) ----------------
-def _latest_shipment_for_order(order_nbr):
-    st, data = api("GET", f"{ENTITY}/Shipment?$filter=substringof('{order_nbr}',OrderNbr) eq true&$select=ShipmentNbr&$top=1&$orderby=ShipmentNbr desc")
-    if st == 200 and isinstance(data, list) and data:
-        return (data[0].get("ShipmentNbr") or {}).get("value")
+def _latest_shipment_for_order(order_nbr, retries=5, delay=1.5):
+    """GET the most recent Shipment for an order. Called right after CreateShipment's
+    long-running action reports done -- confirmed via a real run where the action said
+    complete but an immediate lookup found nothing (Acumatica's OData read can lag briefly
+    behind the action actually finishing), so retry a few times before concluding nothing
+    was created rather than reporting a false negative on the very first check."""
+    q = f"{ENTITY}/Shipment?$filter=substringof('{order_nbr}',OrderNbr) eq true&$select=ShipmentNbr&$top=1&$orderby=ShipmentNbr desc"
+    for attempt in range(retries):
+        st, data = api("GET", q)
+        if st == 200 and isinstance(data, list) and data:
+            return (data[0].get("ShipmentNbr") or {}).get("value")
+        if attempt < retries - 1:
+            time.sleep(delay)
     return None
 
 def _failure_reason(order_type, order_nbr):
