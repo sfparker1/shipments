@@ -649,7 +649,18 @@ def set_shipment_date_and_container(ship, date=None, container_ref=None):
             {"type": "CustomStringField", "value": container_ref}
     if not update:
         return out
-    pst, presp = api("PUT", f"{ENTITY}/Shipment/{ship}", update)
+    # PUT needs the FULL composite key (Type + ShipmentNbr) -- a bare ShipmentNbr caused
+    # Acumatica's router to misresolve the request as a file-attach call ("Invalid uri
+    # structure" from EntityController.PutFile), confirmed via a real run. GET tolerates the
+    # shorthand (used successfully throughout this file), so fetch the real Type value with
+    # it rather than guess the enum string, then PUT to the full key.
+    tst, tdata = api("GET", f"{ENTITY}/Shipment/{ship}?$select=Type")
+    ship_type = (tdata.get("Type") or {}).get("value") if tst == 200 and isinstance(tdata, dict) else None
+    if not ship_type:
+        out["ship_date_put_status"] = tst
+        out["ship_date_put_error"] = "could not read the shipment's Type field to build the composite key"
+        return out
+    pst, presp = api("PUT", f"{ENTITY}/Shipment/{ship_type}/{ship}", update)
     if pst not in (200, 204):
         # Surface WHY the write itself was rejected (e.g. a business rule locking
         # ShipmentDate) instead of only reporting the date mismatch with no clue as to cause.
