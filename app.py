@@ -429,7 +429,7 @@ def load_recent_receipts(force=False):
         rows.append({"containers": conts, "container_raw": cont.strip(),
                      "receipt_nbr": (r.get("ReceiptNbr") or {}).get("value"),
                      "vendor_ref": (r.get("VendorRef") or {}).get("value") or ""})
-    _RECEIPTS_CACHE.update(rows=rows, ts=now)
+    _RECEIPTS_CACHE.update(rows=rows, ts=now, raw_total=len(data))
     return rows
 
 def containers_to_pos(containers):
@@ -1141,6 +1141,18 @@ def diagnostics(sample_po=None, sample_container=None, sample_receipt=None):
         out["load_shape_probe"] = {"status": pst,
                                    "count": (len(pdata) if isinstance(pdata, list) else None),
                                    "error": (None if isinstance(pdata, list) else pdata)}
+        # COVERAGE PROBES: why isn't a known recent receipt (007068) in the loaded set?
+        out["receipts_raw_total"] = _RECEIPTS_CACHE.get("raw_total")  # pre-filter count; ~3000 => page cap hit
+        def _rc(lst):
+            return ([{"ReceiptNbr": (r.get("ReceiptNbr") or {}).get("value"),
+                      "container": ((r.get("custom") or {}).get(rc_view, {}).get(rc_field) or {}).get("value")}
+                     for r in lst] if isinstance(lst, list) else lst)
+        # (a) does descending order work, and do the newest receipts carry containers?
+        _, dd = api("GET", f"{ENTITY}/PurchaseReceipt?$orderby=ReceiptNbr desc&$top=5&$custom={rc_view}.{rc_field}")
+        out["probe_orderby_desc"] = _rc(dd)
+        # (b) can we get the exact target receipt via a ReceiptNbr filter, with its container?
+        _, td = api("GET", f"{ENTITY}/PurchaseReceipt?$filter=ReceiptNbr eq '007068'&$custom={rc_view}.{rc_field}")
+        out["probe_007068"] = _rc(td)
     # FULL custom-field inventory on PurchaseReceipt (all views, every field name) --
     # so if auto-discovery picked the wrong container field we can see the real one
     # (e.g. the "Container Tracking" field) and its exact contract-API name/view to set
