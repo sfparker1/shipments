@@ -594,17 +594,22 @@ def find_sales_orders_batch(pos):
     return results
 
 # ---------------- shipment creation (validate via /diag first) ----------------
-def _latest_shipment_for_order(order_nbr, retries=5, delay=1.5):
-    """GET the most recent Shipment for an order. Called right after CreateShipment's
-    long-running action reports done -- confirmed via a real run where the action said
-    complete but an immediate lookup found nothing (Acumatica's OData read can lag briefly
-    behind the action actually finishing), so retry a few times before concluding nothing
-    was created rather than reporting a false negative on the very first check."""
-    q = f"{ENTITY}/Shipment?$filter=substringof('{order_nbr}',OrderNbr) eq true&$select=ShipmentNbr&$top=1&$orderby=ShipmentNbr desc"
+def _latest_shipment_for_order(order_type, order_nbr, retries=3, delay=1.0):
+    """Find the most recent real Shipment for an order, right after CreateShipment's
+    long-running action reports done. FIXED (2026-07-13): originally filtered the Shipment
+    entity with `substringof(...)`, which this tenant returns a 500 for -- confirmed via a
+    real run where two shipments (017236/017237) genuinely existed in Acumatica but this
+    lookup reported "not found" every single time, even after retrying, because the query
+    itself was broken, not merely racing Acumatica's indexing. Use the same GET-by-key +
+    $expand=Shipments pattern _order_pipeline() already uses successfully on this tenant
+    instead. Small retry kept only for genuine propagation lag, not as the primary fix."""
     for attempt in range(retries):
-        st, data = api("GET", q)
-        if st == 200 and isinstance(data, list) and data:
-            return (data[0].get("ShipmentNbr") or {}).get("value")
+        st, d = api("GET", f"{ENTITY}/SalesOrder/{order_type}/{order_nbr}?$expand=Shipments")
+        if st == 200 and isinstance(d, dict):
+            # Real shipment records carry a ShipmentNbr; credit-memo/auto-issue rows don't.
+            ship_recs = [s for s in (d.get("Shipments") or []) if _sh_field(s, "ShipmentNbr")]
+            if ship_recs:
+                return _sh_field(ship_recs[-1], "ShipmentNbr")
         if attempt < retries - 1:
             time.sleep(delay)
     return None
@@ -665,7 +670,7 @@ def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None, p
 
     res["created"] = st in (200, 204)
     if res["created"]:
-        ship = _latest_shipment_for_order(order_nbr)
+        ship = _latest_shipment_for_order(order_type, order_nbr)
         res["shipment_nbr"] = ship
         if ship:
             update = {}
