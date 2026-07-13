@@ -634,6 +634,35 @@ def _failure_reason(order_type, order_nbr):
         return f"Order status is '{stt}' — not shippable"
     return "Nothing available to ship (backordered or no stock in the ship-from warehouse)"
 
+def set_shipment_date_and_container(ship, date=None, container_ref=None):
+    """PUT ShipmentDate (and the container custom field) onto an EXISTING shipment, then
+    read it back to verify the date actually stuck -- the CreateShipment action's own
+    ShipmentDate parameter proved unreliable (shipments came back dated "today" regardless).
+    Shared by create_shipment() (right after a shipment is made) and the standalone
+    /fixshipdate utility (for correcting an already-created record without re-running
+    CreateShipment, which would create a duplicate)."""
+    out = {}
+    update = {}
+    if date: update["ShipmentDate"] = {"value": date}
+    if container_ref and CFG["container_field"]:
+        update.setdefault("custom", {}).setdefault("Document", {})[CFG["container_field"]] = \
+            {"type": "CustomStringField", "value": container_ref}
+    if not update:
+        return out
+    pst, presp = api("PUT", f"{ENTITY}/Shipment/{ship}", update)
+    if pst not in (200, 204):
+        # Surface WHY the write itself was rejected (e.g. a business rule locking
+        # ShipmentDate) instead of only reporting the date mismatch with no clue as to cause.
+        out["ship_date_put_status"] = pst
+        out["ship_date_put_error"] = presp if isinstance(presp, str) else json.dumps(presp)[:500]
+    vst, vdata = api("GET", f"{ENTITY}/Shipment/{ship}?$select=ShipmentDate")
+    actual = ((vdata.get("ShipmentDate") or {}).get("value") or "")[:10] \
+        if vst == 200 and isinstance(vdata, dict) else None
+    out["ship_date_verified"] = bool(date) and actual == date
+    if date and actual and actual != date:
+        out["ship_date_actual"] = actual
+    return out
+
 def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None, po=None):
     # ship_date is required by the caller (process_file hard-stops before this
     # point if it's missing) -- no more silent fallback to a synced date or to
@@ -673,27 +702,7 @@ def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None, p
         ship = _latest_shipment_for_order(order_type, order_nbr)
         res["shipment_nbr"] = ship
         if ship:
-            update = {}
-            if date: update["ShipmentDate"] = {"value": date}
-            if container_ref and CFG["container_field"]:
-                update.setdefault("custom", {}).setdefault("Document", {})[CFG["container_field"]] = \
-                    {"type": "CustomStringField", "value": container_ref}
-            if update:
-                pst, presp = api("PUT", f"{ENTITY}/Shipment/{ship}", update)
-                if pst not in (200, 204):
-                    # Surface WHY the write itself was rejected (e.g. a business rule
-                    # locking ShipmentDate) instead of only reporting the date mismatch
-                    # with no clue as to the cause.
-                    res["ship_date_put_status"] = pst
-                    res["ship_date_put_error"] = presp if isinstance(presp, str) else json.dumps(presp)[:500]
-                # Verify the date write actually stuck instead of trusting it -- the
-                # CreateShipment action parameter already proved unreliable once.
-                vst, vdata = api("GET", f"{ENTITY}/Shipment/{ship}?$select=ShipmentDate")
-                actual = ((vdata.get("ShipmentDate") or {}).get("value") or "")[:10] \
-                    if vst == 200 and isinstance(vdata, dict) else None
-                res["ship_date_verified"] = bool(date) and actual == date
-                if date and actual and actual != date:
-                    res["ship_date_actual"] = actual
+            res.update(set_shipment_date_and_container(ship, date, container_ref))
         res["verified"] = bool(ship)
         if not ship:
             # Acumatica's action reported done, but no shipment can be found for this
@@ -1790,6 +1799,29 @@ class H(BaseHTTPRequestHandler):
                 return self._send(400, json.dumps({"error": "container is required"}), "application/json")
             try:
                 out = process_manual(container, ship_date, pos=pos, source=source, dry_run=dry)
+                return self._send(200, json.dumps(out), "application/json")
+            except Exception as e:
+                return self._send(200, json.dumps({"error": str(e)}), "application/json")
+        if u.path == "/fixshipdate":
+            # Correct ShipmentDate on an ALREADY-CREATED shipment without re-running
+            # CreateShipment (which would create a duplicate). Same auth/risk tier as
+            # /autoship since it writes to a real Acumatica record.
+            want = AUTOSHIP_TOKEN
+            got = (self.headers.get("Authorization", "") or "").removeprefix("Bearer ").strip()
+            if not (want and hmac.compare_digest(got.encode(), want.encode())):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            ln = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(ln).decode() or "{}")
+            except Exception:
+                return self._send(400, json.dumps({"error": "invalid JSON body"}), "application/json")
+            ship = (body.get("shipment") or "").strip()
+            date = (body.get("ship_date") or "").strip()
+            if not ship or not date:
+                return self._send(400, json.dumps({"error": "shipment and ship_date are required"}), "application/json")
+            try:
+                out = set_shipment_date_and_container(ship, date=date)
+                out["shipment"] = ship
                 return self._send(200, json.dumps(out), "application/json")
             except Exception as e:
                 return self._send(200, json.dumps({"error": str(e)}), "application/json")
