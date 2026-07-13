@@ -398,7 +398,12 @@ def discover_receipt_container_field():
 
 def load_recent_receipts(force=False):
     """Fetch recent PurchaseReceipts (bounded to RECEIPT_LOOKBACK_DAYS) with the
-    container UDF and each line's internal PO# expanded. Cached briefly."""
+    container attribute + the receipt's own VendorRef header. Cached briefly.
+
+    LEAN: the retail order lives right on the receipt's VendorRef header
+    (e.g. "M2626 124940" -> 124940), so we do NOT $expand=Details or make a
+    separate PO lookup -- that pulled every line item of thousands of receipts
+    and hung the page. Header-only + $custom for the container = small + fast."""
     now = time.time()
     if not force and _RECEIPTS_CACHE["rows"] is not None and now - _RECEIPTS_CACHE["ts"] < RECEIPTS_TTL:
         return _RECEIPTS_CACHE["rows"]
@@ -406,73 +411,42 @@ def load_recent_receipts(force=False):
     if not field:
         return []
     cutoff = (datetime.date.today() - datetime.timedelta(days=RECEIPT_LOOKBACK_DAYS)).isoformat()
-    # NO $select. Two contract-API rules bit us here:
-    #  1. custom fields/attributes (AttributeCONTAINER) come back only via $custom=, not $select.
-    #  2. $select cannot reach a nested detail field ("Details/POOrderNbr") -- including it made
-    #     the whole list query return nothing. $expand=Details already returns POOrderNbr in full.
-    # So: filter by Date (bounds the set so paging covers it), expand Details, pull the container
-    # via $custom, and let the records come back whole.
+    # Date filter uses the OData datetimeoffset literal (datetimevalue is rejected). No
+    # $expand, no $select -- VendorRef is a top-level field returned by default; the
+    # container attribute comes via $custom.
     path = (f"{ENTITY}/PurchaseReceipt?$filter=Date ge datetimeoffset'{cutoff}T00:00:00Z'"
-            f"&$expand=Details&$custom={view}.{field}")
+            f"&$custom={view}.{field}")
     data = _fetch_all_pages(path, page_size=500, max_pages=6)
     rows = []
     for r in data:
         cont = ((r.get("custom") or {}).get(view, {}).get(field) or {}).get("value")
         if not cont:
             continue
-        # One receipt's container UDF can list SEVERAL containers (confirmed by Parker).
-        # Parse out each ISO container token (4 letters + 6-7 digits) so a single-container
-        # query matches a multi-container receipt, and so callers can tell when a receipt
-        # spans more than one container (the ~3% split case that must be flagged, not
-        # auto-shipped). Fall back to the raw string if no ISO token is found.
+        # One receipt's container attribute can list SEVERAL containers (confirmed). Parse
+        # each ISO container token (4 letters + 6-7 digits) so a single-container query
+        # matches a multi-container receipt and callers can flag the ~3% split case.
         conts = [m.upper() for m in re.findall(r"[A-Z]{4}\d{6,7}", cont.upper())] or [cont.strip().upper()]
-        internal_pos = sorted({(d.get("POOrderNbr") or {}).get("value") for d in (r.get("Details") or [])
-                                if (d.get("POOrderNbr") or {}).get("value")})
-        if internal_pos:
-            rows.append({"containers": conts, "container_raw": cont.strip(),
-                         "receipt_nbr": (r.get("ReceiptNbr") or {}).get("value"), "internal_pos": internal_pos})
+        rows.append({"containers": conts, "container_raw": cont.strip(),
+                     "receipt_nbr": (r.get("ReceiptNbr") or {}).get("value"),
+                     "vendor_ref": (r.get("VendorRef") or {}).get("value") or ""})
     _RECEIPTS_CACHE.update(rows=rows, ts=now)
     return rows
 
-def load_po_vendor_refs(order_nbrs):
-    """Given Sand+Fog's internal PO numbers, fetch their VendorRef values from
-    Acumatica's PurchaseOrder entity -- equality filters only, batched into
-    OR-chains (substringof is avoided; see the SalesOrder 500 note)."""
-    order_nbrs = sorted({n for n in order_nbrs if n})
-    out = {}
-    for i in range(0, len(order_nbrs), 25):
-        chunk = order_nbrs[i:i + 25]
-        flt = " or ".join("OrderNbr eq '%s'" % n.replace("'", "''") for n in chunk)
-        q = f"{ENTITY}/PurchaseOrder?$filter=({flt})&$select=OrderNbr,VendorRef"
-        st, data = api("GET", q)
-        if st == 200 and isinstance(data, list):
-            for po in data:
-                nbr = (po.get("OrderNbr") or {}).get("value")
-                ref = (po.get("VendorRef") or {}).get("value")
-                if nbr:
-                    out[nbr] = ref or ""
-    return out
-
 def containers_to_pos(containers):
-    """Resolve each advice container to the retail PO#s inside it via Acumatica
-    (container -> PO Receipt -> internal PO# -> VendorRef -> retail PO digits).
-    Returns {container: [po, ...]}; an empty list means the chain didn't resolve
-    (no receipt yet, or no VendorRef match) -- callers should flag these rather
-    than silently drop them."""
+    """Resolve each container to its retail PO#(s) via Acumatica: container -> the PO
+    Receipt(s) carrying it -> the retail order digits in that receipt's VendorRef header.
+    Returns {container: [po, ...]}; an empty list means it didn't resolve (no receipt yet,
+    or no order digits in the VendorRef) -- callers flag these rather than silently drop."""
     containers = [c.strip().upper() for c in containers if c]
     if not containers:
         return {}
     receipts = load_recent_receipts()
-    all_internal_pos = {p for r in receipts for p in r["internal_pos"]}
-    vendor_refs = load_po_vendor_refs(all_internal_pos)
     by_container = {}
     for r in receipts:
         for c in r["containers"]:
             pos = by_container.setdefault(c, set())
-            for internal_po in r["internal_pos"]:
-                ref = vendor_refs.get(internal_po, "")
-                for n in re.findall(r"\b(\d{6})\b", ref):
-                    pos.add(n)
+            for n in re.findall(r"\b(\d{6})\b", r.get("vendor_ref") or ""):
+                pos.add(n)
     return {c: sorted(by_container.get(c, [])) for c in containers}
 
 def container_multi_flags(containers):
@@ -1184,8 +1158,7 @@ def diagnostics(sample_po=None, sample_container=None, sample_receipt=None):
         receipts = [r for r in load_recent_receipts() if sc in r.get("containers", [])]
         out["sample_container"] = sc
         out["sample_container_receipts"] = receipts
-        internal_pos = {p for r in receipts for p in r["internal_pos"]}
-        out["sample_container_vendor_refs"] = load_po_vendor_refs(internal_pos)
+        out["sample_container_vendor_refs"] = sorted({r.get("vendor_ref") for r in receipts if r.get("vendor_ref")})
         out["sample_container_resolved_pos"] = containers_to_pos([sc]).get(sc, [])
     if sample_receipt:
         # Raw contract-API view of one receipt as THIS connection sees it, requesting the
