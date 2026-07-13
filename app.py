@@ -490,8 +490,30 @@ def load_open_orders(force=False):
         _OPEN_ORDERS["ts"] = now
     return rows
 
+# Retail POs are a 6-digit MASTER number. In Acumatica each master is split into one
+# Sales Order per DC (distribution center); the DC is a short numeric prefix on the
+# CustomerOrder, so master 124940 appears as 06124940, 07124940, 01124940, ... (1 DC =
+# 1 SO = 1 invoice). Matching the master to open orders MUST be an anchored suffix with a
+# <=2-digit numeric DC prefix -- NOT a loose substring. A plain `master in cust_order`
+# also hits mid-string (master 124940 matches 12494055, whose real master is 494055),
+# which would ship the wrong customer. Anchoring to <DC><master>$ eliminates that.
+# Matching MULTIPLE open orders for one master is EXPECTED (all DCs ship together) --
+# it is not an ambiguity to flag.
+DC_PREFIX_MAXLEN = 2  # DC-code length in front of the 6-digit master (S+F order scheme)
+
+def _co_matches_master(cust_order, master):
+    if cust_order == master:
+        return True  # e.g. an order with no DC prefix (Costco)
+    if cust_order.endswith(master):
+        prefix = cust_order[:-len(master)]
+        return prefix.isdigit() and 1 <= len(prefix) <= DC_PREFIX_MAXLEN
+    return False
+
 def find_sales_orders_batch(pos):
-    """Match every PO# against the cached open-order list locally (instant)."""
+    """Match every retail-PO master against the cached open-order list locally (instant).
+    One master normally matches SEVERAL open orders -- one per DC -- and that is expected;
+    they ship and invoice together. See _co_matches_master for why this is an anchored
+    suffix match (<DC><master>$) rather than a substring test."""
     orders = load_open_orders()
     results = {p: [] for p in pos}
     for o in orders:
@@ -499,7 +521,7 @@ def find_sales_orders_batch(pos):
         if not co:
             continue
         for p in pos:
-            if p in co:
+            if _co_matches_master(co, p):
                 results[p].append(o)
     return results
 
