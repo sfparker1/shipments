@@ -932,6 +932,13 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
                               if not receipt_pos_by_container.get(c) and not text_pos_by_container.get(c)]
 
     matched = find_sales_orders_batch(all_pos)
+    if all_pos and not any(matched.get(p) for p in all_pos):
+        # Every PO missed -- before flagging "no open sales order" across the board, force
+        # one fresh fetch. The 10-min open-orders cache (load_open_orders) can lag behind a
+        # very recent status change in Acumatica: confirmed via a real case where an order
+        # was genuinely Open in Acumatica but the cached snapshot pre-dated that.
+        load_open_orders(force=True)
+        matched = find_sales_orders_batch(all_pos)
     rows = []; log_orders = []; to_create = 0; created = 0
     for po in all_pos:
         matches = matched.get(po, [])
@@ -1021,6 +1028,10 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         unresolved = not resolved
 
     matched = find_sales_orders_batch(all_pos)
+    if all_pos and not any(matched.get(p) for p in all_pos):
+        # Same stale-cache guard as process_file() -- see its comment above.
+        load_open_orders(force=True)
+        matched = find_sales_orders_batch(all_pos)
     rows = []; log_orders = []; to_create = 0; created = 0
     for po in all_pos:
         matches = matched.get(po, [])
