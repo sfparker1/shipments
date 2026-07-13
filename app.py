@@ -198,7 +198,10 @@ def build_authorize_url():
     _PKCE["verifier"] = verifier; _PKCE["state"] = state
     save_json(PKCE_PATH, {"verifier": verifier, "state": state})
     q = {"response_type": "code", "client_id": CFG["client_id"], "redirect_uri": REDIRECT_URI,
-         "scope": "api offline_access", "code_challenge": challenge,
+         # openid+profile requested so the token/userinfo actually carries a username claim --
+         # without them Acumatica's identity endpoints return nothing to identify who's
+         # connected, which is why the "Connected as ..." banner silently showed no user.
+         "scope": "api offline_access openid profile", "code_challenge": challenge,
          "code_challenge_method": "S256", "state": state,
          "prompt": "login"}  # force the Acumatica login prompt so it never silently reuses a personal SSO session
     return CFG["base_url"] + "/identity/connect/authorize?" + urllib.parse.urlencode(q)
@@ -1321,10 +1324,17 @@ def page(body, favicon=None):
         if exp and u and exp.lower() not in u.lower():
             badge = ('<span class=pill style="border-color:#b0653a;color:#b0653a">&#9888; Connected as %s &mdash; expected %s</span>'
                      ' <a class=pill href=/connect>Switch account</a>' % (u, exp))
+        elif not u:
+            # Detection failed (or the token predates requesting the openid/profile scope) --
+            # warn loudly rather than showing a calm green "Connected" that implies verified.
+            # Every write on this service runs as whoever is ACTUALLY logged in regardless of
+            # what this banner says, so an unverifiable identity must not look fine.
+            badge = ('<span class=pill style="border-color:#b0653a;color:#b0653a">'
+                     '&#9888; Connected &mdash; user identity unknown, verify manually before any write</span>'
+                     ' <a class=pill href=/connect>Switch account</a>')
         else:
-            label = ("Connected as %s" % u) if u else "Connected to Acumatica"
-            badge = ('<span class=pill style="border-color:#5a7d5a">%s</span>'
-                     ' <a class=pill href=/connect>Switch account</a>' % label)
+            badge = ('<span class=pill style="border-color:#5a7d5a">Connected as %s</span>'
+                     ' <a class=pill href=/connect>Switch account</a>' % u)
     else:
         badge = '<a class=pill href=/connect>Connect to Acumatica</a>'
     return """<!doctype html><meta charset=utf-8><title>Handover &#8594; Shipments</title>%s<style>%s</style>
