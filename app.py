@@ -651,18 +651,14 @@ def set_shipment_date_and_container(ship, date=None, container_ref=None):
         return out
     # PUT needs the FULL composite key (Type + ShipmentNbr) -- a bare ShipmentNbr caused
     # Acumatica's router to misresolve the request as a file-attach call ("Invalid uri
-    # structure" from EntityController.PutFile), confirmed via a real run. GET tolerates the
-    # shorthand (used successfully throughout this file), so fetch the real Type value with
-    # it rather than guess the enum string, then PUT to the full key.
-    # No $select here -- selecting Type specifically 500'd on a real run even though the
-    # same shorthand key with $select=ShipmentDate worked; fetching the full record avoids
-    # whatever that was and still gives us the Type field to read.
-    tst, tdata = api("GET", f"{ENTITY}/Shipment/{ship}")
-    ship_type = (tdata.get("Type") or {}).get("value") if tst == 200 and isinstance(tdata, dict) else None
-    if not ship_type:
-        out["ship_date_put_status"] = tst
-        out["ship_date_put_error"] = tdata if isinstance(tdata, str) else json.dumps(tdata)[:500]
-        return out
+    # structure"), confirmed via a real run. Looking Type up live proved unreliable in its
+    # own right (both $select=Type and a full-record GET on the bare key 500'd, for
+    # apparently unrelated reasons, even though $select=ShipmentDate on that same bare key
+    # works fine) -- so don't fight that. Every shipment this app creates comes from
+    # SalesOrder/CreateShipment, which always produces a standard outbound "Shipment" type
+    # document (matches the ShipmentType seen on a real sample earlier), so Type is a known
+    # constant here, not something requiring a lookup.
+    ship_type = "Shipment"
     pst, presp = api("PUT", f"{ENTITY}/Shipment/{ship_type}/{ship}", update)
     if pst not in (200, 204):
         # Surface WHY the write itself was rejected (e.g. a business rule locking
