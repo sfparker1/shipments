@@ -412,7 +412,7 @@ def load_recent_receipts(force=False):
     #     the whole list query return nothing. $expand=Details already returns POOrderNbr in full.
     # So: filter by Date (bounds the set so paging covers it), expand Details, pull the container
     # via $custom, and let the records come back whole.
-    path = (f"{ENTITY}/PurchaseReceipt?$filter=Date ge datetimevalue'{cutoff}'"
+    path = (f"{ENTITY}/PurchaseReceipt?$filter=Date ge datetimeoffset'{cutoff}T00:00:00Z'"
             f"&$expand=Details&$custom={view}.{field}")
     data = _fetch_all_pages(path, page_size=500, max_pages=6)
     rows = []
@@ -1162,7 +1162,7 @@ def diagnostics(sample_po=None, sample_container=None, sample_receipt=None):
         # Status probe of the EXACT load-shape query (top 5) -- if receipts_loaded is 0 this
         # shows whether the query errored (status != 200) or genuinely returned nothing.
         cutoff = (datetime.date.today() - datetime.timedelta(days=RECEIPT_LOOKBACK_DAYS)).isoformat()
-        pst, pdata = api("GET", f"{ENTITY}/PurchaseReceipt?$filter=Date ge datetimevalue'{cutoff}'"
+        pst, pdata = api("GET", f"{ENTITY}/PurchaseReceipt?$filter=Date ge datetimeoffset'{cutoff}T00:00:00Z'"
                                 f"&$expand=Details&$custom={rc_view}.{rc_field}&$top=5")
         out["load_shape_probe"] = {"status": pst,
                                    "count": (len(pdata) if isinstance(pdata, list) else None),
