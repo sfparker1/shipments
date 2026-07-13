@@ -287,6 +287,33 @@ def api(method, path, body=None, token=None):
     except Exception as e:
         return 0, {"error": str(e)}
 
+def api_with_headers(method, path, body=None, token=None):
+    """Like api(), but also returns response headers (lowercased keys) -- needed to follow
+    the `Location` header Acumatica gives back for LONG-RUNNING actions (e.g. CreateShipment).
+    A 202 from the initial POST means "accepted, still processing", not "done"; the caller
+    must poll Location until it stops returning 202."""
+    token = token or access_token()
+    if not token: return 0, {"error": "not connected"}, {}
+    url = (CFG["base_url"] + path).replace(" ", "%20")
+    headers = {"Authorization": "Bearer " + token, "Accept": "application/json"}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode(); headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            raw = r.read().decode()
+            try: parsed = json.loads(raw)
+            except Exception: parsed = raw
+            return r.status, parsed, {k.lower(): v for k, v in r.headers.items()}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()
+        try: parsed = json.loads(raw)
+        except Exception: parsed = raw
+        return e.code, parsed, {k.lower(): v for k, v in e.headers.items()}
+    except Exception as e:
+        return 0, {"error": str(e)}, {}
+
 # ---------------- PDF parser (Dachser formats A & B) ----------------
 _SKIP_MARK = ("CUBE", "STANDARD", "REEFER", "HIGH", "N/M", "CONTAINER", "40'", "20'", "45'")
 
@@ -602,8 +629,28 @@ def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None, p
     if date: params["ShipmentDate"] = {"value": date}
     if CFG["warehouse"]: params["WarehouseID"] = {"value": CFG["warehouse"]}
     body = {"entity": {"OrderType": {"value": order_type}, "OrderNbr": {"value": order_nbr}}, "parameters": params}
-    st, resp = api("POST", f"{ENTITY}/SalesOrder/CreateShipment", body)
-    res = {"order": f"{order_type} {order_nbr}", "invoke_status": st, "created": st in (200, 202, 204), "ship_date": date}
+    st, resp, headers = api_with_headers("POST", f"{ENTITY}/SalesOrder/CreateShipment", body)
+    res = {"order": f"{order_type} {order_nbr}", "invoke_status": st, "ship_date": date}
+
+    # CreateShipment is a LONG-RUNNING action: 202 + Location means "accepted, still
+    # processing", not "done". Poll Location until it stops returning 202 -- otherwise a
+    # 202 gets reported as success even when the action goes on to fail with a business
+    # rule (e.g. "no items are available for shipment"), which is exactly what happened
+    # before this fix: a real failure was logged as created=true.
+    location = headers.get("location")
+    if st == 202 and location:
+        poll_path = location.replace(CFG["base_url"], "") if location.startswith("http") else location
+        for _ in range(15):  # ~15s max; a single-order action normally finishes in 1-3s
+            time.sleep(1)
+            st, resp, _ = api_with_headers("GET", poll_path)
+            if st != 202:
+                break
+        else:
+            res.update(created=False, verified=False,
+                       error="Acumatica did not finish processing within 15s (still 202) -- check manually")
+            return res
+
+    res["created"] = st in (200, 204)
     if res["created"]:
         ship = _latest_shipment_for_order(order_nbr)
         res["shipment_nbr"] = ship
@@ -611,8 +658,13 @@ def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None, p
             api("PUT", f"{ENTITY}/Shipment/{ship}",
                 {"custom": {"Document": {CFG["container_field"]: {"type": "CustomStringField", "value": container_ref}}}})
         res["verified"] = bool(ship)
+        if not ship:
+            # Acumatica's action reported done, but no shipment can be found for this
+            # order -- don't claim success on an outcome we can't actually verify.
+            res["created"] = False
+            res["error"] = "action completed but no resulting shipment was found for this order"
     else:
-        res["error"] = resp if isinstance(resp, str) else json.dumps(resp)[:300]
+        res["error"] = resp if isinstance(resp, str) else json.dumps(resp)[:500]
         res["reason"] = _failure_reason(order_type, order_nbr)
     return res
 
