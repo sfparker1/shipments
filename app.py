@@ -451,9 +451,25 @@ def containers_to_pos(containers):
     for r in receipts:
         for c in r["containers"]:
             pos = by_container.setdefault(c, set())
-            for n in re.findall(r"\b(\d{6})\b", r.get("vendor_ref") or ""):
+            for n in _extract_order_tokens(r.get("vendor_ref")):
                 pos.add(n)
     return {c: sorted(by_container.get(c, [])) for c in containers}
+
+def container_scope(container):
+    """Classify a single container for the NRT port-pickup path (returns (scope, pos)):
+      - 'out_of_scope': every PO Receipt carrying it is 3PL-marked (MMX/4006/AMAZON/HG...)
+        -> revenue is recognized at the 3PL, not at port; skip QUIETLY, not an exception.
+      - 'in_scope': at least one in-scope order token (6-digit master or 8-9 digit Ecomm).
+      - 'unresolved': a receipt exists but carries no in-scope token, OR no receipt found
+        -> genuinely needs human review."""
+    container = (container or "").strip().upper()
+    receipts = [r for r in load_recent_receipts() if container in r.get("containers", [])]
+    pos = sorted({n for r in receipts for n in _extract_order_tokens(r.get("vendor_ref"))})
+    if pos:
+        return "in_scope", pos
+    if receipts and all(_is_3pl_vendor_ref(r.get("vendor_ref")) for r in receipts):
+        return "out_of_scope", []
+    return "unresolved", []
 
 def container_multi_flags(containers):
     """For each queried container, True if it appears on a PO Receipt that also lists
@@ -501,11 +517,33 @@ def load_open_orders(force=False):
 # it is not an ambiguity to flag.
 DC_PREFIX_MAXLEN = 2  # DC-code length in front of the 6-digit master (S+F order scheme)
 
-def _co_matches_master(cust_order, master):
-    if cust_order == master:
-        return True  # e.g. an order with no DC prefix (Costco)
-    if cust_order.endswith(master):
-        prefix = cust_order[:-len(master)]
+# Markers that flag a 3PL-bound receipt: those units are recognized at the 3PL LATER,
+# not at port pickup, so they are OUT OF SCOPE for this project and must never match a
+# sales order. Word-boundary matched against the VendorRef so they don't false-hit inside
+# a longer order number. NOTE: "HG" here is the 3PL HomeGoods flow -- in-scope HomeGoods
+# DC orders arrive with a 6-digit master, not an "HG" marker.
+THREEPL_MARKERS = ("MMX", "AMAZON", "HG", "4003", "4006", "4007")
+_THREEPL_RE = re.compile(r"(?<![A-Z0-9])(?:" + "|".join(THREEPL_MARKERS) + r")(?![A-Z0-9])")
+
+def _is_3pl_vendor_ref(vendor_ref):
+    return bool(_THREEPL_RE.search((vendor_ref or "").upper()))
+
+def _extract_order_tokens(vendor_ref):
+    """In-scope order numbers from a receipt VendorRef header: a 6-digit MASTER (DC-split,
+    fans out to every DC order) or an 8-9 digit Ecomm number (exact, one order). Returns []
+    for 3PL / out-of-scope refs so they never match a sales order."""
+    if _is_3pl_vendor_ref(vendor_ref):
+        return []
+    return re.findall(r"\b(\d{6}|\d{8,9})\b", vendor_ref or "")
+
+def _co_matches_master(cust_order, token):
+    """token = an order number pulled from a receipt VendorRef. A 6-digit MASTER matches
+    every DC-split order (<=2-digit numeric DC prefix + master, or the bare master). An
+    8-9 digit Ecomm number matches its order EXACTLY (Ecomm is not DC-split)."""
+    if cust_order == token:
+        return True  # exact: Ecomm 8-9 digit, or a bare master with no DC prefix (Costco)
+    if len(token) == 6 and cust_order.endswith(token):
+        prefix = cust_order[:-len(token)]
         return prefix.isdigit() and 1 <= len(prefix) <= DC_PREFIX_MAXLEN
     return False
 
@@ -874,17 +912,23 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         all_pos = list(dict.fromkeys(p.strip() for p in pos if p and p.strip()))
         unresolved = False
     else:
-        # NRT path: refuse to auto-create when the container's PO Receipt also covers
-        # OTHER containers. Picking up one container of a multi-container receipt doesn't
-        # mean the whole PO/SO is available to ship -- surface it for a clerk instead of
-        # shipping goods that may still be afloat. Authoritative here (not just in the
-        # agent) so the guard can't be bypassed.
+        scope, resolved = container_scope(container)
+        # Out of scope: 3PL-bound units are recognized at the 3PL, not at port pickup.
+        # Skip quietly (not a review exception) so 3PL containers don't spam the digest.
+        if scope == "out_of_scope":
+            return {"container": container, "out_of_scope": True, "created": 0, "orders_matched": 0,
+                    "reason": "out_of_scope_3pl",
+                    "note": "container's PO Receipt is 3PL-bound (MMX/4006/AMAZON/HG); revenue is "
+                            "recognized at the 3PL, not at port pickup -- skipped, no action needed"}
+        # NRT path: refuse to auto-create when the container's PO Receipt also covers OTHER
+        # containers. Picking up one container of a multi-container receipt doesn't mean the
+        # whole PO/SO is available to ship -- surface it for a clerk instead of shipping goods
+        # that may still be afloat. Authoritative here (not just in the agent).
         if not dry_run and container_multi_flags([container]).get(container):
             return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
                     "reason": "multi_container_receipt",
                     "note": "container shares a PO Receipt with other containers; a clerk should "
                             "confirm which orders are actually available before shipping"}
-        resolved = containers_to_pos([container]).get(container, [])
         all_pos = resolved
         unresolved = not resolved
 
