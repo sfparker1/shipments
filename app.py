@@ -654,11 +654,14 @@ def set_shipment_date_and_container(ship, date=None, container_ref=None):
     # structure" from EntityController.PutFile), confirmed via a real run. GET tolerates the
     # shorthand (used successfully throughout this file), so fetch the real Type value with
     # it rather than guess the enum string, then PUT to the full key.
-    tst, tdata = api("GET", f"{ENTITY}/Shipment/{ship}?$select=Type")
+    # No $select here -- selecting Type specifically 500'd on a real run even though the
+    # same shorthand key with $select=ShipmentDate worked; fetching the full record avoids
+    # whatever that was and still gives us the Type field to read.
+    tst, tdata = api("GET", f"{ENTITY}/Shipment/{ship}")
     ship_type = (tdata.get("Type") or {}).get("value") if tst == 200 and isinstance(tdata, dict) else None
     if not ship_type:
         out["ship_date_put_status"] = tst
-        out["ship_date_put_error"] = "could not read the shipment's Type field to build the composite key"
+        out["ship_date_put_error"] = tdata if isinstance(tdata, str) else json.dumps(tdata)[:500]
         return out
     pst, presp = api("PUT", f"{ENTITY}/Shipment/{ship_type}/{ship}", update)
     if pst not in (200, 204):
