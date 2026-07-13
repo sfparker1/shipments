@@ -923,8 +923,9 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         # NRT path: refuse to auto-create when the container's PO Receipt also covers OTHER
         # containers. Picking up one container of a multi-container receipt doesn't mean the
         # whole PO/SO is available to ship -- surface it for a clerk instead of shipping goods
-        # that may still be afloat. Authoritative here (not just in the agent).
-        if not dry_run and container_multi_flags([container]).get(container):
+        # that may still be afloat. Authoritative here (not just in the agent). Checked even in
+        # dry_run so a preview accurately reflects what the real run would refuse to do.
+        if container_multi_flags([container]).get(container):
             return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
                     "reason": "multi_container_receipt",
                     "note": "container shares a PO Receipt with other containers; a clerk should "
@@ -1467,6 +1468,26 @@ class H(BaseHTTPRequestHandler):
             if status_filter:
                 wl = {c: e for c, e in wl.items() if e.get("status") == status_filter}
             return self._send(200, json.dumps(wl), "application/json")
+        if u.path == "/autoship":
+            # Browser-friendly PREVIEW of the same resolution logic /autoship (POST) runs --
+            # for eyeballing container -> PO -> sales-order matches in a URL bar. Always
+            # forces dry_run=True regardless of query string: this route can never create
+            # a shipment (writes stay POST-only, above).
+            qs = urllib.parse.parse_qs(u.query)
+            want = AUTOSHIP_TOKEN
+            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            if not (token_ok or self._authed()):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            container = qs.get("container", [""])[0].strip()
+            pos = [p.strip() for p in qs.get("pos", [""])[0].split(",") if p.strip()] or None
+            source = (qs.get("source", ["preview"])[0] or "preview").strip()
+            if not container:
+                return self._send(400, json.dumps({"error": "container is required"}), "application/json")
+            try:
+                out = process_manual(container, None, pos=pos, source=source, dry_run=True)
+                return self._send(200, json.dumps(out), "application/json")
+            except Exception as e:
+                return self._send(200, json.dumps({"error": str(e)}), "application/json")
         if u.path == "/agent/log":
             # The mailbox-agent's decision audit trail. JSON for the agent's own
             # idempotency check (?message_id=...) and programmatic reads; a rendered HTML
