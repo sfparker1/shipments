@@ -624,6 +624,10 @@ def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None, p
     # ship_date is required by the caller (process_file hard-stops before this
     # point if it's missing) -- no more silent fallback to a synced date or to
     # "today". po is accepted for logging only.
+    # NOTE: the ShipmentDate action PARAMETER below is NOT reliably honored by Acumatica --
+    # confirmed via a real run where the resulting shipment came back dated "today" despite
+    # this parameter. Kept here in case it helps in some configs, but the real mechanism is
+    # the corrective PUT + verification read further down, right after the shipment exists.
     date = ship_date
     params = {}
     if date: params["ShipmentDate"] = {"value": date}
@@ -654,9 +658,22 @@ def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None, p
     if res["created"]:
         ship = _latest_shipment_for_order(order_nbr)
         res["shipment_nbr"] = ship
-        if ship and container_ref and CFG["container_field"]:
-            api("PUT", f"{ENTITY}/Shipment/{ship}",
-                {"custom": {"Document": {CFG["container_field"]: {"type": "CustomStringField", "value": container_ref}}}})
+        if ship:
+            update = {}
+            if date: update["ShipmentDate"] = {"value": date}
+            if container_ref and CFG["container_field"]:
+                update.setdefault("custom", {}).setdefault("Document", {})[CFG["container_field"]] = \
+                    {"type": "CustomStringField", "value": container_ref}
+            if update:
+                api("PUT", f"{ENTITY}/Shipment/{ship}", update)
+                # Verify the date write actually stuck instead of trusting it -- the
+                # CreateShipment action parameter already proved unreliable once.
+                vst, vdata = api("GET", f"{ENTITY}/Shipment/{ship}?$select=ShipmentDate")
+                actual = ((vdata.get("ShipmentDate") or {}).get("value") or "")[:10] \
+                    if vst == 200 and isinstance(vdata, dict) else None
+                res["ship_date_verified"] = bool(date) and actual == date
+                if date and actual and actual != date:
+                    res["ship_date_actual"] = actual
         res["verified"] = bool(ship)
         if not ship:
             # Acumatica's action reported done, but no shipment can be found for this
