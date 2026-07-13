@@ -884,7 +884,8 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
         else:
             status = "failed"
         log_run({"reference": parsed["dachser_reference"], "document": source_name or os.path.basename(path),
-                 "user": user, "status": status, "orders_matched": to_create, "created": created,
+                 "user": user, "acumatica_user": connected_user(), "status": status,
+                 "orders_matched": to_create, "created": created,
                  "containers": container_ref, "unresolved_containers": unresolved_containers,
                  "ship_date": ship_date, "orders": log_orders})
     return summary
@@ -972,8 +973,8 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         else:
             status = "failed"
         log_run({"reference": None, "document": f"auto:{source or 'unknown'}",
-                 "user": user or f"auto:{source or 'unknown'}", "status": status,
-                 "orders_matched": to_create, "created": created, "containers": container,
+                 "user": user or f"auto:{source or 'unknown'}", "acumatica_user": connected_user(),
+                 "status": status, "orders_matched": to_create, "created": created, "containers": container,
                  "unresolved_containers": unresolved_containers, "ship_date": ship_date,
                  "orders": log_orders})
     return summary
@@ -1158,10 +1159,42 @@ def so_pipeline(po):
     is already fully processed ('Done')."""
     return [_order_pipeline(m, po) for m in find_sales_orders_batch([po]).get(po, [])]
 
+def _identity_probe():
+    """Raw view of what the identity-detection path actually sees, for diagnosing why the
+    'Connected as ...' banner can't name a user. Shows JWT payload KEYS (not full token) and
+    the raw userinfo call outcome -- enough to tell whether Acumatica granted openid/profile
+    or silently dropped them, without ever printing the token itself."""
+    tok = load_json(TOKEN_PATH) or {}
+    at = tok.get("access_token", "")
+    out = {"stored_user": tok.get("_user"), "scope_in_token_response": tok.get("scope"),
+           "jwt_decodable": False, "jwt_payload_keys": [], "userinfo_status": None, "userinfo_body": None}
+    try:
+        parts = at.split(".")
+        if len(parts) >= 2:
+            pad = parts[1] + "=" * (-len(parts[1]) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(pad.encode()))
+            out["jwt_decodable"] = True
+            out["jwt_payload_keys"] = sorted(payload.keys())
+    except Exception as e:
+        out["jwt_decode_error"] = str(e)
+    try:
+        req = urllib.request.Request(CFG["base_url"] + "/identity/connect/userinfo",
+                                     headers={"Authorization": "Bearer " + at})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            out["userinfo_status"] = r.status
+            out["userinfo_body"] = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        out["userinfo_status"] = e.code
+        out["userinfo_body"] = e.read().decode("utf-8", "ignore")[:500]
+    except Exception as e:
+        out["userinfo_error"] = str(e)
+    return out
+
 def diagnostics(sample_po=None, sample_container=None, sample_receipt=None):
     out = {"connected": bool(access_token()), "tenant": CFG["tenant"],
            "container_field": CFG["container_field"] or "(not set)", "warehouse": CFG["warehouse"] or "(SO default)"}
     if not out["connected"]: return out
+    out["identity_probe"] = _identity_probe()
     # Structural samples (no substringof — that operator 500s on this tenant).
     # A single order with its Shipments expand reveals the real field names.
     sst, sso = api("GET", f"{ENTITY}/SalesOrder?$top=1&$expand=Shipments")
@@ -1606,15 +1639,29 @@ class H(BaseHTTPRequestHandler):
                 cont_cell = h.get("containers", "")
                 if unresolved:
                     cont_cell += f' <span class=pill style="border-color:#b06a5a;color:#b06a5a">&#9888; unresolved: {", ".join(unresolved)}</span>'
+                # Which Acumatica identity actually performed this write (not the app-level
+                # "By" caller/source tag) -- flag red if it doesn't match EXPECTED_ACU_USER, so
+                # segregation-of-duties drift shows up per-run in the permanent log, not only
+                # in the live banner (which only reflects whoever is connected RIGHT NOW).
+                acu_user = h.get("acumatica_user") or ""
+                exp = os.environ.get("EXPECTED_ACU_USER", "").strip()
+                if not acu_user:
+                    acu_cell = '<span class=pill style="border-color:#c9c0ad">unknown</span>'
+                elif exp and exp.lower() not in acu_user.lower():
+                    acu_cell = f'<span class=pill style="border-color:#b06a5a;color:#b06a5a">&#9888; {acu_user}</span>'
+                else:
+                    acu_cell = acu_user
                 return (f"<tr><td>{h.get('ts','')}</td><td>{h.get('user','') or ''}</td>"
+                        f"<td>{acu_cell}</td>"
                         f"<td>{h.get('document','') or ''}</td><td>{h.get('reference','')}</td>"
                         f"<td>{pill}</td><td>{h.get('created','')}/{h.get('orders_matched','')}</td>"
                         f"<td>{cont_cell}</td><td>{detail_cell}</td></tr>")
             rows = "".join(_hrow(h) for h in history())
             body = ('<div class=card><h1 style="font-size:16px">Run history</h1>'
                     '<p class=sub>Every shipment-creation run, kept permanently on the tool&#39;s disk (not just this session). '
-                    'Expand the last column for per-order/shipment detail.</p>'
-                    '<table><tr><th>When</th><th>By</th><th>Document</th><th>Reference</th><th>Status</th>'
+                    'Expand the last column for per-order/shipment detail. &#8220;Acumatica user&#8221; is who was actually '
+                    'connected when the write ran (set <code>EXPECTED_ACU_USER</code> to flag any run under a different account).</p>'
+                    '<table><tr><th>When</th><th>By</th><th>Acumatica user</th><th>Document</th><th>Reference</th><th>Status</th>'
                     '<th>Created/Matched</th><th>Containers</th><th>Orders</th></tr>' + rows + '</table></div>')
             return self._send(200, page(body))
         return self._send(404, page("<div class=card>Not found</div>"))
