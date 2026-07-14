@@ -640,14 +640,13 @@ def _failure_reason(order_type, order_nbr):
 
 def _resolve_shipment_id(ship_nbr):
     """GET-by-natural-key (proven reliable throughout this file) to fetch a shipment's
-    internal system id GUID. Avoids $select=Type specifically -- "Type" behaved differently
-    from every other field name tried on this tenant (plausibly a reserved/special-cased
-    word in the OData layer), while ordinary field names via $select on this same bare-key
-    URL have worked fine."""
+    internal system id GUID. Returns (id, current_date, debug) -- debug carries the raw
+    status/body on failure so a caller can show WHY, instead of a guess-again situation."""
     st, d = api("GET", f"{ENTITY}/Shipment/{ship_nbr}?$select=id,ShipmentDate")
     if st == 200 and isinstance(d, dict) and d.get("id"):
-        return d["id"], ((d.get("ShipmentDate") or {}).get("value") or "")[:10]
-    return None, None
+        return d["id"], ((d.get("ShipmentDate") or {}).get("value") or "")[:10], None
+    debug = {"status": st, "body": d if isinstance(d, str) else json.dumps(d)[:500]}
+    return None, None, debug
 
 def set_shipment_date_and_container(shipment_id, ship_nbr, date=None, container_ref=None):
     """PUT ShipmentDate (and the container custom field) onto an EXISTING shipment, then
@@ -1846,10 +1845,11 @@ class H(BaseHTTPRequestHandler):
             if not ship or not date:
                 return self._send(400, json.dumps({"error": "shipment and ship_date are required"}), "application/json")
             try:
-                ship_id, current_date = _resolve_shipment_id(ship)
+                ship_id, current_date, debug = _resolve_shipment_id(ship)
                 if not ship_id:
                     return self._send(200, json.dumps({"shipment": ship,
-                        "error": "could not resolve this shipment's internal id -- refusing to PUT"}), "application/json")
+                        "error": "could not resolve this shipment's internal id -- refusing to PUT",
+                        "debug": debug}), "application/json")
                 out = set_shipment_date_and_container(ship_id, ship, date=date)
                 out["shipment"] = ship
                 out["ship_date_before"] = current_date
