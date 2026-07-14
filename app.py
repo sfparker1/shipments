@@ -642,24 +642,20 @@ def set_shipment_date_and_container(ship, date=None, container_ref=None):
     /fixshipdate utility (for correcting an already-created record without re-running
     CreateShipment, which would create a duplicate)."""
     out = {}
-    update = {}
+    update = {"ShipmentNbr": {"value": ship}}
     if date: update["ShipmentDate"] = {"value": date}
     if container_ref and CFG["container_field"]:
         update.setdefault("custom", {}).setdefault("Document", {})[CFG["container_field"]] = \
             {"type": "CustomStringField", "value": container_ref}
-    if not update:
+    if len(update) <= 1:  # only the identifying key, nothing to actually change
         return out
-    # PUT needs the FULL composite key (Type + ShipmentNbr) -- a bare ShipmentNbr caused
-    # Acumatica's router to misresolve the request as a file-attach call ("Invalid uri
-    # structure"), confirmed via a real run. Looking Type up live proved unreliable in its
-    # own right (both $select=Type and a full-record GET on the bare key 500'd, for
-    # apparently unrelated reasons, even though $select=ShipmentDate on that same bare key
-    # works fine) -- so don't fight that. Every shipment this app creates comes from
-    # SalesOrder/CreateShipment, which always produces a standard outbound "Shipment" type
-    # document (matches the ShipmentType seen on a real sample earlier), so Type is a known
-    # constant here, not something requiring a lookup.
-    ship_type = "Shipment"
-    pst, presp = api("PUT", f"{ENTITY}/Shipment/{ship_type}/{ship}", update)
+    # Every URL-path-key variant tried (bare ShipmentNbr, guessed composite Type/ShipmentNbr)
+    # 500'd identically ("Invalid uri structure", routed into EntityController.PutFile)
+    # regardless of segment count -- so putting a key in the URL path isn't the right
+    # pattern for this entity/tenant. Acumatica's contract API updates a record by PUTting
+    # to the bare COLLECTION endpoint with the identifying key field(s) in the JSON BODY
+    # instead -- try that.
+    pst, presp = api("PUT", f"{ENTITY}/Shipment", update)
     if pst not in (200, 204):
         # Surface WHY the write itself was rejected (e.g. a business rule locking
         # ShipmentDate) instead of only reporting the date mismatch with no clue as to cause.
