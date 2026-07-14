@@ -829,6 +829,41 @@ def agent_summary(hours=24):
         mode = "live"
     else:
         mode = "mixed"
+
+    last_decision_at = all_rows[0].get("ts") if all_rows else None
+    # Agent-health flag -- same staleness threshold the dashboard uses, computed once here
+    # so a notification flow can branch on one field instead of doing its own date math.
+    if not last_decision_at:
+        agent_health = "no_activity"
+    else:
+        try:
+            agent_health = "stale" if (time.time() - _epoch(all_rows[0])) / 3600 > 6 else "ok"
+        except Exception:
+            agent_health = "ok"
+
+    # Real shipment-creation runs in this window that either failed technically or ran
+    # under an unexpected Acumatica identity -- distinct from exception_flag, which only
+    # covers cases the agent's own judgment recognized as ambiguous. A run can look fine to
+    # the agent (it called /autoship) but still fail on Acumatica's side, or succeed under
+    # the wrong account -- this catches both, so it's not invisible until someone happens
+    # to check /history.
+    exp_user = os.environ.get("EXPECTED_ACU_USER", "").strip()
+    run_issues = []
+    for h in history(limit=0):
+        try:
+            if time.mktime(time.strptime(h.get("ts", ""), "%Y-%m-%d %H:%M:%S")) < cutoff:
+                continue
+        except Exception:
+            continue
+        acu = h.get("acumatica_user") or ""
+        identity_mismatch = bool(exp_user and acu and exp_user.lower() not in acu.lower())
+        if h.get("status") in ("failed", "partial") or identity_mismatch:
+            run_issues.append({
+                "when": h.get("ts"), "containers": h.get("containers") or "",
+                "status": h.get("status") or "", "acumatica_user": acu or "(unknown)",
+                "identity_mismatch": identity_mismatch,
+            })
+
     return {
         "window_hours": hours,
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -840,7 +875,9 @@ def agent_summary(hours=24):
         "by_classification": by_class,
         "exceptions": exceptions,
         "queue_depth": len(ingest_list()),
-        "last_decision_at": all_rows[0].get("ts") if all_rows else None,
+        "last_decision_at": last_decision_at,
+        "agent_health": agent_health,
+        "run_issues": run_issues,
     }
 
 # ---------------- ingest queue (Power Automate push -> agent pull) ----------------
