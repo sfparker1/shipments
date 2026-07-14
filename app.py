@@ -635,37 +635,25 @@ def _failure_reason(order_type, order_nbr):
     return "Nothing available to ship (backordered or no stock in the ship-from warehouse)"
 
 def set_shipment_date_and_container(ship, date=None, container_ref=None):
-    """PUT ShipmentDate (and the container custom field) onto an EXISTING shipment, then
-    read it back to verify the date actually stuck -- the CreateShipment action's own
-    ShipmentDate parameter proved unreliable (shipments came back dated "today" regardless).
-    Shared by create_shipment() (right after a shipment is made) and the standalone
-    /fixshipdate utility (for correcting an already-created record without re-running
-    CreateShipment, which would create a duplicate)."""
+    """Report whether an existing shipment's ShipmentDate matches what was requested.
+    WRITE DISABLED 2026-07-14: every attempt to correct the date via PUT failed differently
+    -- URL-path key (bare ShipmentNbr, and a guessed composite Type/ShipmentNbr) both 500'd
+    identically ("Invalid uri structure", misrouted into EntityController.PutFile); PUTting
+    to the bare collection with the key in the JSON body instead caused Acumatica to attempt
+    an INSERT of a NEW blank shipment (422 "CustomerID cannot be empty" caught it that time,
+    but a different missing-field combination could someday succeed in creating a stray
+    garbage record). Too risky to keep guessing against production -- this now only READS
+    and reports the mismatch; it no longer attempts to write. Correct the date manually in
+    Acumatica for now. A real fix needs Acumatica's actual API contract (swagger/docs), not
+    further live trial-and-error. See [[container-pickup-tracking-project]] memory."""
     out = {}
-    update = {"ShipmentNbr": {"value": ship}}
-    if date: update["ShipmentDate"] = {"value": date}
-    if container_ref and CFG["container_field"]:
-        update.setdefault("custom", {}).setdefault("Document", {})[CFG["container_field"]] = \
-            {"type": "CustomStringField", "value": container_ref}
-    if len(update) <= 1:  # only the identifying key, nothing to actually change
+    if not date:
         return out
-    # Every URL-path-key variant tried (bare ShipmentNbr, guessed composite Type/ShipmentNbr)
-    # 500'd identically ("Invalid uri structure", routed into EntityController.PutFile)
-    # regardless of segment count -- so putting a key in the URL path isn't the right
-    # pattern for this entity/tenant. Acumatica's contract API updates a record by PUTting
-    # to the bare COLLECTION endpoint with the identifying key field(s) in the JSON BODY
-    # instead -- try that.
-    pst, presp = api("PUT", f"{ENTITY}/Shipment", update)
-    if pst not in (200, 204):
-        # Surface WHY the write itself was rejected (e.g. a business rule locking
-        # ShipmentDate) instead of only reporting the date mismatch with no clue as to cause.
-        out["ship_date_put_status"] = pst
-        out["ship_date_put_error"] = presp if isinstance(presp, str) else json.dumps(presp)[:500]
     vst, vdata = api("GET", f"{ENTITY}/Shipment/{ship}?$select=ShipmentDate")
     actual = ((vdata.get("ShipmentDate") or {}).get("value") or "")[:10] \
         if vst == 200 and isinstance(vdata, dict) else None
-    out["ship_date_verified"] = bool(date) and actual == date
-    if date and actual and actual != date:
+    out["ship_date_verified"] = actual == date
+    if actual and actual != date:
         out["ship_date_actual"] = actual
     return out
 
@@ -1809,9 +1797,11 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._send(200, json.dumps({"error": str(e)}), "application/json")
         if u.path == "/fixshipdate":
-            # Correct ShipmentDate on an ALREADY-CREATED shipment without re-running
-            # CreateShipment (which would create a duplicate). Same auth/risk tier as
-            # /autoship since it writes to a real Acumatica record.
+            # READ-ONLY as of 2026-07-14: reports whether an existing shipment's date
+            # matches what's expected. The write side was disabled -- see
+            # set_shipment_date_and_container()'s docstring for why. Kept as a POST (not a
+            # plain GET) since it still requires the write-tier AUTOSHIP_TOKEN, matching
+            # /autoship's auth pattern for consistency even though it no longer writes.
             want = AUTOSHIP_TOKEN
             got = (self.headers.get("Authorization", "") or "").removeprefix("Bearer ").strip()
             if not (want and hmac.compare_digest(got.encode(), want.encode())):
