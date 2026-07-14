@@ -1843,7 +1843,8 @@ class H(BaseHTTPRequestHandler):
                 ship = _latest_shipment_for_order(order_type, order_nbr)
                 if not ship or not ship.get("id"):
                     return self._send(200, json.dumps({"order": f"{order_type} {order_nbr}",
-                        "error": "could not find a shipment (with a resolvable id) for this order"}), "application/json")
+                        "error": "could not find a shipment (with a resolvable id) for this order",
+                        "debug_ship": ship}), "application/json")
                 out = set_shipment_date_and_container(ship["id"], ship["shipment_nbr"], date=date)
                 out["order"] = f"{order_type} {order_nbr}"
                 out["shipment"] = ship["shipment_nbr"]
