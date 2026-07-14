@@ -1495,14 +1495,82 @@ def page(body, favicon=None):
                      ' <a class=pill href=/connect>Switch account</a>' % u)
     else:
         badge = '<a class=pill href=/connect>Connect to Acumatica</a>'
-    return """<!doctype html><meta charset=utf-8><title>Handover &#8594; Shipments</title>%s<style>%s</style>
-<div class=wrap><div class=brand>SAND + FOG</div><h1>Handover Advice &#8594; Acumatica Shipments</h1>
-<p class=sub>%s &nbsp; <a class=pill href=/>Home</a> <a class=pill href=/guide>Guide</a> <a class=pill href=/history>History</a> <a class=pill href=/diag>Diagnostics</a></p>
+    return """<!doctype html><meta charset=utf-8><title>NRT Shipment Agent</title>%s<style>%s</style>
+<div class=wrap><div class=brand>SAND + FOG</div><h1>NRT Shipment Agent</h1>
+<p class=sub>%s &nbsp; <a class=pill href=/>Dashboard</a> <a class=pill href=/manual>Manual upload</a> <a class=pill href=/guide>Guide</a> <a class=pill href=/history>Shipment history</a> <a class=pill href=/diag>Diagnostics</a></p>
 %s</div>""" % (favicon, CSS, badge, body)
 
-HOME = """<div class=card>
-<h1 style="font-size:18px">Create shipments from a handover advice</h1>
-<p class=sub>Drop a Dachser handover-advice PDF. Preview the matched sales orders, then create shipments (left unconfirmed for a person to confirm in Acumatica).</p>
+def _dashboard_html():
+    """Agent dashboard -- the default landing page. Health/rollup stats up top (the same
+    agent_summary() the daily email digest already computes), then the most recent
+    decisions inline, so a glance here is enough for day-to-day monitoring. The manual
+    PDF-upload tool (the old default landing page) moved to /manual -- still there as a
+    fallback, just no longer the front door now that the agent handles the common case."""
+    s = agent_summary(hours=24)
+    recent = agent_log_read(limit=15)
+
+    mode_color = {"live": "#5a7d5a", "shadow": "#7d7363", "mixed": "#b0653a", "n/a": "#c9c0ad"}
+    mode_pill = ('<span class=pill style="border-color:%s">%s</span>'
+                 % (mode_color.get(s["mode"], "#c9c0ad"), s["mode"]))
+
+    # Same dead-man's-switch signal the daily digest email relies on, surfaced here too so
+    # a glance at the dashboard catches a stuck/stopped agent without waiting for 7am.
+    warn = ""
+    if s["last_decision_at"]:
+        try:
+            age_h = (time.time() - time.mktime(time.strptime(s["last_decision_at"], "%Y-%m-%d %H:%M:%S"))) / 3600
+            if age_h > 6:
+                warn = ('<p class=sub style="color:#b06a5a">&#9888; Last decision was %.0fh ago &mdash; '
+                        'check the agent is still running (Render cron logs).</p>' % age_h)
+        except Exception:
+            pass
+    elif s["decisions"] == 0:
+        warn = '<p class=sub style="color:#b06a5a">&#9888; No decisions logged in the last 24h.</p>'
+
+    by_class = "".join('<span class=pill>%s: %d</span>' % (k, v) for k, v in sorted(s["by_classification"].items()))
+
+    stats = ('<div class=card><h1 style="font-size:16px">Agent dashboard &mdash; last 24h</h1>'
+             '<p class=sub>Mode: %s &nbsp; Queue depth: <b>%s</b> &nbsp; Last decision: <b>%s</b></p>'
+             '%s'
+             '<p><b>%s</b> decisions &middot; <b>%s</b> shipments prepared &middot; '
+             '<b>%s</b> flagged for review &middot; <b>%s</b> no action needed</p>'
+             '<p>%s</p>'
+             '<p><a class=pill href=/agent/log?view=html>Full decision log</a> '
+             '<a class=pill href="/agent/log?exceptions_only=1&view=html">Exceptions only</a> '
+             '<a class=pill href=/history>Shipment run history</a> '
+             '<a class=pill href=/diag>Diagnostics</a> '
+             '<a class=pill href=/manual>Manual PDF upload (fallback)</a></p></div>'
+             % (mode_pill, s["queue_depth"], s["last_decision_at"] or "&mdash;", warn,
+                s["decisions"], s["shipments_prepared"], s["flagged"], s["no_action"],
+                by_class or "&mdash;"))
+    return stats + _dashboard_recent_html(recent)
+
+def _dashboard_recent_html(rows):
+    """Compact recent-activity table for the dashboard -- deliberately lighter than
+    /agent/log's full view (no args/result expand) so it stays scannable at a glance."""
+    def esc(v):
+        s = "" if v is None else str(v)
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    def _row(r):
+        flagged = bool(r.get("exception_flag"))
+        rowstyle = ' style="background:#f6ece8"' if flagged else ""
+        subj = esc(r.get("subject") or "")
+        if len(subj) > 50: subj = subj[:50] + "&hellip;"
+        exc = ("&#9888; " + esc(r.get("exception_reason") or "exception")) if flagged else ""
+        return (f"<tr{rowstyle}><td>{esc(r.get('ts',''))}</td><td>{subj}</td>"
+                f"<td>{esc(r.get('classification') or '')}</td>"
+                f"<td>{esc(r.get('action_taken') or '&mdash;')}</td>"
+                f"<td>{esc(r.get('mode') or '')}</td>"
+                f'<td style="color:#b06a5a">{exc}</td></tr>')
+    body = "".join(_row(r) for r in rows)
+    return ('<div class=card><h1 style="font-size:16px">Recent activity (last %d)</h1>'
+            '<table><tr><th>When</th><th>Subject</th><th>Class</th><th>Action</th>'
+            '<th>Mode</th><th>Exception</th></tr>%s</table></div>'
+            % (len(rows), body or '<tr><td colspan=6 class=sub>No decisions logged yet.</td></tr>'))
+
+MANUAL_UPLOAD = """<div class=card>
+<h1 style="font-size:18px">Create shipments from a handover advice (manual fallback)</h1>
+<p class=sub>The mailbox agent normally creates these automatically from NRT pickup emails &mdash; use this only as a fallback (e.g. an item the agent flagged, or a container to check manually). Drop a Dachser handover-advice PDF. Preview the matched sales orders, then create shipments (left unconfirmed for a person to confirm in Acumatica).</p>
 <form id=f onsubmit="return false">
 <p><input type=file id=pdf accept="application/pdf"></p>
 <p style="max-width:340px"><label class=sub>Shipment date (required &mdash; type the NRT pickup date)</label><input type=date id=sd required></p>
@@ -1548,15 +1616,15 @@ function td(x){return '<td>'+x+'</td>';}
 
 GUIDE = """<div class=card>
 <h1 style="font-size:18px">User guide &mdash; how this tool works</h1>
-<p class=sub>It turns a Dachser handover advice into shipment records in Acumatica &mdash; with a person always in control of the revenue step.</p>
+<p class=sub>A mailbox agent reads NRT pickup emails and creates shipment records in Acumatica automatically &mdash; with a person always in control of the revenue step.</p>
 <ol style="line-height:1.75;font-size:14px;padding-left:20px">
 <li><b>Connect as the shipments account.</b> Click <b>Switch account</b> (top) and sign in with the dedicated Acumatica login &mdash; not a personal one. The banner shows who&#39;s connected.</li>
-<li><b>Drop the handover advice.</b> On <b>Home</b>, choose the Dachser handover-advice PDF and click <b>Preview</b>.</li>
-<li><b>Review the matches.</b> Most containers don&#39;t list PO#s in the advice text itself, so the tool also resolves each container&#39;s POs via Acumatica PO Receipts (container &rarr; receipt &rarr; internal PO &rarr; VendorRef &rarr; retail PO#). If a container can&#39;t be resolved either way, it&#39;s flagged in red &mdash; check it manually (e.g. against the packing list) before creating.</li>
-<li><b>Type the Shipment date, then create.</b> Enter the NRT pickup date in <b>Shipment date</b> (required) and click <b>Create shipments</b>. Each is created <b>unconfirmed</b>, dated as typed.</li>
-<li><b>Confirm &amp; invoice in Acumatica.</b> A person confirms each shipment (this recognizes revenue), then creates and releases the invoice. <b>This tool never confirms</b> &mdash; that stays a human decision.</li>
+<li><b>Monitor from the Dashboard.</b> That&#39;s the home page: last-24h stats, mode (shadow/live), queue depth, and the most recent decisions. A stale "last decision" time or a red exception row is what to watch for.</li>
+<li><b>Review flagged items.</b> <a href="/agent/log?exceptions_only=1&view=html">Exceptions only</a> lists anything the agent couldn&#39;t safely resolve on its own (e.g. no open sales order, a multi-container receipt, an unresolved container) &mdash; check those by hand.</li>
+<li><b>Manual fallback, if ever needed.</b> <a href=/manual>Manual upload</a> is the same PDF&rarr;shipment flow this tool started as, kept as a fallback for a flagged item or if the agent/email pipeline is down. Container&rarr;PO resolution there also goes through Acumatica PO Receipts (container &rarr; receipt &rarr; internal PO &rarr; VendorRef &rarr; retail PO#), independent of the advice text.</li>
+<li><b>Confirm &amp; invoice in Acumatica.</b> A person confirms each shipment (this recognizes revenue), then creates and releases the invoice. <b>Neither the agent nor this tool ever confirms</b> &mdash; that stays a human decision.</li>
 </ol>
-<p class=sub>If a line can&#39;t be created, the Result column explains why (e.g. nothing available to ship, order on hold). <a href=/history>History</a> lists past runs and who ran them.</p>
+<p class=sub>If a line can&#39;t be created, the Result column (or the log&#39;s exception reason) explains why (e.g. nothing available to ship, order on hold). <a href=/history>Shipment history</a> lists past runs and who ran them.</p>
 </div>"""
 
 class H(BaseHTTPRequestHandler):
@@ -1729,7 +1797,9 @@ class H(BaseHTTPRequestHandler):
         if not self._authed():
             return self._send(200, LOGIN)
         if u.path == "/":
-            return self._send(200, page(HOME))
+            return self._send(200, page(_dashboard_html()))
+        if u.path == "/manual":
+            return self._send(200, page(MANUAL_UPLOAD))
         if u.path == "/connect":
             self.send_response(302); self.send_header("Location", build_authorize_url()); self.end_headers(); return
         if u.path == "/diag":
