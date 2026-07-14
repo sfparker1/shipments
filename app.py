@@ -609,7 +609,11 @@ def _latest_shipment_for_order(order_type, order_nbr, retries=3, delay=1.0):
             # Real shipment records carry a ShipmentNbr; credit-memo/auto-issue rows don't.
             ship_recs = [s for s in (d.get("Shipments") or []) if _sh_field(s, "ShipmentNbr")]
             if ship_recs:
-                return _sh_field(ship_recs[-1], "ShipmentNbr")
+                sh = ship_recs[-1]
+                # Also capture the record's own system "id" GUID -- Acumatica's contract API
+                # identifies a record for UPDATE by this id, not by the natural key
+                # (ShipmentNbr); every entity sub-record carries it for free, no extra call.
+                return {"shipment_nbr": _sh_field(sh, "ShipmentNbr"), "id": sh.get("id")}
         if attempt < retries - 1:
             time.sleep(delay)
     return None
@@ -634,34 +638,48 @@ def _failure_reason(order_type, order_nbr):
         return f"Order status is '{stt}' — not shippable"
     return "Nothing available to ship (backordered or no stock in the ship-from warehouse)"
 
-def set_shipment_date_and_container(ship, date=None, container_ref=None):
+def _resolve_shipment_id(ship_nbr):
+    """GET-by-natural-key (proven reliable throughout this file) to fetch a shipment's
+    internal system id GUID. Avoids $select=Type specifically -- "Type" behaved differently
+    from every other field name tried on this tenant (plausibly a reserved/special-cased
+    word in the OData layer), while ordinary field names via $select on this same bare-key
+    URL have worked fine."""
+    st, d = api("GET", f"{ENTITY}/Shipment/{ship_nbr}?$select=id,ShipmentDate")
+    if st == 200 and isinstance(d, dict) and d.get("id"):
+        return d["id"], ((d.get("ShipmentDate") or {}).get("value") or "")[:10]
+    return None, None
+
+def set_shipment_date_and_container(shipment_id, ship_nbr, date=None, container_ref=None):
     """PUT ShipmentDate (and the container custom field) onto an EXISTING shipment, then
-    read it back to verify the date actually stuck -- the CreateShipment action's own
-    ShipmentDate parameter proved unreliable (shipments came back dated "today" regardless).
-    Shared by create_shipment() (right after a shipment is made) and the standalone
-    /fixshipdate utility (for correcting an already-created record without re-running
-    CreateShipment, which would create a duplicate)."""
+    read it back to verify the date actually stuck.
+
+    2026-07-14: earlier attempts identified the record by its NATURAL key (ShipmentNbr) --
+    either in the URL path (every variant 500'd identically: "Invalid uri structure",
+    misrouted into EntityController.PutFile) or in the JSON body of a bare-collection PUT
+    (Acumatica read the absence of an "id" as "no existing record" and attempted an INSERT
+    of a new blank shipment -- caught safely that time by a required-field validation error,
+    but not something to keep testing against production). Acumatica's contract API
+    identifies a record for UPDATE by its internal system "id" GUID, not the natural key --
+    GET-by-natural-key is a convenience for reads only. shipment_id must come from a prior
+    read (e.g. the $expand=Shipments call in _latest_shipment_for_order, or
+    _resolve_shipment_id) -- never invented or left empty, since an empty/missing id in the
+    body is exactly the condition that caused the earlier accidental-insert attempt."""
     out = {}
-    update = {"ShipmentNbr": {"value": ship}}
+    if not shipment_id:
+        out["ship_date_put_error"] = "no shipment id available -- refusing to PUT without one (would risk an insert, not an update)"
+        return out
+    update = {"id": shipment_id}
     if date: update["ShipmentDate"] = {"value": date}
     if container_ref and CFG["container_field"]:
         update.setdefault("custom", {}).setdefault("Document", {})[CFG["container_field"]] = \
             {"type": "CustomStringField", "value": container_ref}
-    if len(update) <= 1:  # only the identifying key, nothing to actually change
+    if len(update) <= 1:  # only the id, nothing to actually change
         return out
-    # Every URL-path-key variant tried (bare ShipmentNbr, guessed composite Type/ShipmentNbr)
-    # 500'd identically ("Invalid uri structure", routed into EntityController.PutFile)
-    # regardless of segment count -- so putting a key in the URL path isn't the right
-    # pattern for this entity/tenant. Acumatica's contract API updates a record by PUTting
-    # to the bare COLLECTION endpoint with the identifying key field(s) in the JSON BODY
-    # instead -- try that.
     pst, presp = api("PUT", f"{ENTITY}/Shipment", update)
     if pst not in (200, 204):
-        # Surface WHY the write itself was rejected (e.g. a business rule locking
-        # ShipmentDate) instead of only reporting the date mismatch with no clue as to cause.
         out["ship_date_put_status"] = pst
         out["ship_date_put_error"] = presp if isinstance(presp, str) else json.dumps(presp)[:500]
-    vst, vdata = api("GET", f"{ENTITY}/Shipment/{ship}?$select=ShipmentDate")
+    vst, vdata = api("GET", f"{ENTITY}/Shipment/{ship_nbr}?$select=ShipmentDate")
     actual = ((vdata.get("ShipmentDate") or {}).get("value") or "")[:10] \
         if vst == 200 and isinstance(vdata, dict) else None
     out["ship_date_verified"] = bool(date) and actual == date
@@ -706,9 +724,9 @@ def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None, p
     res["created"] = st in (200, 204)
     if res["created"]:
         ship = _latest_shipment_for_order(order_type, order_nbr)
-        res["shipment_nbr"] = ship
+        res["shipment_nbr"] = ship.get("shipment_nbr") if ship else None
         if ship:
-            res.update(set_shipment_date_and_container(ship, date, container_ref))
+            res.update(set_shipment_date_and_container(ship.get("id"), ship.get("shipment_nbr"), date, container_ref))
         res["verified"] = bool(ship)
         if not ship:
             # Acumatica's action reported done, but no shipment can be found for this
@@ -1810,8 +1828,10 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"error": str(e)}), "application/json")
         if u.path == "/fixshipdate":
             # Correct ShipmentDate on an ALREADY-CREATED shipment without re-running
-            # CreateShipment (which would create a duplicate). Same auth/risk tier as
-            # /autoship since it writes to a real Acumatica record.
+            # CreateShipment (which would create a duplicate). Resolves the shipment's
+            # internal system id first (the record identifier Acumatica's contract API
+            # actually needs for an update -- see set_shipment_date_and_container()'s
+            # docstring) and refuses to PUT if that lookup doesn't return one.
             want = AUTOSHIP_TOKEN
             got = (self.headers.get("Authorization", "") or "").removeprefix("Bearer ").strip()
             if not (want and hmac.compare_digest(got.encode(), want.encode())):
@@ -1826,8 +1846,13 @@ class H(BaseHTTPRequestHandler):
             if not ship or not date:
                 return self._send(400, json.dumps({"error": "shipment and ship_date are required"}), "application/json")
             try:
-                out = set_shipment_date_and_container(ship, date=date)
+                ship_id, current_date = _resolve_shipment_id(ship)
+                if not ship_id:
+                    return self._send(200, json.dumps({"shipment": ship,
+                        "error": "could not resolve this shipment's internal id -- refusing to PUT"}), "application/json")
+                out = set_shipment_date_and_container(ship_id, ship, date=date)
                 out["shipment"] = ship
+                out["ship_date_before"] = current_date
                 return self._send(200, json.dumps(out), "application/json")
             except Exception as e:
                 return self._send(200, json.dumps({"error": str(e)}), "application/json")
