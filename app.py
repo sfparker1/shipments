@@ -892,20 +892,58 @@ def ingest_delete(item_id):
     except Exception:
         return False
 
+def _fmt_ts(ts):
+    """Display-only: 'YYYY-MM-DD HH:MM:SS' -> 'MM/DD/YYYY HH:MM:SS'. Never used for
+    parsing/sorting/staleness math -- those keep the sortable stored format; this only
+    reformats what's shown on screen."""
+    if not ts or " " not in ts:
+        return ts or ""
+    try:
+        d, t = ts.split(" ", 1)
+        y, m, day = d.split("-")
+        return f"{m}/{day}/{y} {t}"
+    except Exception:
+        return ts
+
+# What the agent's classification enum (agent.py) actually means, in plain English --
+# shown as the "What" column instead of the raw enum, plus a legend under the table.
+CLASSIFICATION_LABELS = {
+    "nrt_available_for_pickup": "Available for pickup",
+    "nrt_other_status": "NRT update, not a pickup",
+    "not_nrt": "Not an NRT email",
+    "ambiguous": "Ambiguous",
+    "skip": "Skipped",
+}
+CLASSIFICATION_LEGEND = ("<b>What:</b> what the agent decided this email was about &mdash; "
+    "<b>Available for pickup</b> is the shipment trigger; the others result in no shipment.")
+
+def _friendly_classification(c):
+    return CLASSIFICATION_LABELS.get(c, c or "&mdash;")
+
+def _status_pill(r):
+    """One colored badge that says, at a glance, what happened -- replaces the separate
+    raw Action/Mode text columns. Derived from fields already on every decision row:
+    exception_flag (needs a human), action_taken (create_shipment vs none), and mode
+    (shadow vs live) -- no new data needed."""
+    if r.get("exception_flag"):
+        return '<span class=pill style="border-color:#b06a5a;color:#b06a5a">&#9888; Needs review</span>'
+    if r.get("action_taken") == "create_shipment":
+        if r.get("mode") == "live":
+            return '<span class=pill style="border-color:#5a7d5a;color:#5a7d5a">&#10003; Shipment created</span>'
+        return '<span class=pill style="border-color:#5d7682;color:#5d7682">&#9678; Would create &middot; shadow</span>'
+    return '<span class=pill style="border-color:#c9c0ad">No action needed</span>'
+
 def _agent_log_html(rows, exc_only):
     """Scannable decision table -- one row per decision, exceptions highlighted. Matches
     the low-tooling HTML style used by /history."""
     def esc(v):
         s = "" if v is None else str(v)
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    _mode = {"shadow": "#7d7363", "live": "#5a7d5a"}
     def _row(r):
         flagged = bool(r.get("exception_flag"))
         rowstyle = ' style="background:#f6ece8"' if flagged else ""
-        mode = r.get("mode") or ""
-        mode_pill = f'<span class=pill style="border-color:{_mode.get(mode, "#c9c0ad")}">{esc(mode) or "&mdash;"}</span>'
-        cls = esc(r.get("classification") or "")
-        action = esc(r.get("action_taken") or "&mdash;")
+        what = esc(_friendly_classification(r.get("classification")))
+        status = _status_pill(r)
         args = r.get("tool_args")
         result = r.get("tool_result")
         detail = ""
@@ -915,16 +953,15 @@ def _agent_log_html(rows, exc_only):
                       f"<div><b>result:</b> {esc(json.dumps(result))}</div></details>")
         note = esc(r.get("rationale") or "")
         if flagged:
-            note = (f'<span style="color:#b06a5a">&#9888; {esc(r.get("exception_reason") or "exception")}</span>'
-                    f'<br>{note}' if note else
-                    f'<span style="color:#b06a5a">&#9888; {esc(r.get("exception_reason") or "exception")}</span>')
+            exc_note = f'<span style="color:#b06a5a">{esc(r.get("exception_reason") or "needs review")}</span>'
+            note = f"{exc_note}<br>{note}" if note else exc_note
         subj = esc(r.get("subject") or "")
         if len(subj) > 60:
             subj = subj[:60] + "&hellip;"
-        return (f"<tr{rowstyle}><td>{esc(r.get('ts',''))}</td>"
+        return (f"<tr{rowstyle}><td>{esc(_fmt_ts(r.get('ts')))}</td>"
                 f"<td>{esc(r.get('source_mailbox') or '')}</td>"
                 f"<td title=\"{esc(r.get('message_id') or '')}\">{subj}</td>"
-                f"<td>{cls}</td><td>{action}</td><td>{mode_pill}</td>"
+                f"<td>{what}</td><td>{status}</td>"
                 f"<td>{note}</td><td>{detail}</td></tr>")
     body_rows = "".join(_row(r) for r in rows)
     title = "Agent decisions" + (" &mdash; exceptions only" if exc_only else "")
@@ -933,10 +970,11 @@ def _agent_log_html(rows, exc_only):
     return ('<div class=card><h1 style="font-size:16px">%s</h1>'
             '<p class=sub>One row per decision the mailbox-agent made (not per LLM turn). '
             'Flagged rows are highlighted. %s</p>'
-            '<table><tr><th>When</th><th>Mailbox</th><th>Subject</th><th>Class</th>'
-            '<th>Action</th><th>Mode</th><th>Rationale / exception</th><th>Detail</th></tr>'
-            '%s</table></div>') % (title, toggle, body_rows or
-            '<tr><td colspan=8 class=sub>No decisions logged yet.</td></tr>')
+            '<p class=sub>%s</p>'
+            '<table><tr><th>When</th><th>Mailbox</th><th>Subject</th><th>What</th>'
+            '<th>Status</th><th>Rationale / exception</th><th>Detail</th></tr>'
+            '%s</table></div>') % (title, toggle, CLASSIFICATION_LEGEND, body_rows or
+            '<tr><td colspan=7 class=sub>No decisions logged yet.</td></tr>')
 
 # ---------------- process a handover PDF ----------------
 def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None):
@@ -1468,7 +1506,7 @@ AGENT_FAVICON = _favicon('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 3
 
 LOGIN = """<!doctype html><meta charset=utf-8><title>Sign in</title>%s<style>%s
 .box{max-width:340px;margin:12vh auto}</style><div class=wrap><div class="card box">
-<div class=brand>SAND + FOG</div><h1>Handover &#8594; Shipments</h1>
+<div class=brand>SAND + FOG</div><h1>POE Shipment Agent</h1>
 <form method=post action=/login><p><input type=text name=user placeholder="Username" autofocus></p>
 <p><input type=password name=pw placeholder="Password"></p>
 <button>Sign in</button></form></div></div>""" % (SHIP_FAVICON, CSS)
@@ -1495,8 +1533,8 @@ def page(body, favicon=None):
                      ' <a class=pill href=/connect>Switch account</a>' % u)
     else:
         badge = '<a class=pill href=/connect>Connect to Acumatica</a>'
-    return """<!doctype html><meta charset=utf-8><title>NRT Shipment Agent</title>%s<style>%s</style>
-<div class=wrap><div class=brand>SAND + FOG</div><h1>NRT Shipment Agent</h1>
+    return """<!doctype html><meta charset=utf-8><title>POE Shipment Agent</title>%s<style>%s</style>
+<div class=wrap><div class=brand>SAND + FOG</div><h1>POE Shipment Agent</h1>
 <p class=sub>%s &nbsp; <a class=pill href=/>Dashboard</a> <a class=pill href=/manual>Manual upload</a> <a class=pill href=/guide>Guide</a> <a class=pill href=/history>Shipment history</a> <a class=pill href=/diag>Diagnostics</a></p>
 %s</div>""" % (favicon, CSS, badge, body)
 
@@ -1540,7 +1578,7 @@ def _dashboard_html():
              '<a class=pill href=/history>Shipment run history</a> '
              '<a class=pill href=/diag>Diagnostics</a> '
              '<a class=pill href=/manual>Manual PDF upload (fallback)</a></p></div>'
-             % (mode_pill, s["queue_depth"], s["last_decision_at"] or "&mdash;", warn,
+             % (mode_pill, s["queue_depth"], _fmt_ts(s["last_decision_at"]) or "&mdash;", warn,
                 s["decisions"], s["shipments_prepared"], s["flagged"], s["no_action"],
                 by_class or "&mdash;"))
     return stats + _dashboard_recent_html(recent)
@@ -1556,17 +1594,17 @@ def _dashboard_recent_html(rows):
         rowstyle = ' style="background:#f6ece8"' if flagged else ""
         subj = esc(r.get("subject") or "")
         if len(subj) > 50: subj = subj[:50] + "&hellip;"
-        exc = ("&#9888; " + esc(r.get("exception_reason") or "exception")) if flagged else ""
-        return (f"<tr{rowstyle}><td>{esc(r.get('ts',''))}</td><td>{subj}</td>"
-                f"<td>{esc(r.get('classification') or '')}</td>"
-                f"<td>{esc(r.get('action_taken') or '&mdash;')}</td>"
-                f"<td>{esc(r.get('mode') or '')}</td>"
+        exc = esc(r.get("exception_reason") or "") if flagged else ""
+        return (f"<tr{rowstyle}><td>{esc(_fmt_ts(r.get('ts')))}</td><td>{subj}</td>"
+                f"<td>{esc(_friendly_classification(r.get('classification')))}</td>"
                 f'<td style="color:#b06a5a">{exc}</td></tr>')
     body = "".join(_row(r) for r in rows)
     return ('<div class=card><h1 style="font-size:16px">Recent activity (last %d)</h1>'
-            '<table><tr><th>When</th><th>Subject</th><th>Class</th><th>Action</th>'
-            '<th>Mode</th><th>Exception</th></tr>%s</table></div>'
-            % (len(rows), body or '<tr><td colspan=6 class=sub>No decisions logged yet.</td></tr>'))
+            '<p class=sub>%s</p>'
+            '<table><tr><th>When</th><th>Subject</th><th>What</th><th>Status</th>'
+            '<th>Exception</th></tr>%s</table></div>'
+            % (len(rows), CLASSIFICATION_LEGEND, body or
+               '<tr><td colspan=5 class=sub>No decisions logged yet.</td></tr>'))
 
 MANUAL_UPLOAD = """<div class=card>
 <h1 style="font-size:18px">Create shipments from a handover advice (manual fallback)</h1>
@@ -1846,7 +1884,7 @@ class H(BaseHTTPRequestHandler):
                     acu_cell = f'<span class=pill style="border-color:#b06a5a;color:#b06a5a">&#9888; {acu_user}</span>'
                 else:
                     acu_cell = acu_user
-                return (f"<tr><td>{h.get('ts','')}</td><td>{h.get('user','') or ''}</td>"
+                return (f"<tr><td>{_fmt_ts(h.get('ts'))}</td><td>{h.get('user','') or ''}</td>"
                         f"<td>{acu_cell}</td>"
                         f"<td>{h.get('document','') or ''}</td><td>{h.get('reference','')}</td>"
                         f"<td>{pill}</td><td>{h.get('created','')}/{h.get('orders_matched','')}</td>"
