@@ -906,7 +906,7 @@ def _fmt_ts(ts):
         return ts
 
 # What the agent's classification enum (agent.py) actually means, in plain English --
-# shown as the "What" column instead of the raw enum, plus a legend under the table.
+# shown as the "Update type" column instead of the raw enum, plus a legend under the table.
 CLASSIFICATION_LABELS = {
     "nrt_available_for_pickup": "Available for pickup",
     "nrt_other_status": "NRT update, not a pickup",
@@ -914,11 +914,25 @@ CLASSIFICATION_LABELS = {
     "ambiguous": "Ambiguous",
     "skip": "Skipped",
 }
-CLASSIFICATION_LEGEND = ("<b>What:</b> what the agent decided this email was about &mdash; "
+CLASSIFICATION_LEGEND = ("<b>Update type:</b> what the agent decided this email was about &mdash; "
     "<b>Available for pickup</b> is the shipment trigger; the others result in no shipment.")
 
 def _friendly_classification(c):
     return CLASSIFICATION_LABELS.get(c, c or "&mdash;")
+
+# The run-history "user" field is either a real app-login username (manual PDF upload) or
+# an "auto:<source>" tag (an automated trigger -- the live agent, or a manual API test).
+# Label the automated ones plainly instead of showing the raw tag.
+RUN_SOURCE_LABELS = {"nrt": "Automated &middot; NRT agent", "maersk-fcr": "Automated &middot; Maersk/FCR",
+                     "test": "Automated &middot; manual test", "preview": "Automated &middot; preview"}
+
+def _friendly_run_source(user_val):
+    if not user_val:
+        return "&mdash;"
+    if user_val.startswith("auto:"):
+        src = user_val.split(":", 1)[1]
+        return RUN_SOURCE_LABELS.get(src, f"Automated &middot; {src}" if src != "unknown" else "Automated")
+    return user_val
 
 def _status_pill(r):
     """One colored badge that says, at a glance, what happened -- replaces the separate
@@ -933,6 +947,23 @@ def _status_pill(r):
         return '<span class=pill style="border-color:#5d7682;color:#5d7682">&#9678; Would create &middot; shadow</span>'
     return '<span class=pill style="border-color:#c9c0ad">No action needed</span>'
 
+def _fmt_kv(d, esc):
+    """Flat dict -> 'Key: value &middot; Key2: value2' instead of a raw JSON dump -- used
+    for the tool call args/result in the decision log's Detail column. Falls back to a
+    plain escaped string for a non-dict (e.g. a bare error string) or None."""
+    if d is None:
+        return None
+    if not isinstance(d, dict):
+        return esc(str(d))
+    parts = []
+    for k, v in d.items():
+        if v is None or v == "":
+            continue
+        label = k.replace("_", " ").strip().capitalize()
+        val = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
+        parts.append(f"{label}: {esc(val)}")
+    return " &middot; ".join(parts) if parts else None
+
 def _agent_log_html(rows, exc_only):
     """Scannable decision table -- one row per decision, exceptions highlighted. Matches
     the low-tooling HTML style used by /history."""
@@ -944,13 +975,12 @@ def _agent_log_html(rows, exc_only):
         rowstyle = ' style="background:#f6ece8"' if flagged else ""
         what = esc(_friendly_classification(r.get("classification")))
         status = _status_pill(r)
-        args = r.get("tool_args")
-        result = r.get("tool_result")
-        detail = ""
-        if args is not None or result is not None:
-            detail = (f"<details><summary>args/result</summary>"
-                      f"<div><b>args:</b> {esc(json.dumps(args))}</div>"
-                      f"<div><b>result:</b> {esc(json.dumps(result))}</div></details>")
+        args_txt = _fmt_kv(r.get("tool_args"), esc)
+        result_txt = _fmt_kv(r.get("tool_result"), esc)
+        detail_parts = []
+        if args_txt: detail_parts.append(f"<div><b>Requested:</b> {args_txt}</div>")
+        if result_txt: detail_parts.append(f"<div><b>Result:</b> {result_txt}</div>")
+        detail = f"<details><summary>Details</summary>{''.join(detail_parts)}</details>" if detail_parts else "&mdash;"
         note = esc(r.get("rationale") or "")
         if flagged:
             exc_note = f'<span style="color:#b06a5a">{esc(r.get("exception_reason") or "needs review")}</span>'
@@ -971,9 +1001,9 @@ def _agent_log_html(rows, exc_only):
             '<p class=sub>One row per decision the mailbox-agent made (not per LLM turn). '
             'Flagged rows are highlighted. %s</p>'
             '<p class=sub>%s</p>'
-            '<table><tr><th>When</th><th>Mailbox</th><th>Subject</th><th>What</th>'
+            '<div class=twrap><table><tr><th>When</th><th>Mailbox</th><th>Subject</th><th>Update type</th>'
             '<th>Status</th><th>Rationale / exception</th><th>Detail</th></tr>'
-            '%s</table></div>') % (title, toggle, CLASSIFICATION_LEGEND, body_rows or
+            '%s</table></div></div>') % (title, toggle, CLASSIFICATION_LEGEND, body_rows or
             '<tr><td colspan=7 class=sub>No decisions logged yet.</td></tr>')
 
 # ---------------- process a handover PDF ----------------
@@ -1486,6 +1516,7 @@ button{background:var(--stone);color:#fff;border:0;border-radius:8px;padding:10p
 button.fog{background:var(--fog)}button:disabled{opacity:.5}
 input[type=file],input[type=date],input[type=password],input[type=text]{padding:9px;border:1px solid var(--line);border-radius:8px;background:#faf8f4;width:100%}
 table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line)}
+.twrap{overflow-x:auto}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%}.ok{background:#5a7d5a}.flag{background:#b06a5a}
 a{color:var(--fog)}.pill{background:var(--sand);border:1px solid var(--line);border-radius:14px;padding:2px 10px;font-size:12px;margin:0 6px 6px 0;display:inline-block}
 pre{background:#2b2b2b;color:#d7d2c6;padding:14px;border-radius:8px;overflow:auto;font-size:12px}
@@ -1597,12 +1628,13 @@ def _dashboard_recent_html(rows):
         exc = esc(r.get("exception_reason") or "") if flagged else ""
         return (f"<tr{rowstyle}><td>{esc(_fmt_ts(r.get('ts')))}</td><td>{subj}</td>"
                 f"<td>{esc(_friendly_classification(r.get('classification')))}</td>"
+                f"<td>{_status_pill(r)}</td>"
                 f'<td style="color:#b06a5a">{exc}</td></tr>')
     body = "".join(_row(r) for r in rows)
     return ('<div class=card><h1 style="font-size:16px">Recent activity (last %d)</h1>'
             '<p class=sub>%s</p>'
-            '<table><tr><th>When</th><th>Subject</th><th>What</th><th>Status</th>'
-            '<th>Exception</th></tr>%s</table></div>'
+            '<div class=twrap><table><tr><th>When</th><th>Subject</th><th>Update type</th><th>Status</th>'
+            '<th>Exception</th></tr>%s</table></div></div>'
             % (len(rows), CLASSIFICATION_LEGEND, body or
                '<tr><td colspan=5 class=sub>No decisions logged yet.</td></tr>'))
 
@@ -1854,9 +1886,12 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, page(GUIDE))
         if u.path == "/history":
             _badge = {"ok": "#5a7d5a", "partial": "#b0653a", "failed": "#b06a5a", "no_matches": "#7d7363"}
+            _status_label = {"ok": "Created", "partial": "Partially created", "failed": "Failed",
+                              "no_matches": "No matching order"}
             def _hrow(h):
                 status = h.get("status") or ""
-                pill = f'<span class=pill style="border-color:{_badge.get(status, "#c9c0ad")}">{status or "&mdash;"}</span>'
+                label = _status_label.get(status, status or "&mdash;")
+                pill = f'<span class=pill style="border-color:{_badge.get(status, "#c9c0ad")}">{label}</span>'
                 orders = h.get("orders") or []
                 if orders:
                     detail = "".join(
@@ -1884,9 +1919,21 @@ class H(BaseHTTPRequestHandler):
                     acu_cell = f'<span class=pill style="border-color:#b06a5a;color:#b06a5a">&#9888; {acu_user}</span>'
                 else:
                     acu_cell = acu_user
-                return (f"<tr><td>{_fmt_ts(h.get('ts'))}</td><td>{h.get('user','') or ''}</td>"
+                # Document/Reference only mean anything for a manual PDF upload; an
+                # automated run's "document" is just its own auto:<source> tag (redundant
+                # with "Triggered by") and its reference is always empty -- merge into one
+                # column that shows nothing rather than a confusing "auto:test" / "None".
+                doc = h.get("document") or ""
+                ref = h.get("reference") or ""
+                if doc.startswith("auto:"):
+                    source_cell = "&mdash;"
+                else:
+                    source_cell = doc or "&mdash;"
+                    if ref:
+                        source_cell += f" &middot; ref {ref}"
+                return (f"<tr><td>{_fmt_ts(h.get('ts'))}</td><td>{_friendly_run_source(h.get('user'))}</td>"
                         f"<td>{acu_cell}</td>"
-                        f"<td>{h.get('document','') or ''}</td><td>{h.get('reference','')}</td>"
+                        f"<td>{source_cell}</td>"
                         f"<td>{pill}</td><td>{h.get('created','')}/{h.get('orders_matched','')}</td>"
                         f"<td>{cont_cell}</td><td>{detail_cell}</td></tr>")
             rows = "".join(_hrow(h) for h in history())
@@ -1894,8 +1941,8 @@ class H(BaseHTTPRequestHandler):
                     '<p class=sub>Every shipment-creation run, kept permanently on the tool&#39;s disk (not just this session). '
                     'Expand the last column for per-order/shipment detail. &#8220;Acumatica user&#8221; is who was actually '
                     'connected when the write ran (set <code>EXPECTED_ACU_USER</code> to flag any run under a different account).</p>'
-                    '<table><tr><th>When</th><th>By</th><th>Acumatica user</th><th>Document</th><th>Reference</th><th>Status</th>'
-                    '<th>Created/Matched</th><th>Containers</th><th>Orders</th></tr>' + rows + '</table></div>')
+                    '<div class=twrap><table><tr><th>When</th><th>Triggered by</th><th>Acumatica user</th><th>Source</th><th>Status</th>'
+                    '<th>Created/Matched</th><th>Containers</th><th>Orders</th></tr>' + rows + '</table></div></div>')
             return self._send(200, page(body))
         return self._send(404, page("<div class=card>Not found</div>"))
 
