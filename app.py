@@ -639,13 +639,21 @@ def _failure_reason(order_type, order_nbr):
     return "Nothing available to ship (backordered or no stock in the ship-from warehouse)"
 
 def _resolve_shipment_id(ship_nbr):
-    """GET-by-natural-key (proven reliable throughout this file) to fetch a shipment's
-    internal system id GUID. Returns (id, current_date, debug) -- debug carries the raw
-    status/body on failure so a caller can show WHY, instead of a guess-again situation."""
-    st, d = api("GET", f"{ENTITY}/Shipment/{ship_nbr}?$select=id,ShipmentDate")
-    if st == 200 and isinstance(d, dict) and d.get("id"):
+    """LIST query with an exact $filter (not a by-key GET) to fetch a shipment's internal
+    system id GUID. Confirmed NOT to work on this tenant: (a) $select=id on the by-key
+    shorthand URL -- 500 "The given key was not present in the dictionary" from
+    SelectPathSegmentTokenBinder, meaning "id" isn't a normal declared/selectable property,
+    it's a system field the framework injects into every response envelope; (b) a
+    full-record (no $select) GET on that same shorthand key -- "No entity satisfies the
+    condition". A LIST query with an EXACT filter (`eq`, not `substringof` which 500s on
+    this tenant -- see the notes elsewhere in this file) returns each row as a full default
+    representation with no $select restriction, so "id" comes through naturally.
+    Returns (id, current_date, debug) -- debug carries the raw status/body on failure."""
+    st, data = api("GET", f"{ENTITY}/Shipment?$filter=ShipmentNbr eq '{ship_nbr}'")
+    if st == 200 and isinstance(data, list) and data and data[0].get("id"):
+        d = data[0]
         return d["id"], ((d.get("ShipmentDate") or {}).get("value") or "")[:10], None
-    debug = {"status": st, "body": d if isinstance(d, str) else json.dumps(d)[:500]}
+    debug = {"status": st, "body": data if isinstance(data, str) else json.dumps(data)[:500]}
     return None, None, debug
 
 def set_shipment_date_and_container(shipment_id, ship_nbr, date=None, container_ref=None):
