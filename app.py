@@ -638,23 +638,6 @@ def _failure_reason(order_type, order_nbr):
         return f"Order status is '{stt}' — not shippable"
     return "Nothing available to ship (backordered or no stock in the ship-from warehouse)"
 
-def _resolve_shipment_id(ship_nbr):
-    """LIST query with an exact $filter (not a by-key GET) to fetch a shipment's internal
-    system id GUID. Confirmed NOT to work on this tenant: (a) $select=id on the by-key
-    shorthand URL -- 500 "The given key was not present in the dictionary" from
-    SelectPathSegmentTokenBinder, meaning "id" isn't a normal declared/selectable property,
-    it's a system field the framework injects into every response envelope; (b) a
-    full-record (no $select) GET on that same shorthand key -- "No entity satisfies the
-    condition". A LIST query with an EXACT filter (`eq`, not `substringof` which 500s on
-    this tenant -- see the notes elsewhere in this file) returns each row as a full default
-    representation with no $select restriction, so "id" comes through naturally.
-    Returns (id, current_date, debug) -- debug carries the raw status/body on failure."""
-    st, data = api("GET", f"{ENTITY}/Shipment?$filter=ShipmentNbr eq '{ship_nbr}'")
-    if st == 200 and isinstance(data, list) and data and data[0].get("id"):
-        d = data[0]
-        return d["id"], ((d.get("ShipmentDate") or {}).get("value") or "")[:10], None
-    debug = {"status": st, "body": data if isinstance(data, str) else json.dumps(data)[:500]}
-    return None, None, debug
 
 def set_shipment_date_and_container(shipment_id, ship_nbr, date=None, container_ref=None):
     """PUT ShipmentDate (and the container custom field) onto an EXISTING shipment, then
@@ -667,10 +650,12 @@ def set_shipment_date_and_container(shipment_id, ship_nbr, date=None, container_
     of a new blank shipment -- caught safely that time by a required-field validation error,
     but not something to keep testing against production). Acumatica's contract API
     identifies a record for UPDATE by its internal system "id" GUID, not the natural key --
-    GET-by-natural-key is a convenience for reads only. shipment_id must come from a prior
-    read (e.g. the $expand=Shipments call in _latest_shipment_for_order, or
-    _resolve_shipment_id) -- never invented or left empty, since an empty/missing id in the
-    body is exactly the condition that caused the earlier accidental-insert attempt."""
+    GET-by-natural-key is a convenience for reads only. Looking a shipment's id up directly
+    by ShipmentNbr also proved unreliable three different ways (URL-path key, $select=id,
+    an exact-filter list query all failed differently) -- shipment_id must instead come from
+    _latest_shipment_for_order()'s $expand=Shipments read via the parent order, which is
+    proven to work. Never invented or left empty, since an empty/missing id in the body is
+    exactly the condition that caused the earlier accidental-insert attempt."""
     out = {}
     if not shipment_id:
         out["ship_date_put_error"] = "no shipment id available -- refusing to PUT without one (would risk an insert, not an update)"
@@ -1835,10 +1820,11 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"error": str(e)}), "application/json")
         if u.path == "/fixshipdate":
             # Correct ShipmentDate on an ALREADY-CREATED shipment without re-running
-            # CreateShipment (which would create a duplicate). Resolves the shipment's
-            # internal system id first (the record identifier Acumatica's contract API
-            # actually needs for an update -- see set_shipment_date_and_container()'s
-            # docstring) and refuses to PUT if that lookup doesn't return one.
+            # CreateShipment (which would create a duplicate). Takes the SALES ORDER (not
+            # the bare shipment number) because resolving a shipment's internal id directly
+            # by ShipmentNbr proved unreliable three different ways -- _latest_shipment_
+            # for_order()'s $expand=Shipments read via the parent order is the one path
+            # that's actually proven to return a usable id.
             want = AUTOSHIP_TOKEN
             got = (self.headers.get("Authorization", "") or "").removeprefix("Bearer ").strip()
             if not (want and hmac.compare_digest(got.encode(), want.encode())):
@@ -1848,19 +1834,19 @@ class H(BaseHTTPRequestHandler):
                 body = json.loads(self.rfile.read(ln).decode() or "{}")
             except Exception:
                 return self._send(400, json.dumps({"error": "invalid JSON body"}), "application/json")
-            ship = (body.get("shipment") or "").strip()
+            order_type = (body.get("order_type") or "").strip()
+            order_nbr = (body.get("order_nbr") or "").strip()
             date = (body.get("ship_date") or "").strip()
-            if not ship or not date:
-                return self._send(400, json.dumps({"error": "shipment and ship_date are required"}), "application/json")
+            if not order_type or not order_nbr or not date:
+                return self._send(400, json.dumps({"error": "order_type, order_nbr, and ship_date are required"}), "application/json")
             try:
-                ship_id, current_date, debug = _resolve_shipment_id(ship)
-                if not ship_id:
-                    return self._send(200, json.dumps({"shipment": ship,
-                        "error": "could not resolve this shipment's internal id -- refusing to PUT",
-                        "debug": debug}), "application/json")
-                out = set_shipment_date_and_container(ship_id, ship, date=date)
-                out["shipment"] = ship
-                out["ship_date_before"] = current_date
+                ship = _latest_shipment_for_order(order_type, order_nbr)
+                if not ship or not ship.get("id"):
+                    return self._send(200, json.dumps({"order": f"{order_type} {order_nbr}",
+                        "error": "could not find a shipment (with a resolvable id) for this order"}), "application/json")
+                out = set_shipment_date_and_container(ship["id"], ship["shipment_nbr"], date=date)
+                out["order"] = f"{order_type} {order_nbr}"
+                out["shipment"] = ship["shipment_nbr"]
                 return self._send(200, json.dumps(out), "application/json")
             except Exception as e:
                 return self._send(200, json.dumps({"error": str(e)}), "application/json")
