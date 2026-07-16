@@ -1494,6 +1494,60 @@ def diagnostics(sample_po=None, sample_container=None, sample_receipt=None):
             else:
                 qty_probe.append({"order": f"{m['order_type']} {m['order_nbr']}", "status": qst})
         out["sample_po_qty_probe"] = qty_probe
+        # READ-ONLY PurchaseOrder-completeness probe (Tier 2 of the Phase-2 plan, see
+        # majestic-swimming-melody.md). Answers, before any code is written against it:
+        # (a) does a receipt's Details agree on ONE POOrderNbr, (b) what field name/value
+        # does PurchaseOrder actually use for its Type ("Type" vs "OrderType" -- even the
+        # sibling packing-list-acumatica app hedges between the two), (c) which qty field
+        # (OpenQty vs OrderQty-QtyOnReceipts) is trustworthy, (d) whether that qty reflects
+        # the SUM across every receipt tied to this PO when more than one receipt is found
+        # below (the entire premise of the completeness-check design). Uses an EXACT $filter
+        # (OrderNbr eq '...'), never substringof -- substringof is confirmed to 500 on this
+        # tenant (see _latest_shipment_for_order's docstring); an exact eq filter is the same
+        # safe pattern diagnostics() already uses elsewhere (e.g. probe_007068 below).
+        po_probe = {"receipts_checked": []}
+        matching_receipts = [r for r in load_recent_receipts()
+                              if sample_po in _extract_order_tokens(r.get("vendor_ref"))]
+        for r in matching_receipts[:5]:
+            rflt = urllib.parse.quote(f"ReceiptNbr eq '{r['receipt_nbr']}'")
+            rst, rd = api("GET", f"{ENTITY}/PurchaseReceipt?$filter={rflt}&$expand=Details")
+            entry = {"receipt_nbr": r["receipt_nbr"]}
+            if rst == 200 and isinstance(rd, list) and rd:
+                details = rd[0].get("Details") or []
+                po_nbrs = sorted({(d.get("POOrderNbr") or {}).get("value")
+                                   for d in details if d.get("POOrderNbr")})
+                po_types = sorted({(d.get("POOrderType") or {}).get("value")
+                                    for d in details if d.get("POOrderType")})
+                entry["po_order_nbrs_on_this_receipt"] = po_nbrs
+                entry["po_order_types_on_this_receipt"] = po_types
+                entry["details_agree_on_one_po"] = len(po_nbrs) <= 1
+            else:
+                entry["status"] = rst
+            po_probe["receipts_checked"].append(entry)
+        distinct_po_nbrs = sorted({n for e in po_probe["receipts_checked"]
+                                    for n in e.get("po_order_nbrs_on_this_receipt", [])})
+        po_probe["distinct_po_order_nbrs_across_receipts"] = distinct_po_nbrs
+        po_probe["receipt_count_for_this_master"] = len(matching_receipts)
+        if distinct_po_nbrs:
+            target_nbr = distinct_po_nbrs[0]
+            pflt = urllib.parse.quote(f"OrderNbr eq '{target_nbr}'")
+            pst, pd = api("GET", f"{ENTITY}/PurchaseOrder?$filter={pflt}&$expand=Details")
+            po_probe["po_lookup_status"] = pst
+            if pst == 200 and isinstance(pd, list) and pd:
+                po_body = pd[0]
+                po_probe["po_keys"] = sorted(po_body.keys())
+                type_field = "Type" if "Type" in po_body else ("OrderType" if "OrderType" in po_body else None)
+                po_probe["po_type_field_name"] = type_field
+                po_probe["po_type_field_value"] = (po_body.get(type_field) or {}).get("value") if type_field else None
+                po_probe["po_status"] = (po_body.get("Status") or {}).get("value")
+                details = po_body.get("Details") or []
+                po_probe["po_detail_qty_fields"] = [
+                    {k: (v.get("value") if isinstance(v, dict) else v) for k, v in d.items()
+                     if re.search(r"qty|quantity|open|receiv|complet", k, re.I)}
+                    for d in details]
+            else:
+                po_probe["po_lookup_error"] = pd
+        out["po_completeness_probe"] = po_probe
     st, schema = api("GET", f"{ENTITY}/Shipment/$adHocSchema")
     if st == 200 and isinstance(schema, dict):
         cands = []
