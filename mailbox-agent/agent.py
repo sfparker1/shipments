@@ -126,10 +126,15 @@ TOOLS = [
         "description": "Create an UNCONFIRMED (On Hold) Acumatica shipment for the given container. "
                        "Use ONLY for NRT emails whose status is 'Available for Pickup'. ship_date "
                        "must be the date the email was received (provided in the email metadata). "
-                       "Never releases/confirms -- a clerk does that in Acumatica. The result may come "
-                       "back with needs_review=true (e.g. the container shares a PO Receipt with other "
-                       "containers, or no open sales order resolved / created=0) -- when that happens, "
-                       "do NOT treat it as done: call finish with exception=true and explain.",
+                       "Never releases/confirms -- a clerk does that in Acumatica. The result can come "
+                       "back three ways: (1) created -- done, call finish normally; (2) "
+                       "waiting_on_containers=true -- this order's Purchase Order isn't fully received "
+                       "yet (its containers are still arriving across separate shipments); this is "
+                       "NORMAL, not an error -- call finish with exception=false and classification "
+                       "nrt_waiting_on_containers, no further action needed, it'll ship automatically "
+                       "once complete; (3) needs_review=true (e.g. no open sales order resolved, or a "
+                       "pickup arrived for an order already shipped) -- this DOES need a human, call "
+                       "finish with exception=true and explain.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -147,13 +152,15 @@ TOOLS = [
                        "Set exception=true for anything a human should look at: an NRT status you don't "
                        "recognize, a create_shipment that came back needs_review or created nothing, "
                        "missing/unclear data, a non-NRT email that landed in this folder, or anything "
-                       "that didn't fit the normal path.",
+                       "that didn't fit the normal path. Do NOT set exception=true for "
+                       "waiting_on_containers=true -- that's a normal, expected state, not a problem.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "classification": {
                     "type": "string",
-                    "enum": ["nrt_available_for_pickup", "nrt_other_status", "not_nrt", "ambiguous", "skip"],
+                    "enum": ["nrt_available_for_pickup", "nrt_waiting_on_containers", "nrt_other_status",
+                              "not_nrt", "ambiguous", "skip"],
                 },
                 "action_summary": {"type": "string", "description": "One phrase, e.g. 'created shipment' / 'no action'"},
                 "rationale": {"type": "string", "description": "1-2 sentences explaining the decision"},
@@ -182,9 +189,14 @@ STATUS is only in the email body, so you must read the body to know what this em
 the container number (from the subject/body) and ship_date = the email's received date \
 (given in the metadata -- NOT any date in the body, NOT today). Then call finish. \
 Acumatica resolves which sales orders that container maps to; you don't need to.
-   - If create_shipment comes back with needs_review=true or created=0 (e.g. the \
-container shares a PO Receipt with other containers, or no open sales order resolved), \
-do NOT treat it as done -- call finish with exception=true and explain.
+   - If create_shipment comes back with waiting_on_containers=true: this order's \
+Purchase Order isn't fully received yet (more containers for it are still arriving, \
+possibly weeks apart). This is EXPECTED, not an error -- call finish with \
+classification nrt_waiting_on_containers, exception=false. It'll ship automatically \
+once complete; nothing more for you to do.
+   - If create_shipment comes back with needs_review=true instead (e.g. no open sales \
+order resolved, or a pickup arrived for an order already marked shipped), that DOES \
+need a human -- call finish with exception=true and explain.
 - Any OTHER status (in transit, arrived at port, delayed, on hold, empty returned, etc.): \
 do NOT create a shipment. Call finish with classification nrt_other_status, no action.
 

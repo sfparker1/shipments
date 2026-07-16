@@ -64,6 +64,8 @@ SHIPDATES_PATH = os.path.join(TOKEN_DIR, "po_shipdates.json")  # {po: 'YYYY-MM-D
 CONTAINERDATES_PATH = os.path.join(TOKEN_DIR, "container_dates.json")  # {container: 'YYYY-MM-DD'} NRT pickup (email) dates, pushed by the daily sync
 WATCHLIST_PATH = os.path.join(TOKEN_DIR, "maersk_watchlist.json")  # {container: {pos, port_of_loading, receipt_no, vessel, status, date_added, ...}}
 WATCHLIST_SLA_DAYS = int(cfg("WATCHLIST_SLA_DAYS", "45"))  # containers watching longer than this without a Load-on event are flagged, not silently left open
+LEDGER_PATH = os.path.join(TOKEN_DIR, "container_ledger.json")  # {master_token: {containers: {container: pickup_date}, status, first_seen, last_updated}} -- see po_completeness()
+LEDGER_SLA_DAYS = int(cfg("LEDGER_SLA_DAYS", "45"))  # masters stuck waiting/partial longer than this surface in /agent/summary for human review
 AGENTLOG_PATH = os.path.join(TOKEN_DIR, "agent_log.jsonl")  # one row per agent DECISION (not per LLM turn) -- the mailbox-agent's human-reviewable audit trail
 INGEST_DIR = os.path.join(TOKEN_DIR, "ingest_queue")  # Power Automate pushes raw emails here (one JSON file each); the agent cron job drains it
 AUTOSHIP_TOKEN = cfg("AUTOSHIP_TOKEN", "")  # separate, write-capable token for /autoship -- keep distinct from STATUS_TOKEN (read-only)
@@ -166,6 +168,64 @@ def watchlist_check_sla():
     if changed:
         save_json(WATCHLIST_PATH, wl)
     return wl
+
+# ---------------- container ledger (Phase 2 / Tier 2: split-PO shipment completeness) ----------------
+# Tracks per-master pickup dates across however many NRT events it takes, so a PO whose
+# containers arrive via separate receipts (see master_multi_receipt_flags' docstring) can
+# still be shipped once -- at the LATEST recorded pickup date -- rather than refused forever.
+# Same JSON-on-persistent-disk pattern as the Maersk watch-list above.
+def ledger_record(master_token, container, pickup_date):
+    """Idempotent upsert -- a duplicate/resent NRT email for a container already in the
+    ledger just re-writes the same date, harmless. Always called BEFORE any shipment
+    decision, so the ledger reflects reality even if the completeness check or the
+    shipment-creation loop below it fails partway through."""
+    if not master_token or not container:
+        return None
+    data = load_json(LEDGER_PATH) or {}
+    entry = data.setdefault(master_token, {"containers": {}, "status": "waiting",
+                                            "first_seen": pickup_date, "last_updated": pickup_date})
+    entry["containers"][container] = pickup_date
+    entry["last_updated"] = pickup_date
+    save_json(LEDGER_PATH, data)
+    return entry
+
+def ledger_set_status(master_token, status, note=None):
+    data = load_json(LEDGER_PATH) or {}
+    if master_token not in data:
+        return None
+    data[master_token]["status"] = status
+    if note:
+        data[master_token]["note"] = note
+    save_json(LEDGER_PATH, data)
+    return data[master_token]
+
+def ledger_latest_date(master_token):
+    data = load_json(LEDGER_PATH) or {}
+    dates = list((data.get(master_token) or {}).get("containers", {}).values())
+    return max(dates) if dates else None
+
+def ledger_entry(master_token):
+    return (load_json(LEDGER_PATH) or {}).get(master_token)
+
+def ledger_check_sla():
+    """Flag masters stuck 'waiting'/'partial' past LEDGER_SLA_DAYS -- mirrors
+    watchlist_check_sla(). Runs opportunistically (from /agent/summary), no separate cron
+    needed for the flagging itself (the recheck job below is separate and IS cron-driven,
+    since it has to actually retry the completeness check, not just flag staleness)."""
+    data = load_json(LEDGER_PATH) or {}
+    stale = []
+    for token, entry in data.items():
+        if entry.get("status") not in ("waiting", "partial"):
+            continue
+        try:
+            first = datetime.date.fromisoformat((entry.get("first_seen") or "")[:10])
+        except Exception:
+            continue
+        if (datetime.date.today() - first).days > LEDGER_SLA_DAYS:
+            stale.append({"master": token, "status": entry["status"],
+                          "days_waiting": (datetime.date.today() - first).days,
+                          "containers": sorted(entry.get("containers", {}).keys())})
+    return stale
 
 def parse_multipart(body, boundary):
     """Minimal multipart/form-data parser (replaces the removed stdlib `cgi`).
@@ -534,6 +594,68 @@ def master_multi_receipt_flags(containers):
         flags[c] = same_receipt_multi or cross_receipt_split
     return flags
 
+def resolve_pos_from_container(container):
+    """All distinct internal Purchase Orders behind a container's receipt(s) -- usually
+    one, but a container can appear on more than one receipt (confirmed real: e.g. two
+    masters resolving to the same DC off one container, seen in production). Targeted,
+    bounded $expand=Details fetch per receipt (NOT the header-only bulk cache) to read
+    POOrderNbr/POOrderType. Returns a list, one entry per receipt: (po_type, po_nbr) if
+    that receipt's Details agree on a single PO, else None -- a None means "couldn't
+    resolve," which callers must treat as incomplete (fail closed), never skipped."""
+    container = (container or "").strip().upper()
+    receipts = [r for r in load_recent_receipts() if container in r.get("containers", [])]
+    found = []
+    for r in receipts:
+        flt = urllib.parse.quote(f"ReceiptNbr eq '{r['receipt_nbr']}'")
+        st, d = api("GET", f"{ENTITY}/PurchaseReceipt?$filter={flt}&$expand=Details")
+        if st != 200 or not isinstance(d, list) or not d:
+            found.append(None)
+            continue
+        details = d[0].get("Details") or []
+        po_nbrs = {(dd.get("POOrderNbr") or {}).get("value") for dd in details if dd.get("POOrderNbr")}
+        po_types = {(dd.get("POOrderType") or {}).get("value") for dd in details if dd.get("POOrderType")}
+        if len(po_nbrs) == 1 and po_nbrs != {None}:
+            found.append(((next(iter(po_types)) if po_types else None), next(iter(po_nbrs))))
+        else:
+            found.append(None)
+    return found
+
+def po_completeness(po_type, po_nbr):
+    """Is this Purchase Order fully received? Uses the PO's own header Status field --
+    confirmed live (via /diag's po_completeness_probe) that Status flips to 'Completed'
+    exactly when every line's received qty (QtyOnReceipts) reaches its ordered qty
+    (OrderQty), correctly aggregated across however many separate PurchaseReceipt
+    documents it took to get there. Exact eq filter, never substringof (500s on this
+    tenant). FAILS CLOSED: any lookup error or missing/unexpected Status is treated as
+    NOT complete -- never silently 'ready to ship' on an ambiguous read."""
+    if not po_nbr:
+        return False, {"error": "no PO number"}
+    flt = urllib.parse.quote(f"OrderNbr eq '{po_nbr}'")
+    st, d = api("GET", f"{ENTITY}/PurchaseOrder?$filter={flt}")
+    if st != 200 or not isinstance(d, list) or not d:
+        return False, {"error": f"PO lookup failed (status {st})", "po": po_nbr}
+    status = (d[0].get("Status") or {}).get("value")
+    return status == "Completed", {"po": po_nbr, "po_status": status}
+
+def containers_completeness(container):
+    """Combines resolve_pos_from_container + po_completeness across ALL of a container's
+    resolved POs -- every one of them must be Completed for the container's order to be
+    considered ready to ship. Returns (complete: bool, detail: list) -- fails closed if
+    resolution itself came back empty or ambiguous (a genuinely single-container, fully
+    resolved order still passes this the same as it does today; nothing changes for the
+    normal case)."""
+    refs = resolve_pos_from_container(container)
+    if not refs or any(r is None for r in refs):
+        return False, [{"error": "one or more receipts for this container did not resolve "
+                                  "to exactly one Purchase Order"}]
+    detail = []
+    complete = True
+    for po_type, po_nbr in refs:
+        ok, d = po_completeness(po_type, po_nbr)
+        detail.append(d)
+        complete = complete and ok
+    return complete, detail
+
 # ---------------- matching ----------------
 _OPEN_ORDERS = {"rows": None, "ts": 0}
 OPEN_TTL = 600   # cache open sales orders for 10 min
@@ -900,6 +1022,10 @@ def agent_summary(hours=24):
         "last_decision_at": last_decision_at,
         "agent_health": agent_health,
         "run_issues": run_issues,
+        # Masters stuck "waiting"/"partial" (Purchase Order not yet fully received) past
+        # LEDGER_SLA_DAYS -- not time-windowed like the fields above, this is current state,
+        # not a window count, since a stuck master isn't tied to any one day's decisions.
+        "ledger_stale": ledger_check_sla(),
     }
 
 # ---------------- ingest queue (Power Automate push -> agent pull) ----------------
@@ -1172,19 +1298,37 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                     "reason": "out_of_scope_3pl",
                     "note": "container's PO Receipt is 3PL-bound (MMX/4006/AMAZON/HG); revenue is "
                             "recognized at the 3PL, not at port pickup -- skipped, no action needed"}
-        # NRT path: refuse to auto-create when the container's master/Ecomm order is split
-        # across MULTIPLE PO Receipts -- either the same receipt lists other containers too
-        # (one packing-list upload covering several containers), or a DIFFERENT receipt
-        # resolves to the same master (containers arrived via separate uploads over time).
-        # Either way, picking up one container doesn't mean the whole PO/SO is available to
-        # ship -- surface it for a clerk instead of shipping goods that may still be afloat.
-        # Authoritative here (not just in the agent). Checked even in dry_run so a preview
-        # accurately reflects what the real run would refuse to do.
-        if master_multi_receipt_flags([container]).get(container):
-            return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
-                    "reason": "multi_container_receipt",
-                    "note": "container's order is split across multiple PO Receipts; a clerk should "
-                            "confirm which orders are actually available before shipping"}
+        # NRT path completeness gate (Phase 2 / Tier 2 -- see majestic-swimming-melody.md):
+        # does the underlying Purchase Order behind this container actually show everything
+        # received yet? Runs on EVERY in-scope pickup event, not just ones that already look
+        # like a multi-container split -- a PO whose containers arrived via separate
+        # packing-list uploads leaves no trace on any single receipt (see
+        # master_multi_receipt_flags' docstring), so only this PO-level check catches the
+        # worst case: a sibling container whose receipt doesn't exist in Acumatica yet at
+        # all. FAILS CLOSED: any resolution/lookup problem is treated as "not complete."
+        # Ledger updated FIRST, unconditionally, before any shipment decision.
+        pickup_date = ship_date or datetime.date.today().isoformat()
+        for token in resolved:
+            entry = ledger_entry(token)
+            if entry and entry.get("status") == "shipped":
+                # Anomaly: new inventory for a master we already shipped as complete.
+                # Something's inconsistent -- flag for a human rather than silently
+                # re-shipping (would risk a duplicate) or silently dropping it.
+                return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
+                        "reason": "pickup_after_already_shipped",
+                        "note": f"master {token} was already marked shipped, but a new pickup "
+                                "event just arrived for it -- a clerk should investigate",
+                        "ledger_entry": entry}
+            ledger_record(token, container, pickup_date)
+        complete, completeness_detail = containers_completeness(container)
+        if not complete:
+            for token in resolved:
+                ledger_set_status(token, "waiting")
+            return {"container": container, "waiting_on_containers": True, "created": 0,
+                    "orders_matched": 0, "reason": "po_incomplete",
+                    "note": "underlying Purchase Order isn't fully received yet -- waiting for "
+                            "the remaining container(s) before shipping this order; no action needed",
+                    "completeness_detail": completeness_detail}
         all_pos = resolved
         unresolved = not resolved
 
@@ -1194,6 +1338,7 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         load_open_orders(force=True)
         matched = find_sales_orders_batch(all_pos)
     rows = []; log_orders = []; to_create = 0; created = 0
+    po_all_created = {}  # po/master token -> did every matched order for it end up created?
     for po in all_pos:
         matches = matched.get(po, [])
         if not matches:
@@ -1201,18 +1346,47 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
             if not dry_run:
                 log_orders.append({"po": po, "order": None, "shipment_nbr": None,
                                     "created": False, "reason": "no open sales order"})
+            po_all_created[po] = False
             continue
+        po_ok = True
         for m in matches:
             to_create += 1
             row = {"po": po, "confidence": "ok", "orders": [m], "note": ""}
             if not dry_run:
-                res = create_shipment(m["order_type"], m["order_nbr"], container, ship_date, po=po)
+                # Per-order idempotency pre-check: if this specific order already has a real
+                # shipment, don't call create_shipment again -- makes a crash-and-retry (or a
+                # duplicate/resent NRT email) naturally resume/no-op without depending on
+                # whether Acumatica's CreateShipment itself would reject or duplicate a
+                # re-call (confirmed unresolved either way, see the Phase-2 plan).
+                existing = _latest_shipment_for_order(m["order_type"], m["order_nbr"], retries=1, delay=0)
+                if existing:
+                    res = {"order": f"{m['order_type']} {m['order_nbr']}", "created": True,
+                           "shipment_nbr": existing.get("shipment_nbr"), "already_existed": True}
+                else:
+                    # Ship at the LATEST recorded pickup date for this master (spans however
+                    # many separate NRT events it took), not just this one event's own date --
+                    # falls back to the passed-in ship_date for the pos-given (Maersk/FCR) path,
+                    # which isn't ledger-tracked.
+                    effective_date = ledger_latest_date(po) or ship_date
+                    res = create_shipment(m["order_type"], m["order_nbr"], container, effective_date, po=po)
                 row["result"] = res
-                if res.get("created"): created += 1
+                if res.get("created"):
+                    created += 1
+                else:
+                    po_ok = False
                 log_orders.append({"po": po, "order": f"{m['order_type']} {m['order_nbr']}".strip(),
                                     "shipment_nbr": res.get("shipment_nbr"), "created": res.get("created"),
                                     "ship_date": res.get("ship_date"), "reason": res.get("reason") or res.get("error")})
             rows.append(row)
+        po_all_created[po] = po_ok
+
+    if not dry_run and not pos:
+        # Only the container-resolution (NRT) path is ledger-tracked -- mark each master
+        # "shipped" once every one of its matched DC orders is confirmed created (existing
+        # or new); if only some succeeded, leave it "partial" so the recheck job (and SLA
+        # flagging) can finish/surface the rest rather than silently losing track.
+        for token in all_pos:
+            ledger_set_status(token, "shipped" if po_all_created.get(token) else "partial")
 
     unresolved_containers = [container] if (unresolved and not all_pos) else []
     summary = {"container": container, "source": source, "po_count": len(all_pos),
@@ -2109,6 +2283,34 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(out), "application/json")
             except Exception as e:
                 return self._send(200, json.dumps({"error": str(e)}), "application/json")
+        if u.path == "/ledger/recheck":
+            # Cron-triggered (e.g. daily, alongside the digest). Without this, a master
+            # whose LAST container's pickup email fires before its receipt posts in
+            # Acumatica has no future NRT event to re-trigger it -- it would sit "waiting"
+            # forever even after the PO genuinely becomes complete. Re-runs the exact same
+            # completeness gate process_manual already uses (picking any one of the
+            # master's recorded containers is enough -- containers_completeness() checks
+            # the underlying PO, not just that one container). Same write stakes as
+            # /autoship, same token.
+            want = AUTOSHIP_TOKEN
+            got = (self.headers.get("Authorization", "") or "").removeprefix("Bearer ").strip()
+            if not (want and hmac.compare_digest(got.encode(), want.encode())):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            ledger = load_json(LEDGER_PATH) or {}
+            results = []
+            for token, entry in ledger.items():
+                if entry.get("status") not in ("waiting", "partial"):
+                    continue
+                containers = list(entry.get("containers", {}).keys())
+                if not containers:
+                    continue
+                latest = ledger_latest_date(token)
+                try:
+                    out = process_manual(containers[-1], latest, source="ledger-recheck", dry_run=False)
+                except Exception as e:
+                    out = {"error": str(e)}
+                results.append({"master": token, "container_used": containers[-1], "result": out})
+            return self._send(200, json.dumps({"checked": len(results), "results": results}), "application/json")
         if u.path == "/fixshipdate":
             # Correct ShipmentDate on an ALREADY-CREATED shipment without re-running
             # CreateShipment (which would create a duplicate). Takes the SALES ORDER (not
