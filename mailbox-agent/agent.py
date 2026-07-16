@@ -299,6 +299,23 @@ def process_item(client, item):
     flag = " [EXCEPTION]" if decision.get("exception_flag") else ""
     print(f"  {decision.get('classification')} / {decision.get('action_taken')}{flag}: {msg_id}")
 
+def ledger_recheck():
+    """Re-check every 'waiting'/'partial' master (Phase 2 / Tier 2 completeness ledger) for
+    whether its Purchase Order has since become fully received. Required, not optional --
+    without this, a master whose LAST container's NRT email fires before its receipt posts
+    in Acumatica has no future event to re-trigger it and would sit stuck forever. Piggybacks
+    on this cron's existing schedule/token rather than a separate service (no new secrets).
+    Same write stakes as create_shipment -- skipped entirely in shadow mode, not intercepted
+    like the LLM's tool calls, since this is a direct endpoint call outside the agent loop."""
+    if SHADOW_MODE:
+        print("  [ledger recheck] skipped -- SHADOW_MODE on")
+        return
+    st, data = _http("POST", "/ledger/recheck", AUTOSHIP_TOKEN)
+    if st == 200 and isinstance(data, dict):
+        print(f"  [ledger recheck] checked={data.get('checked')}")
+    else:
+        print(f"  [ledger recheck] failed: status={st} body={data}")
+
 # ---------------- main ----------------
 RUN_ID = None
 def main():
@@ -314,15 +331,18 @@ def main():
     print(f"[mailbox-agent run {RUN_ID}] mode={mode} model={MODEL} queued={len(items)}")
     if not items:
         print("  nothing to do.")
-        return
-    for i, item in enumerate(items[:MAX_ITEMS_PER_RUN]):
-        try:
-            process_item(client, item)
-        except Exception as e:
-            print(f"  ERROR on item {item.get('id')}: {e}")
-            # leave it in the queue for the next run rather than dropping it
-    if len(items) > MAX_ITEMS_PER_RUN:
-        print(f"  capped at {MAX_ITEMS_PER_RUN}; {len(items) - MAX_ITEMS_PER_RUN} remain for next run.")
+    else:
+        for i, item in enumerate(items[:MAX_ITEMS_PER_RUN]):
+            try:
+                process_item(client, item)
+            except Exception as e:
+                print(f"  ERROR on item {item.get('id')}: {e}")
+                # leave it in the queue for the next run rather than dropping it
+        if len(items) > MAX_ITEMS_PER_RUN:
+            print(f"  capped at {MAX_ITEMS_PER_RUN}; {len(items) - MAX_ITEMS_PER_RUN} remain for next run.")
+    # Runs every cron cycle regardless of queue state -- a stuck ledger entry isn't tied to
+    # whether new mail arrived this run.
+    ledger_recheck()
     print("done.")
 
 if __name__ == "__main__":
