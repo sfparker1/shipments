@@ -1449,6 +1449,26 @@ def diagnostics(sample_po=None, sample_container=None, sample_receipt=None):
         out["sample_po"] = sample_po
         out["open_matches"] = matches[:5]
         out["sample_pipeline"] = so_pipeline(sample_po)
+        # READ-ONLY qty probe for the Phase-2 (multi-container aggregation) design question:
+        # does Acumatica already show enough received/available qty to ship on a SO whose
+        # linked PO spans multiple containers, only SOME of which have arrived? If so,
+        # CreateShipment could create a premature PARTIAL shipment the moment any one
+        # container's PO Receipt posts qty -- before container_multi_flags' refusal even
+        # matters for a would-be Phase 2 that tries to call it early. Never calls
+        # CreateShipment itself -- just reads each matched SO's Detail lines.
+        qty_probe = []
+        for m in matches[:5]:
+            qst, qd = api("GET", f"{ENTITY}/SalesOrder/{m['order_type']}/{m['order_nbr']}?$expand=Details")
+            if qst == 200 and isinstance(qd, dict):
+                lines = []
+                for dline in (qd.get("Details") or []):
+                    lines.append({k: (v.get("value") if isinstance(v, dict) else v)
+                                  for k, v in dline.items()
+                                  if re.search(r"qty|quantity|open|ship|complet", k, re.I)})
+                qty_probe.append({"order": f"{m['order_type']} {m['order_nbr']}", "lines": lines})
+            else:
+                qty_probe.append({"order": f"{m['order_type']} {m['order_nbr']}", "status": qst})
+        out["sample_po_qty_probe"] = qty_probe
     st, schema = api("GET", f"{ENTITY}/Shipment/$adHocSchema")
     if st == 200 and isinstance(schema, dict):
         cands = []
