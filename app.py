@@ -501,15 +501,37 @@ def container_scope(container):
         return "out_of_scope", []
     return "unresolved", []
 
-def container_multi_flags(containers):
-    """For each queried container, True if it appears on a PO Receipt that also lists
-    OTHER containers. A multi-container receipt means picking up one container doesn't
-    imply the whole PO/SO is available to ship -- the NRT auto-ship path refuses these
-    and flags for a human (the ~3% split case) rather than shipping items still afloat."""
+def master_multi_receipt_flags(containers):
+    """For each queried container, True if picking it up doesn't imply the whole PO/SO is
+    available to ship -- either of two cases:
+      (a) same-receipt split: its PO Receipt also lists OTHER containers (one packing-list
+          upload covering several containers for the same PO) -- the original check.
+      (b) cross-receipt split: its resolved master/Ecomm token ALSO appears on a DIFFERENT
+          PO Receipt (a PO whose containers arrived via SEPARATE packing-list uploads, each
+          producing its own receipt that looks like a normal single-container order in
+          isolation). Confirmed real: packing-list-acumatica's create_receipt() always PUTs
+          a brand-new PurchaseReceipt with no lookup against an existing one for the same
+          PO, so a cross-upload split leaves no trace on any single receipt's container
+          field -- only a same-master-different-receipt match reveals it.
+    Either case means the NRT auto-ship path refuses and flags for a human rather than
+    shipping items that may still be afloat elsewhere. Pure client-side check over the
+    already-cached load_recent_receipts() -- no new Acumatica calls.
+    Known remaining gap (needs the PO-completeness check, not this function): a sibling
+    container whose receipt doesn't exist in Acumatica AT ALL yet (still in transit / its
+    packing list not yet processed) has nothing here to detect."""
     receipts = load_recent_receipts()
+    token_receipts = {}
+    for r in receipts:
+        for tok in _extract_order_tokens(r.get("vendor_ref")):
+            token_receipts.setdefault(tok, set()).add(r["receipt_nbr"])
     flags = {}
     for c in [x.strip().upper() for x in containers if x]:
-        flags[c] = any(c in r["containers"] and len(r["containers"]) > 1 for r in receipts)
+        own = [r for r in receipts if c in r.get("containers", [])]
+        own_receipt_nbrs = {r["receipt_nbr"] for r in own}
+        same_receipt_multi = any(len(r["containers"]) > 1 for r in own)
+        _, tokens = container_scope(c)
+        cross_receipt_split = any(token_receipts.get(tok, set()) - own_receipt_nbrs for tok in tokens)
+        flags[c] = same_receipt_multi or cross_receipt_split
     return flags
 
 # ---------------- matching ----------------
@@ -1150,15 +1172,18 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                     "reason": "out_of_scope_3pl",
                     "note": "container's PO Receipt is 3PL-bound (MMX/4006/AMAZON/HG); revenue is "
                             "recognized at the 3PL, not at port pickup -- skipped, no action needed"}
-        # NRT path: refuse to auto-create when the container's PO Receipt also covers OTHER
-        # containers. Picking up one container of a multi-container receipt doesn't mean the
-        # whole PO/SO is available to ship -- surface it for a clerk instead of shipping goods
-        # that may still be afloat. Authoritative here (not just in the agent). Checked even in
-        # dry_run so a preview accurately reflects what the real run would refuse to do.
-        if container_multi_flags([container]).get(container):
+        # NRT path: refuse to auto-create when the container's master/Ecomm order is split
+        # across MULTIPLE PO Receipts -- either the same receipt lists other containers too
+        # (one packing-list upload covering several containers), or a DIFFERENT receipt
+        # resolves to the same master (containers arrived via separate uploads over time).
+        # Either way, picking up one container doesn't mean the whole PO/SO is available to
+        # ship -- surface it for a clerk instead of shipping goods that may still be afloat.
+        # Authoritative here (not just in the agent). Checked even in dry_run so a preview
+        # accurately reflects what the real run would refuse to do.
+        if master_multi_receipt_flags([container]).get(container):
             return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
                     "reason": "multi_container_receipt",
-                    "note": "container shares a PO Receipt with other containers; a clerk should "
+                    "note": "container's order is split across multiple PO Receipts; a clerk should "
                             "confirm which orders are actually available before shipping"}
         all_pos = resolved
         unresolved = not resolved
@@ -1453,7 +1478,7 @@ def diagnostics(sample_po=None, sample_container=None, sample_receipt=None):
         # does Acumatica already show enough received/available qty to ship on a SO whose
         # linked PO spans multiple containers, only SOME of which have arrived? If so,
         # CreateShipment could create a premature PARTIAL shipment the moment any one
-        # container's PO Receipt posts qty -- before container_multi_flags' refusal even
+        # container's PO Receipt posts qty -- before master_multi_receipt_flags' refusal even
         # matters for a would-be Phase 2 that tries to call it early. Never calls
         # CreateShipment itself -- just reads each matched SO's Detail lines.
         qty_probe = []
@@ -1469,6 +1494,60 @@ def diagnostics(sample_po=None, sample_container=None, sample_receipt=None):
             else:
                 qty_probe.append({"order": f"{m['order_type']} {m['order_nbr']}", "status": qst})
         out["sample_po_qty_probe"] = qty_probe
+        # READ-ONLY PurchaseOrder-completeness probe (Tier 2 of the Phase-2 plan, see
+        # majestic-swimming-melody.md). Answers, before any code is written against it:
+        # (a) does a receipt's Details agree on ONE POOrderNbr, (b) what field name/value
+        # does PurchaseOrder actually use for its Type ("Type" vs "OrderType" -- even the
+        # sibling packing-list-acumatica app hedges between the two), (c) which qty field
+        # (OpenQty vs OrderQty-QtyOnReceipts) is trustworthy, (d) whether that qty reflects
+        # the SUM across every receipt tied to this PO when more than one receipt is found
+        # below (the entire premise of the completeness-check design). Uses an EXACT $filter
+        # (OrderNbr eq '...'), never substringof -- substringof is confirmed to 500 on this
+        # tenant (see _latest_shipment_for_order's docstring); an exact eq filter is the same
+        # safe pattern diagnostics() already uses elsewhere (e.g. probe_007068 below).
+        po_probe = {"receipts_checked": []}
+        matching_receipts = [r for r in load_recent_receipts()
+                              if sample_po in _extract_order_tokens(r.get("vendor_ref"))]
+        for r in matching_receipts[:5]:
+            rflt = urllib.parse.quote(f"ReceiptNbr eq '{r['receipt_nbr']}'")
+            rst, rd = api("GET", f"{ENTITY}/PurchaseReceipt?$filter={rflt}&$expand=Details")
+            entry = {"receipt_nbr": r["receipt_nbr"]}
+            if rst == 200 and isinstance(rd, list) and rd:
+                details = rd[0].get("Details") or []
+                po_nbrs = sorted({(d.get("POOrderNbr") or {}).get("value")
+                                   for d in details if d.get("POOrderNbr")})
+                po_types = sorted({(d.get("POOrderType") or {}).get("value")
+                                    for d in details if d.get("POOrderType")})
+                entry["po_order_nbrs_on_this_receipt"] = po_nbrs
+                entry["po_order_types_on_this_receipt"] = po_types
+                entry["details_agree_on_one_po"] = len(po_nbrs) <= 1
+            else:
+                entry["status"] = rst
+            po_probe["receipts_checked"].append(entry)
+        distinct_po_nbrs = sorted({n for e in po_probe["receipts_checked"]
+                                    for n in e.get("po_order_nbrs_on_this_receipt", [])})
+        po_probe["distinct_po_order_nbrs_across_receipts"] = distinct_po_nbrs
+        po_probe["receipt_count_for_this_master"] = len(matching_receipts)
+        if distinct_po_nbrs:
+            target_nbr = distinct_po_nbrs[0]
+            pflt = urllib.parse.quote(f"OrderNbr eq '{target_nbr}'")
+            pst, pd = api("GET", f"{ENTITY}/PurchaseOrder?$filter={pflt}&$expand=Details")
+            po_probe["po_lookup_status"] = pst
+            if pst == 200 and isinstance(pd, list) and pd:
+                po_body = pd[0]
+                po_probe["po_keys"] = sorted(po_body.keys())
+                type_field = "Type" if "Type" in po_body else ("OrderType" if "OrderType" in po_body else None)
+                po_probe["po_type_field_name"] = type_field
+                po_probe["po_type_field_value"] = (po_body.get(type_field) or {}).get("value") if type_field else None
+                po_probe["po_status"] = (po_body.get("Status") or {}).get("value")
+                details = po_body.get("Details") or []
+                po_probe["po_detail_qty_fields"] = [
+                    {k: (v.get("value") if isinstance(v, dict) else v) for k, v in d.items()
+                     if re.search(r"qty|quantity|open|receiv|complet", k, re.I)}
+                    for d in details]
+            else:
+                po_probe["po_lookup_error"] = pd
+        out["po_completeness_probe"] = po_probe
     st, schema = api("GET", f"{ENTITY}/Shipment/$adHocSchema")
     if st == 200 and isinstance(schema, dict):
         cands = []
