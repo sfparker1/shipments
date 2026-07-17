@@ -1095,10 +1095,12 @@ def _fmt_ts(ts):
         return ts
 
 # What the agent's classification enum (agent.py) actually means, in plain English --
-# shown as the "Update type" column instead of the raw enum, plus a legend under the table.
+# shown as the "Email status" column instead of the raw enum, plus a legend under the
+# table. Plain text only, no embedded HTML entities -- every use of this is esc()'d, so an
+# entity like &middot; would double-escape and show up as literal text on screen.
 CLASSIFICATION_LABELS = {
     "nrt_available_for_pickup": "Available for pickup",
-    "nrt_waiting_on_containers": "Available for pickup &middot; waiting on order",
+    "nrt_waiting_on_containers": "Available for pickup",
     "nrt_other_status": "NRT update, not a pickup",
     "not_nrt": "Not an NRT email",
     "ambiguous": "Ambiguous",
@@ -1174,15 +1176,13 @@ def _friendly_shipment_result(tool_result, esc):
     if not isinstance(data, dict):
         return _fmt_kv(tool_result, esc)  # unexpected shape -- fall back rather than hide it
     if data.get("waiting_on_containers"):
-        detail = data.get("completeness_detail") or []
-        pos = "; ".join(
-            f"PO {esc(str(d.get('po')))} &mdash; "
-            + ("received in full" if d.get("po_status") == "Completed"
-               else esc(str(d.get("po_status") or d.get("error") or "still arriving")))
-            for d in detail if isinstance(d, dict))
+        detail = [d for d in (data.get("completeness_detail") or []) if isinstance(d, dict)]
+        total = len(detail)
+        received = sum(1 for d in detail if d.get("po_status") == "Completed")
+        counts = (f"<div class=sub>{received} of {total} purchase orders received in full &mdash; "
+                  f'<a href=/splits>see Split orders</a> for the breakdown.</div>') if total else ""
         return ("Waiting on the rest of this order to arrive &mdash; no shipment created yet; "
-                "it'll ship automatically once every container is in."
-                + (f"<div class=sub>{pos}</div>" if pos else ""))
+                "it'll ship automatically once every container is in." + counts)
     if data.get("out_of_scope"):
         return "Skipped &mdash; this container is 3PL-bound, not tracked here."
     if data.get("needs_review"):
@@ -2033,7 +2033,11 @@ def _dashboard_html():
     elif s["decisions"] == 0:
         warn = '<p class=sub style="color:#b06a5a">&#9888; No decisions logged in the last 24h.</p>'
 
-    by_class = "".join('<span class=pill>%s: %d</span>' % (k, v) for k, v in sorted(s["by_classification"].items()))
+    # Display-only: agent_summary()'s by_classification keeps the raw enum keys (the
+    # digest email/Power-Automate side may match on them) -- map through
+    # _friendly_classification for anything shown on screen, same as everywhere else.
+    by_class = "".join('<span class=pill>%s: %d</span>' % (_friendly_classification(k), v)
+                        for k, v in sorted(s["by_classification"].items()))
 
     # Cheap count (ledger's own stored status, not a live re-check -- that's what the
     # dedicated /splits page is for) so a glance here shows whether anything's mid-split.
