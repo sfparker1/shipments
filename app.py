@@ -1704,27 +1704,14 @@ def _splits_html(limit=10):
         shown, hidden = ordered[:limit], ordered[limit:]
         cards = []
         for tok, entry in shown:
-            info = split_order_status(tok, entry)
-            cont_rows = "".join(
-                f"<tr><td>{esc(c)}</td><td>{esc(d)}</td></tr>"
-                for c, d in sorted(info["containers"].items(), key=lambda kv: kv[1]))
-            po_rows = "".join(
-                f"<tr><td>{esc(p['po'])}</td><td>{'&#10003; Received in full' if p['complete'] else '&#9678; ' + esc(p['status'])}</td></tr>"
-                for p in info["purchase_orders"]) or "<tr><td colspan=2 class=sub>Could not resolve a Purchase Order</td></tr>"
-            order_rows = "".join(
-                f"<tr><td>{esc(o['order'])}</td><td>{esc(o.get('cust_order') or '')}</td><td>{esc(o['stage'])}</td></tr>"
-                for o in info["orders"]) or "<tr><td colspan=3 class=sub>No open sales order matched</td></tr>"
-            status_label = "Partially shipped" if entry.get("status") == "partial" else "Waiting"
-            cards.append(
-                f'<div class=card><h1 style="font-size:16px">Master {esc(tok)} '
-                f'<span class=pill style="border-color:#5d7682;color:#5d7682">{status_label}</span></h1>'
-                f'<p class=sub>Containers seen so far, in order of pickup date:</p>'
-                f'<div class=twrap><table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table></div>'
-                f'<p class=sub>Underlying Purchase Order(s) -- ALL must be fully received before this ships:</p>'
-                f'<div class=twrap><table><tr><th>Purchase Order</th><th>Status</th></tr>{po_rows}</table></div>'
-                f'<p class=sub>Matched Sales Order(s):</p>'
-                f'<div class=twrap><table><tr><th>Order</th><th>Customer order #</th><th>Stage</th></tr>{order_rows}</table></div>'
-                f'</div>')
+            try:
+                cards.append(_split_order_card(tok, entry, esc))
+            except Exception as e:
+                # One master's data shouldn't be able to take the whole page down --
+                # show what broke for this one and keep going.
+                cards.append('<div class=card><h1 style="font-size:16px">Master %s</h1>'
+                              '<p class=sub style="color:#b06a5a">Could not load: %s</p></div>'
+                              % (esc(tok), esc(str(e))))
         body = "".join(cards)
         if hidden:
             body += ('<p class=sub>%d more, oldest-waiting-first shown above -- '
@@ -1734,6 +1721,32 @@ def _splits_html(limit=10):
             '<p class=sub>Orders currently waiting on more than one container before they can ship -- '
             'live status, checked against Acumatica just now, not just the last-known ledger state.</p></div>'
             + body)
+
+def _split_order_card(tok, entry, esc):
+    """Build one master's card for _splits_html. Split out so a failure building ONE
+    card (bad/unexpected data for that master) can be caught and shown inline without
+    taking down the rest of the page."""
+    info = split_order_status(tok, entry)
+    cont_rows = "".join(
+        f"<tr><td>{esc(c)}</td><td>{esc(d)}</td></tr>"
+        for c, d in sorted(info["containers"].items(), key=lambda kv: kv[1]))
+    po_rows = "".join(
+        f"<tr><td>{esc(p['po'])}</td><td>{'&#10003; Received in full' if p['complete'] else '&#9678; ' + esc(p['status'])}</td></tr>"
+        for p in info["purchase_orders"]) or "<tr><td colspan=2 class=sub>Could not resolve a Purchase Order</td></tr>"
+    order_rows = "".join(
+        f"<tr><td>{esc(o['order'])}</td><td>{esc(o.get('cust_order') or '')}</td><td>{esc(o['stage'])}</td></tr>"
+        for o in info["orders"]) or "<tr><td colspan=3 class=sub>No open sales order matched</td></tr>"
+    status_label = "Partially shipped" if entry.get("status") == "partial" else "Waiting"
+    return (
+        f'<div class=card><h1 style="font-size:16px">Master {esc(tok)} '
+        f'<span class=pill style="border-color:#5d7682;color:#5d7682">{status_label}</span></h1>'
+        f'<p class=sub>Containers seen so far, in order of pickup date:</p>'
+        f'<div class=twrap><table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table></div>'
+        f'<p class=sub>Underlying Purchase Order(s) -- ALL must be fully received before this ships:</p>'
+        f'<div class=twrap><table><tr><th>Purchase Order</th><th>Status</th></tr>{po_rows}</table></div>'
+        f'<p class=sub>Matched Sales Order(s):</p>'
+        f'<div class=twrap><table><tr><th>Order</th><th>Customer order #</th><th>Stage</th></tr>{order_rows}</table></div>'
+        f'</div>')
 
 def _identity_probe():
     """Raw view of what the identity-detection path actually sees, for diagnosing why the
@@ -2359,8 +2372,17 @@ class H(BaseHTTPRequestHandler):
             try:
                 limit = max(1, int(qs.get("limit", ["10"])[0]))
             except ValueError:
-                limit = 15
-            return self._send(200, page(_splits_html(limit=limit)))
+                limit = 10
+            # http.server has no built-in exception->500 handling -- an uncaught error in
+            # here would otherwise just hang or drop the connection with no response at
+            # all, which looks identical to a slow page from the browser's side. Catch and
+            # show it plainly instead of guessing next time this happens.
+            try:
+                out = _splits_html(limit=limit)
+            except Exception as e:
+                out = ('<div class=card><h1 style="font-size:16px">Split orders &mdash; error</h1>'
+                       '<p class=sub style="color:#b06a5a">%s</p></div>' % str(e).replace("<", "&lt;"))
+            return self._send(200, page(out))
         if u.path == "/history":
             _badge = {"ok": "#5a7d5a", "partial": "#b0653a", "failed": "#b06a5a", "no_matches": "#7d7363"}
             _status_label = {"ok": "Created", "partial": "Partially created", "failed": "Failed",
