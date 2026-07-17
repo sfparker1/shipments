@@ -207,6 +207,16 @@ def ledger_latest_date(master_token):
     dates = list((data.get(master_token) or {}).get("containers", {}).values())
     return max(dates) if dates else None
 
+def ledger_stamp_checked(master_token):
+    """Records WHEN a live PO-completeness check last actually ran for this master --
+    distinct from last_updated (which tracks container pickup dates, not live-check time).
+    Lets /splits show a cached, zero-API-call view by default with an honest 'as of' time,
+    rather than needing a live call just to know how stale the cache is."""
+    data = load_json(LEDGER_PATH) or {}
+    if master_token in data:
+        data[master_token]["last_checked"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        save_json(LEDGER_PATH, data)
+
 def ledger_entry(master_token):
     return (load_json(LEDGER_PATH) or {}).get(master_token)
 
@@ -1384,6 +1394,8 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                         "ledger_entry": entry}
             ledger_record(token, container, pickup_date)
         complete, completeness_detail = containers_completeness(container)
+        for token in resolved:
+            ledger_stamp_checked(token)
         if not complete:
             for token in resolved:
                 ledger_set_status(token, "waiting")
@@ -1677,21 +1689,21 @@ def split_order_status(master_token, entry):
     else:
         orders = [{"order": f"{m['order_type']} {m['order_nbr']}".strip(), "cust_order": m.get("cust_order"),
                     "stage": "Not shipped yet"} for m in find_sales_orders_batch([master_token]).get(master_token, [])]
+    ledger_stamp_checked(master_token)
     return {"master": master_token, "ledger_status": entry.get("status"),
             "containers": containers, "purchase_orders": po_status, "orders": orders}
 
-def _splits_html(limit=10):
+def _splits_html(limit=10, live=False):
     """Dashboard page for orders currently split across multiple containers/receipts --
-    the cases the Phase-2 completeness gate is holding rather than shipping yet. One card
-    per master: its containers + pickup dates, live PO receiving status, and the matched
-    Sales Orders -- everything needed to answer "why is this still waiting" without a
-    manual /diag lookup.
+    the cases the Phase-2 completeness gate is holding rather than shipping yet.
 
-    Each card costs several live Acumatica calls (resolve_pos_from_container +
-    po_completeness per container/PO -- see split_order_status). With enough active
-    masters that adds up to a slow page load, so this caps how many render per visit,
-    oldest-waiting first (the ones most worth looking at) -- not a silent truncation,
-    the count of what's hidden is shown with a link to see more."""
+    Defaults to CACHED (zero Acumatica calls): just the ledger's own last-known state
+    (containers, pickup dates, status, when it was last actually checked). Acumatica's
+    license caps this tenant at 100 web-service API requests/minute -- a live re-check on
+    every single page view (the original design) meant a couple of quick reloads could
+    burst toward that cap for no reason, since PO receiving status doesn't change between
+    reloads seconds apart. Pass live=True (the /splits?live=1 link) to force a real,
+    paced re-check against Acumatica when you actually want current status."""
     ledger = load_json(LEDGER_PATH) or {}
     active = {tok: e for tok, e in ledger.items() if e.get("status") in ("waiting", "partial")}
     def esc(v):
@@ -1703,37 +1715,74 @@ def _splits_html(limit=10):
         ordered = sorted(active.items(), key=lambda kv: kv[1].get("first_seen") or "")
         shown, hidden = ordered[:limit], ordered[limit:]
         cards = []
-        for tok, entry in shown:
-            info = split_order_status(tok, entry)
-            cont_rows = "".join(
-                f"<tr><td>{esc(c)}</td><td>{esc(d)}</td></tr>"
-                for c, d in sorted(info["containers"].items(), key=lambda kv: kv[1]))
-            po_rows = "".join(
-                f"<tr><td>{esc(p['po'])}</td><td>{'&#10003; Received in full' if p['complete'] else '&#9678; ' + esc(p['status'])}</td></tr>"
-                for p in info["purchase_orders"]) or "<tr><td colspan=2 class=sub>Could not resolve a Purchase Order</td></tr>"
-            order_rows = "".join(
-                f"<tr><td>{esc(o['order'])}</td><td>{esc(o.get('cust_order') or '')}</td><td>{esc(o['stage'])}</td></tr>"
-                for o in info["orders"]) or "<tr><td colspan=3 class=sub>No open sales order matched</td></tr>"
-            status_label = "Partially shipped" if entry.get("status") == "partial" else "Waiting"
-            cards.append(
-                f'<div class=card><h1 style="font-size:16px">Master {esc(tok)} '
-                f'<span class=pill style="border-color:#5d7682;color:#5d7682">{status_label}</span></h1>'
-                f'<p class=sub>Containers seen so far, in order of pickup date:</p>'
-                f'<div class=twrap><table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table></div>'
-                f'<p class=sub>Underlying Purchase Order(s) -- ALL must be fully received before this ships:</p>'
-                f'<div class=twrap><table><tr><th>Purchase Order</th><th>Status</th></tr>{po_rows}</table></div>'
-                f'<p class=sub>Matched Sales Order(s):</p>'
-                f'<div class=twrap><table><tr><th>Order</th><th>Customer order #</th><th>Stage</th></tr>{order_rows}</table></div>'
-                f'</div>')
+        for i, (tok, entry) in enumerate(shown):
+            if live and i > 0:
+                time.sleep(0.5)  # same 100-req/min license cap as /ledger/recheck; only matters when live
+            try:
+                cards.append(_split_order_card(tok, entry, esc, live))
+            except Exception as e:
+                # One master's data shouldn't be able to take the whole page down --
+                # show what broke for this one and keep going.
+                cards.append('<div class=card><h1 style="font-size:16px">Master %s</h1>'
+                              '<p class=sub style="color:#b06a5a">Could not load: %s</p></div>'
+                              % (esc(tok), esc(str(e))))
         body = "".join(cards)
         if hidden:
             body += ('<p class=sub>%d more, oldest-waiting-first shown above -- '
-                      '<a href="/splits?limit=%d">show all %d</a>.</p>'
-                      % (len(hidden), len(ordered), len(ordered)))
+                      '<a href="/splits?live=%s&limit=%d">show all %d</a>.</p>'
+                      % (len(hidden), "1" if live else "0", len(ordered), len(ordered)))
+    toggle = ('<a class=pill href="/splits?live=1">Refresh live status</a>' if not live
+              else '<a class=pill href="/splits">Back to cached view</a>')
+    freshness = ("Showing live status, just checked against Acumatica." if live else
+                 "Showing the last-known status from previous checks -- no Acumatica calls made "
+                 "just to view this page.")
     return ('<div class=card><h1 style="font-size:18px">Orders split across containers</h1>'
-            '<p class=sub>Orders currently waiting on more than one container before they can ship -- '
-            'live status, checked against Acumatica just now, not just the last-known ledger state.</p></div>'
+            '<p class=sub>Orders currently waiting on more than one container before they can ship. '
+            '%s</p><p>%s</p></div>'
+            % (freshness, toggle)
             + body)
+
+def _split_order_card(tok, entry, esc, live=False):
+    """Build one master's card for _splits_html. Split out so a failure building ONE
+    card (bad/unexpected data for that master) can be caught and shown inline without
+    taking down the rest of the page. live=False (the default) makes ZERO Acumatica
+    calls -- everything comes straight from the ledger entry."""
+    if not live:
+        cont_rows = "".join(
+            f"<tr><td>{esc(c)}</td><td>{esc(d)}</td></tr>"
+            for c, d in sorted(entry.get("containers", {}).items(), key=lambda kv: kv[1]))
+        status_label = "Partially shipped" if entry.get("status") == "partial" else "Waiting"
+        checked = entry.get("last_checked")
+        checked_note = (f"Purchase order status as of last check ({esc(_fmt_ts(checked))}) -- "
+                        f'<a href="/splits?live=1">refresh live</a> for current status.') if checked else \
+                       'Purchase order status not yet checked live -- <a href="/splits?live=1">refresh live</a> to check now.'
+        return (
+            f'<div class=card><h1 style="font-size:16px">Master {esc(tok)} '
+            f'<span class=pill style="border-color:#5d7682;color:#5d7682">{status_label}</span></h1>'
+            f'<p class=sub>Containers seen so far, in order of pickup date:</p>'
+            f'<div class=twrap><table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table></div>'
+            f'<p class=sub>{checked_note}</p></div>')
+    info = split_order_status(tok, entry)
+    cont_rows = "".join(
+        f"<tr><td>{esc(c)}</td><td>{esc(d)}</td></tr>"
+        for c, d in sorted(info["containers"].items(), key=lambda kv: kv[1]))
+    po_rows = "".join(
+        f"<tr><td>{esc(p['po'])}</td><td>{'&#10003; Received in full' if p['complete'] else '&#9678; ' + esc(p['status'])}</td></tr>"
+        for p in info["purchase_orders"]) or "<tr><td colspan=2 class=sub>Could not resolve a Purchase Order</td></tr>"
+    order_rows = "".join(
+        f"<tr><td>{esc(o['order'])}</td><td>{esc(o.get('cust_order') or '')}</td><td>{esc(o['stage'])}</td></tr>"
+        for o in info["orders"]) or "<tr><td colspan=3 class=sub>No open sales order matched</td></tr>"
+    status_label = "Partially shipped" if entry.get("status") == "partial" else "Waiting"
+    return (
+        f'<div class=card><h1 style="font-size:16px">Master {esc(tok)} '
+        f'<span class=pill style="border-color:#5d7682;color:#5d7682">{status_label}</span></h1>'
+        f'<p class=sub>Containers seen so far, in order of pickup date:</p>'
+        f'<div class=twrap><table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table></div>'
+        f'<p class=sub>Underlying Purchase Order(s) -- ALL must be fully received before this ships:</p>'
+        f'<div class=twrap><table><tr><th>Purchase Order</th><th>Status</th></tr>{po_rows}</table></div>'
+        f'<p class=sub>Matched Sales Order(s):</p>'
+        f'<div class=twrap><table><tr><th>Order</th><th>Customer order #</th><th>Stage</th></tr>{order_rows}</table></div>'
+        f'</div>')
 
 def _identity_probe():
     """Raw view of what the identity-detection path actually sees, for diagnosing why the
@@ -1771,6 +1820,15 @@ def diagnostics(sample_po=None, sample_container=None, sample_receipt=None):
            "container_field": CFG["container_field"] or "(not set)", "warehouse": CFG["warehouse"] or "(SO default)"}
     if not out["connected"]: return out
     out["identity_probe"] = _identity_probe()
+    # Rate-limit visibility (Parker asked whether we're approaching an Acumatica API
+    # quota) -- dump every response header from one real call. If Acumatica surfaces
+    # anything rate-limit-related (X-RateLimit-*, Retry-After, etc.) it'll show up here;
+    # if not, this tenant/API doesn't expose that and usage has to be checked from
+    # Acumatica's own side (License Management / your reseller), not from here.
+    _, _, hdrs = api_with_headers("GET", f"{ENTITY}/SalesOrder?$top=1")
+    out["response_headers_sample"] = hdrs
+    out["rate_limit_headers_found"] = {k: v for k, v in hdrs.items()
+                                        if "rate" in k or "limit" in k or "retry" in k or "throttl" in k}
     # Structural samples (no substringof — that operator 500s on this tenant).
     # A single order with its Shipments expand reveals the real field names.
     sst, sso = api("GET", f"{ENTITY}/SalesOrder?$top=1&$expand=Shipments")
@@ -2359,8 +2417,18 @@ class H(BaseHTTPRequestHandler):
             try:
                 limit = max(1, int(qs.get("limit", ["10"])[0]))
             except ValueError:
-                limit = 15
-            return self._send(200, page(_splits_html(limit=limit)))
+                limit = 10
+            live = qs.get("live", ["0"])[0] == "1"
+            # http.server has no built-in exception->500 handling -- an uncaught error in
+            # here would otherwise just hang or drop the connection with no response at
+            # all, which looks identical to a slow page from the browser's side. Catch and
+            # show it plainly instead of guessing next time this happens.
+            try:
+                out = _splits_html(limit=limit, live=live)
+            except Exception as e:
+                out = ('<div class=card><h1 style="font-size:16px">Split orders &mdash; error</h1>'
+                       '<p class=sub style="color:#b06a5a">%s</p></div>' % str(e).replace("<", "&lt;"))
+            return self._send(200, page(out))
         if u.path == "/history":
             _badge = {"ok": "#5a7d5a", "partial": "#b0653a", "failed": "#b06a5a", "no_matches": "#7d7363"}
             _status_label = {"ok": "Created", "partial": "Partially created", "failed": "Failed",
@@ -2465,12 +2533,22 @@ class H(BaseHTTPRequestHandler):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             ledger = load_json(LEDGER_PATH) or {}
             results = []
+            # Acumatica's license caps this at 100 web-service API requests/minute
+            # (confirmed via the License Monitoring Console). process_manual costs a
+            # few calls per master (receipt/PO resolution, completeness, possibly a
+            # shipment create) -- looping tight over 20-30+ active masters with no
+            # pacing could burst past that cap in well under a minute. Paced well
+            # below the limit, not right up against it.
+            first = True
             for token, entry in ledger.items():
                 if entry.get("status") not in ("waiting", "partial"):
                     continue
                 containers = list(entry.get("containers", {}).keys())
                 if not containers:
                     continue
+                if not first:
+                    time.sleep(2.5)
+                first = False
                 latest = ledger_latest_date(token)
                 try:
                     out = process_manual(containers[-1], latest, source="ledger-recheck", dry_run=False)
