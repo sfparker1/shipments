@@ -1100,7 +1100,7 @@ def _fmt_ts(ts):
 # entity like &middot; would double-escape and show up as literal text on screen.
 CLASSIFICATION_LABELS = {
     "nrt_available_for_pickup": "Available for pickup",
-    "nrt_waiting_on_containers": "Available for pickup",
+    "nrt_waiting_on_containers": "Waiting on containers",
     "nrt_other_status": "NRT update, not a pickup",
     "not_nrt": "Not an NRT email",
     "ambiguous": "Ambiguous",
@@ -1654,9 +1654,13 @@ def so_pipeline(po):
 def split_order_status(master_token, entry):
     """Live status for one in-progress split order (a container_ledger.json entry): its
     containers' recorded pickup dates, the underlying Purchase Order(s)' receiving
-    completeness, and the matched Sales Orders' shipment/invoice pipeline stage. Always
-    re-checks live (not just the ledger's last-known status) -- a few extra read-only
-    calls, same functions the completeness gate and /diag already use, no writes."""
+    completeness, and the matched Sales Orders. Re-checks PO completeness live (a couple
+    of calls per container/PO, same functions the completeness gate and /diag already
+    use) -- but the full shipment/invoice PIPELINE check (one live call per matched DC
+    order, and a master fans out to several) is only run for 'partial' masters, where
+    something might already be shipped. A 'waiting' master hasn't shipped anything at
+    all by definition, so that check would just be extra live calls confirming a known
+    negative -- skip it and show the cached (no-API-call) match list instead."""
     containers = entry.get("containers", {})
     po_refs = set()
     for c in containers:
@@ -1668,16 +1672,26 @@ def split_order_status(master_token, entry):
         ok, detail = po_completeness(po_type, po_nbr)
         po_status.append({"po": po_nbr, "complete": ok,
                            "status": detail.get("po_status") or detail.get("error") or "unknown"})
+    if entry.get("status") == "partial":
+        orders = so_pipeline(master_token)
+    else:
+        orders = [{"order": f"{m['order_type']} {m['order_nbr']}".strip(), "cust_order": m.get("cust_order"),
+                    "stage": "Not shipped yet"} for m in find_sales_orders_batch([master_token]).get(master_token, [])]
     return {"master": master_token, "ledger_status": entry.get("status"),
-            "containers": containers, "purchase_orders": po_status,
-            "orders": so_pipeline(master_token)}
+            "containers": containers, "purchase_orders": po_status, "orders": orders}
 
-def _splits_html():
+def _splits_html(limit=10):
     """Dashboard page for orders currently split across multiple containers/receipts --
     the cases the Phase-2 completeness gate is holding rather than shipping yet. One card
     per master: its containers + pickup dates, live PO receiving status, and the matched
-    Sales Orders' shipment/invoice pipeline stage -- everything needed to answer "why is
-    this still waiting" without a manual /diag lookup."""
+    Sales Orders -- everything needed to answer "why is this still waiting" without a
+    manual /diag lookup.
+
+    Each card costs several live Acumatica calls (resolve_pos_from_container +
+    po_completeness per container/PO -- see split_order_status). With enough active
+    masters that adds up to a slow page load, so this caps how many render per visit,
+    oldest-waiting first (the ones most worth looking at) -- not a silent truncation,
+    the count of what's hidden is shown with a link to see more."""
     ledger = load_json(LEDGER_PATH) or {}
     active = {tok: e for tok, e in ledger.items() if e.get("status") in ("waiting", "partial")}
     def esc(v):
@@ -1686,8 +1700,10 @@ def _splits_html():
     if not active:
         body = '<p class=sub>No orders currently split across multiple containers.</p>'
     else:
+        ordered = sorted(active.items(), key=lambda kv: kv[1].get("first_seen") or "")
+        shown, hidden = ordered[:limit], ordered[limit:]
         cards = []
-        for tok, entry in sorted(active.items()):
+        for tok, entry in shown:
             info = split_order_status(tok, entry)
             cont_rows = "".join(
                 f"<tr><td>{esc(c)}</td><td>{esc(d)}</td></tr>"
@@ -1706,10 +1722,14 @@ def _splits_html():
                 f'<div class=twrap><table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table></div>'
                 f'<p class=sub>Underlying Purchase Order(s) -- ALL must be fully received before this ships:</p>'
                 f'<div class=twrap><table><tr><th>Purchase Order</th><th>Status</th></tr>{po_rows}</table></div>'
-                f'<p class=sub>Matched Sales Order(s) once shipped:</p>'
+                f'<p class=sub>Matched Sales Order(s):</p>'
                 f'<div class=twrap><table><tr><th>Order</th><th>Customer order #</th><th>Stage</th></tr>{order_rows}</table></div>'
                 f'</div>')
         body = "".join(cards)
+        if hidden:
+            body += ('<p class=sub>%d more, oldest-waiting-first shown above -- '
+                      '<a href="/splits?limit=%d">show all %d</a>.</p>'
+                      % (len(hidden), len(ordered), len(ordered)))
     return ('<div class=card><h1 style="font-size:18px">Orders split across containers</h1>'
             '<p class=sub>Orders currently waiting on more than one container before they can ship -- '
             'live status, checked against Acumatica just now, not just the last-known ledger state.</p></div>'
@@ -2335,7 +2355,12 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/guide":
             return self._send(200, page(GUIDE))
         if u.path == "/splits":
-            return self._send(200, page(_splits_html()))
+            qs = urllib.parse.parse_qs(u.query)
+            try:
+                limit = max(1, int(qs.get("limit", ["10"])[0]))
+            except ValueError:
+                limit = 15
+            return self._send(200, page(_splits_html(limit=limit)))
         if u.path == "/history":
             _badge = {"ok": "#5a7d5a", "partial": "#b0653a", "failed": "#b06a5a", "no_matches": "#7d7363"}
             _status_label = {"ok": "Created", "partial": "Partially created", "failed": "Failed",
