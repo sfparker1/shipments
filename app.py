@@ -1703,7 +1703,9 @@ def _splits_html(limit=10):
         ordered = sorted(active.items(), key=lambda kv: kv[1].get("first_seen") or "")
         shown, hidden = ordered[:limit], ordered[limit:]
         cards = []
-        for tok, entry in shown:
+        for i, (tok, entry) in enumerate(shown):
+            if i > 0:
+                time.sleep(0.5)  # same 100-req/min license cap as /ledger/recheck; ?limit= can go above the default
             try:
                 cards.append(_split_order_card(tok, entry, esc))
             except Exception as e:
@@ -2496,12 +2498,22 @@ class H(BaseHTTPRequestHandler):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             ledger = load_json(LEDGER_PATH) or {}
             results = []
+            # Acumatica's license caps this at 100 web-service API requests/minute
+            # (confirmed via the License Monitoring Console). process_manual costs a
+            # few calls per master (receipt/PO resolution, completeness, possibly a
+            # shipment create) -- looping tight over 20-30+ active masters with no
+            # pacing could burst past that cap in well under a minute. Paced well
+            # below the limit, not right up against it.
+            first = True
             for token, entry in ledger.items():
                 if entry.get("status") not in ("waiting", "partial"):
                     continue
                 containers = list(entry.get("containers", {}).keys())
                 if not containers:
                     continue
+                if not first:
+                    time.sleep(2.5)
+                first = False
                 latest = ledger_latest_date(token)
                 try:
                     out = process_manual(containers[-1], latest, source="ledger-recheck", dry_run=False)
