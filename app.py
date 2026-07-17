@@ -20,6 +20,9 @@ RECEIPT_CONTAINER_VIEW (skip auto-discovery), RECEIPT_LOOKBACK_DAYS (default 180
 import os, re, json, time, base64, hashlib, hmac, secrets, datetime
 import urllib.parse, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from zoneinfo import ZoneInfo
+
+PACIFIC = ZoneInfo("America/Los_Angeles")  # dashboard/log display only -- stored timestamps stay UTC
 
 try:
     import pdfplumber
@@ -1078,15 +1081,16 @@ def ingest_delete(item_id):
         return False
 
 def _fmt_ts(ts):
-    """Display-only: 'YYYY-MM-DD HH:MM:SS' -> 'MM/DD/YYYY HH:MM:SS'. Never used for
-    parsing/sorting/staleness math -- those keep the sortable stored format; this only
-    reformats what's shown on screen."""
+    """Display-only: server stores naive UTC 'YYYY-MM-DD HH:MM:SS' (time.strftime with no
+    tzinfo) -- convert to Pacific (DST-aware) and a plain 12-hour clock for anything shown
+    on screen. Never used for parsing/sorting/staleness math -- those keep operating on the
+    stored UTC string untouched."""
     if not ts or " " not in ts:
         return ts or ""
     try:
-        d, t = ts.split(" ", 1)
-        y, m, day = d.split("-")
-        return f"{m}/{day}/{y} {t}"
+        dt = datetime.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+        local = dt.astimezone(PACIFIC)
+        return local.strftime("%m/%d/%Y %I:%M %p %Z").replace(" 0", " ")
     except Exception:
         return ts
 
@@ -1094,12 +1098,13 @@ def _fmt_ts(ts):
 # shown as the "Update type" column instead of the raw enum, plus a legend under the table.
 CLASSIFICATION_LABELS = {
     "nrt_available_for_pickup": "Available for pickup",
+    "nrt_waiting_on_containers": "Available for pickup &middot; waiting on order",
     "nrt_other_status": "NRT update, not a pickup",
     "not_nrt": "Not an NRT email",
     "ambiguous": "Ambiguous",
     "skip": "Skipped",
 }
-CLASSIFICATION_LEGEND = ("<b>Update type:</b> what the agent decided this email was about &mdash; "
+CLASSIFICATION_LEGEND = ("<b>Email status:</b> what the agent decided this email was about &mdash; "
     "<b>Available for pickup</b> is the shipment trigger; the others result in no shipment.")
 
 def _friendly_classification(c):
@@ -1122,14 +1127,21 @@ def _friendly_run_source(user_val):
 def _status_pill(r):
     """One colored badge that says, at a glance, what happened -- replaces the separate
     raw Action/Mode text columns. Derived from fields already on every decision row:
-    exception_flag (needs a human), action_taken (create_shipment vs none), and mode
-    (shadow vs live) -- no new data needed."""
+    exception_flag (needs a human), action_taken (create_shipment vs none), mode (shadow
+    vs live), and -- for live create_shipment calls -- the actual tool_result.data, so a
+    waiting_on_containers=true outcome (Phase 2 completeness gate) isn't mislabeled as a
+    success just because the tool was CALLED; nothing was actually created."""
     if r.get("exception_flag"):
         return '<span class=pill style="border-color:#b06a5a;color:#b06a5a">&#9888; Needs review</span>'
     if r.get("action_taken") == "create_shipment":
-        if r.get("mode") == "live":
+        if r.get("mode") != "live":
+            return '<span class=pill style="border-color:#5d7682;color:#5d7682">&#9678; Would create &middot; shadow</span>'
+        data = (r.get("tool_result") or {}).get("data") or {}
+        if data.get("waiting_on_containers"):
+            return '<span class=pill style="border-color:#5d7682;color:#5d7682">&#8987; Waiting on containers</span>'
+        if data.get("created"):
             return '<span class=pill style="border-color:#5a7d5a;color:#5a7d5a">&#10003; Shipment created</span>'
-        return '<span class=pill style="border-color:#5d7682;color:#5d7682">&#9678; Would create &middot; shadow</span>'
+        return '<span class=pill style="border-color:#c9c0ad">No action needed</span>'
     return '<span class=pill style="border-color:#c9c0ad">No action needed</span>'
 
 def _fmt_kv(d, esc):
@@ -1149,9 +1161,62 @@ def _fmt_kv(d, esc):
         parts.append(f"{label}: {esc(val)}")
     return " &middot; ".join(parts) if parts else None
 
+def _friendly_shipment_result(tool_result, esc):
+    """Plain-English rendering of a create_shipment tool_result, for the decision log's
+    Detail column -- replaces a raw JSON dump of process_manual's response (which nests
+    dicts/lists that _fmt_kv would otherwise show as literal JSON text) with the same
+    sentences a person would use to describe what happened. Internal debug fields (HTTP
+    status codes, the ship-date-correction PUT's stack trace, dry_run/confidence flags)
+    are deliberately omitted -- nothing here needs them to understand the outcome."""
+    if not isinstance(tool_result, dict):
+        return None
+    data = tool_result.get("data")
+    if not isinstance(data, dict):
+        return _fmt_kv(tool_result, esc)  # unexpected shape -- fall back rather than hide it
+    if data.get("waiting_on_containers"):
+        detail = data.get("completeness_detail") or []
+        pos = "; ".join(
+            f"PO {esc(str(d.get('po')))} &mdash; "
+            + ("received in full" if d.get("po_status") == "Completed"
+               else esc(str(d.get("po_status") or d.get("error") or "still arriving")))
+            for d in detail if isinstance(d, dict))
+        return ("Waiting on the rest of this order to arrive &mdash; no shipment created yet; "
+                "it'll ship automatically once every container is in."
+                + (f"<div class=sub>{pos}</div>" if pos else ""))
+    if data.get("out_of_scope"):
+        return "Skipped &mdash; this container is 3PL-bound, not tracked here."
+    if data.get("needs_review"):
+        return f"Needs a person to look at this &mdash; {esc(str(data.get('note') or data.get('reason') or ''))}"
+    rows = data.get("rows") or []
+    created_lines, other_lines = [], []
+    for row in rows:
+        res = row.get("result") or {}
+        po = esc(str(row.get("po") or ""))
+        order = esc(str(res.get("order") or ""))
+        if res.get("created"):
+            already = " (already existed)" if res.get("already_existed") else ""
+            created_lines.append(
+                f"Order {order} (PO {po}) &rarr; Shipment {esc(str(res.get('shipment_nbr') or '?'))}, "
+                f"dated {esc(str(res.get('ship_date') or ''))}{already}")
+        elif order or po:
+            reason = res.get("reason") or res.get("error") or row.get("note") or "not created"
+            other_lines.append(f"Order {order} (PO {po}) &mdash; {esc(str(reason))}")
+    if not rows:
+        note = data.get("note") or data.get("reason")
+        return esc(str(note)) if note else None
+    parts = []
+    if created_lines:
+        parts.append("<br>".join(created_lines))
+    if other_lines:
+        parts.append(("<br>" if created_lines else "") + "<br>".join(other_lines))
+    return "".join(parts) if parts else None
+
+_CONTAINER_IN_SUBJECT = re.compile(r"Container\s*#\s*(\S+)", re.I)
+
 def _agent_log_html(rows, exc_only):
-    """Scannable decision table -- one row per decision, exceptions highlighted. Matches
-    the low-tooling HTML style used by /history."""
+    """Scannable decision table -- one row per decision, exceptions highlighted. Plain-
+    English throughout: no raw JSON, no code-shaped field names -- the Details column uses
+    _friendly_shipment_result instead of a JSON dump, and times display in Pacific."""
     def esc(v):
         s = "" if v is None else str(v)
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -1160,22 +1225,20 @@ def _agent_log_html(rows, exc_only):
         rowstyle = ' style="background:#f6ece8"' if flagged else ""
         what = esc(_friendly_classification(r.get("classification")))
         status = _status_pill(r)
-        args_txt = _fmt_kv(r.get("tool_args"), esc)
-        result_txt = _fmt_kv(r.get("tool_result"), esc)
-        detail_parts = []
-        if args_txt: detail_parts.append(f"<div><b>Requested:</b> {args_txt}</div>")
-        if result_txt: detail_parts.append(f"<div><b>Result:</b> {result_txt}</div>")
-        detail = f"<details><summary>Details</summary>{''.join(detail_parts)}</details>" if detail_parts else "&mdash;"
+        m = _CONTAINER_IN_SUBJECT.search(r.get("subject") or "")
+        container = esc(m.group(1)) if m else esc(r.get("subject") or "")
+        args = r.get("tool_args") or {}
+        ship_date = esc(str(args.get("ship_date") or ""))
+        result_txt = _friendly_shipment_result(r.get("tool_result"), esc)
+        detail = (f"<details><summary>What happened</summary><div>{result_txt}</div></details>"
+                  if result_txt else "&mdash;")
         note = esc(r.get("rationale") or "")
         if flagged:
             exc_note = f'<span style="color:#b06a5a">{esc(r.get("exception_reason") or "needs review")}</span>'
             note = f"{exc_note}<br>{note}" if note else exc_note
-        subj = esc(r.get("subject") or "")
-        if len(subj) > 60:
-            subj = subj[:60] + "&hellip;"
         return (f"<tr{rowstyle}><td>{esc(_fmt_ts(r.get('ts')))}</td>"
-                f"<td>{esc(r.get('source_mailbox') or '')}</td>"
-                f"<td title=\"{esc(r.get('message_id') or '')}\">{subj}</td>"
+                f"<td title=\"{esc(r.get('subject') or '')}\">{container}</td>"
+                f"<td>{ship_date}</td>"
                 f"<td>{what}</td><td>{status}</td>"
                 f"<td>{note}</td><td>{detail}</td></tr>")
     body_rows = "".join(_row(r) for r in rows)
@@ -1184,10 +1247,10 @@ def _agent_log_html(rows, exc_only):
               '<a class=pill href="/agent/log?exceptions_only=1">exceptions only</a>')
     return ('<div class=card><h1 style="font-size:16px">%s</h1>'
             '<p class=sub>One row per decision the mailbox-agent made (not per LLM turn). '
-            'Flagged rows are highlighted. %s</p>'
+            'Flagged rows are highlighted. Times are Pacific. %s</p>'
             '<p class=sub>%s</p>'
-            '<div class=twrap><table><tr><th>When</th><th>Mailbox</th><th>Subject</th><th>Update type</th>'
-            '<th>Status</th><th>Rationale / exception</th><th>Detail</th></tr>'
+            '<div class=twrap><table><tr><th>Received</th><th>Container</th><th>Pickup date</th>'
+            '<th>Email status</th><th>Result</th><th>Why</th><th>Details</th></tr>'
             '%s</table></div></div>') % (title, toggle, CLASSIFICATION_LEGEND, body_rows or
             '<tr><td colspan=7 class=sub>No decisions logged yet.</td></tr>')
 
@@ -1933,17 +1996,18 @@ def _dashboard_recent_html(rows):
     def _row(r):
         flagged = bool(r.get("exception_flag"))
         rowstyle = ' style="background:#f6ece8"' if flagged else ""
-        subj = esc(r.get("subject") or "")
-        if len(subj) > 50: subj = subj[:50] + "&hellip;"
+        m = _CONTAINER_IN_SUBJECT.search(r.get("subject") or "")
+        container = esc(m.group(1)) if m else esc(r.get("subject") or "")
         exc = esc(r.get("exception_reason") or "") if flagged else ""
-        return (f"<tr{rowstyle}><td>{esc(_fmt_ts(r.get('ts')))}</td><td>{subj}</td>"
+        return (f"<tr{rowstyle}><td>{esc(_fmt_ts(r.get('ts')))}</td>"
+                f"<td title=\"{esc(r.get('subject') or '')}\">{container}</td>"
                 f"<td>{esc(_friendly_classification(r.get('classification')))}</td>"
                 f"<td>{_status_pill(r)}</td>"
                 f'<td style="color:#b06a5a">{exc}</td></tr>')
     body = "".join(_row(r) for r in rows)
     return ('<div class=card><h1 style="font-size:16px">Recent activity (last %d)</h1>'
-            '<p class=sub>%s</p>'
-            '<div class=twrap><table><tr><th>When</th><th>Subject</th><th>Update type</th><th>Status</th>'
+            '<p class=sub>Times are Pacific. %s</p>'
+            '<div class=twrap><table><tr><th>Received</th><th>Container</th><th>Email status</th><th>Result</th>'
             '<th>Exception</th></tr>%s</table></div></div>'
             % (len(rows), CLASSIFICATION_LEGEND, body or
                '<tr><td colspan=5 class=sub>No decisions logged yet.</td></tr>'))
@@ -2249,9 +2313,9 @@ class H(BaseHTTPRequestHandler):
             rows = "".join(_hrow(h) for h in history())
             body = ('<div class=card><h1 style="font-size:16px">Run history</h1>'
                     '<p class=sub>Every shipment-creation run, kept permanently on the tool&#39;s disk (not just this session). '
-                    'Expand the last column for per-order/shipment detail. &#8220;Acumatica user&#8221; is who was actually '
-                    'connected when the write ran (set <code>EXPECTED_ACU_USER</code> to flag any run under a different account).</p>'
-                    '<div class=twrap><table><tr><th>When</th><th>Triggered by</th><th>Acumatica user</th><th>Source</th><th>Status</th>'
+                    'Times are Pacific. Expand the last column for per-order/shipment detail. &#8220;Acumatica user&#8221; is who was '
+                    'actually connected when the write ran (set <code>EXPECTED_ACU_USER</code> to flag any run under a different account).</p>'
+                    '<div class=twrap><table><tr><th>Received</th><th>Triggered by</th><th>Acumatica user</th><th>Source</th><th>Status</th>'
                     '<th>Created/Matched</th><th>Containers</th><th>Orders</th></tr>' + rows + '</table></div></div>')
             return self._send(200, page(body))
         return self._send(404, page("<div class=card>Not found</div>"))
