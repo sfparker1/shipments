@@ -1784,6 +1784,15 @@ def diagnostics(sample_po=None, sample_container=None, sample_receipt=None):
            "container_field": CFG["container_field"] or "(not set)", "warehouse": CFG["warehouse"] or "(SO default)"}
     if not out["connected"]: return out
     out["identity_probe"] = _identity_probe()
+    # Rate-limit visibility (Parker asked whether we're approaching an Acumatica API
+    # quota) -- dump every response header from one real call. If Acumatica surfaces
+    # anything rate-limit-related (X-RateLimit-*, Retry-After, etc.) it'll show up here;
+    # if not, this tenant/API doesn't expose that and usage has to be checked from
+    # Acumatica's own side (License Management / your reseller), not from here.
+    _, _, hdrs = api_with_headers("GET", f"{ENTITY}/SalesOrder?$top=1")
+    out["response_headers_sample"] = hdrs
+    out["rate_limit_headers_found"] = {k: v for k, v in hdrs.items()
+                                        if "rate" in k or "limit" in k or "retry" in k or "throttl" in k}
     # Structural samples (no substringof — that operator 500s on this tenant).
     # A single order with its Shipments expand reveals the real field names.
     sst, sso = api("GET", f"{ENTITY}/SalesOrder?$top=1&$expand=Shipments")

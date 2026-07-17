@@ -42,7 +42,7 @@ Config (env vars):
     MODEL                default "claude-opus-4-8"
     MAX_ITEMS_PER_RUN    safety cap on items processed per run (default 50)
 """
-import os, re, json, base64, html, time
+import os, re, json, base64, html, time, datetime
 import urllib.request, urllib.error
 
 import anthropic
@@ -299,14 +299,27 @@ def process_item(client, item):
     flag = " [EXCEPTION]" if decision.get("exception_flag") else ""
     print(f"  {decision.get('classification')} / {decision.get('action_taken')}{flag}: {msg_id}")
 
+RECHECK_HOUR_UTC = int(os.environ.get("RECHECK_HOUR_UTC", "15"))  # ~8am Pacific (PDT)
+
 def ledger_recheck():
     """Re-check every 'waiting'/'partial' master (Phase 2 / Tier 2 completeness ledger) for
-    whether its Purchase Order has since become fully received. Required, not optional --
+    whether its Purchase Order has since become fully received. Needed, not optional --
     without this, a master whose LAST container's NRT email fires before its receipt posts
     in Acumatica has no future event to re-trigger it and would sit stuck forever. Piggybacks
     on this cron's existing schedule/token rather than a separate service (no new secrets).
+
+    RUNS ONCE A DAY, not every cron cycle: this endpoint calls process_manual (and its live
+    Acumatica resolution chain) for EVERY active master. Running it every 3-hour cycle scales
+    with however many masters are currently split -- confirmed real: 28+ active masters meant
+    60-100+ extra Acumatica calls every single cycle, on top of normal email processing, purely
+    to re-check something that only changes as fast as a clerk processes packing lists (days,
+    not hours). This cron job has no persistent disk between runs, so the gate is wall-clock
+    time-of-day (matches one of this cron's own fire hours), not a saved "last ran" timestamp.
     Same write stakes as create_shipment -- skipped entirely in shadow mode, not intercepted
     like the LLM's tool calls, since this is a direct endpoint call outside the agent loop."""
+    if datetime.datetime.now(datetime.timezone.utc).hour != RECHECK_HOUR_UTC:
+        print(f"  [ledger recheck] skipped -- only runs at hour {RECHECK_HOUR_UTC} UTC")
+        return
     if SHADOW_MODE:
         print("  [ledger recheck] skipped -- SHADOW_MODE on")
         return
