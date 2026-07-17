@@ -1100,7 +1100,7 @@ def _fmt_ts(ts):
 # entity like &middot; would double-escape and show up as literal text on screen.
 CLASSIFICATION_LABELS = {
     "nrt_available_for_pickup": "Available for pickup",
-    "nrt_waiting_on_containers": "Available for pickup",
+    "nrt_waiting_on_containers": "Waiting on containers",
     "nrt_other_status": "NRT update, not a pickup",
     "not_nrt": "Not an NRT email",
     "ambiguous": "Ambiguous",
