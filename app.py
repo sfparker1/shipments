@@ -1095,10 +1095,12 @@ def _fmt_ts(ts):
         return ts
 
 # What the agent's classification enum (agent.py) actually means, in plain English --
-# shown as the "Update type" column instead of the raw enum, plus a legend under the table.
+# shown as the "Email status" column instead of the raw enum, plus a legend under the
+# table. Plain text only, no embedded HTML entities -- every use of this is esc()'d, so an
+# entity like &middot; would double-escape and show up as literal text on screen.
 CLASSIFICATION_LABELS = {
     "nrt_available_for_pickup": "Available for pickup",
-    "nrt_waiting_on_containers": "Available for pickup &middot; waiting on order",
+    "nrt_waiting_on_containers": "Available for pickup",
     "nrt_other_status": "NRT update, not a pickup",
     "not_nrt": "Not an NRT email",
     "ambiguous": "Ambiguous",
@@ -1174,15 +1176,13 @@ def _friendly_shipment_result(tool_result, esc):
     if not isinstance(data, dict):
         return _fmt_kv(tool_result, esc)  # unexpected shape -- fall back rather than hide it
     if data.get("waiting_on_containers"):
-        detail = data.get("completeness_detail") or []
-        pos = "; ".join(
-            f"PO {esc(str(d.get('po')))} &mdash; "
-            + ("received in full" if d.get("po_status") == "Completed"
-               else esc(str(d.get("po_status") or d.get("error") or "still arriving")))
-            for d in detail if isinstance(d, dict))
+        detail = [d for d in (data.get("completeness_detail") or []) if isinstance(d, dict)]
+        total = len(detail)
+        received = sum(1 for d in detail if d.get("po_status") == "Completed")
+        counts = (f"<div class=sub>{received} of {total} purchase orders received in full &mdash; "
+                  f'<a href=/splits>see Split orders</a> for the breakdown.</div>') if total else ""
         return ("Waiting on the rest of this order to arrive &mdash; no shipment created yet; "
-                "it'll ship automatically once every container is in."
-                + (f"<div class=sub>{pos}</div>" if pos else ""))
+                "it'll ship automatically once every container is in." + counts)
     if data.get("out_of_scope"):
         return "Skipped &mdash; this container is 3PL-bound, not tracked here."
     if data.get("needs_review"):
@@ -1651,6 +1651,70 @@ def so_pipeline(po):
     is already fully processed ('Done')."""
     return [_order_pipeline(m, po) for m in find_sales_orders_batch([po]).get(po, [])]
 
+def split_order_status(master_token, entry):
+    """Live status for one in-progress split order (a container_ledger.json entry): its
+    containers' recorded pickup dates, the underlying Purchase Order(s)' receiving
+    completeness, and the matched Sales Orders' shipment/invoice pipeline stage. Always
+    re-checks live (not just the ledger's last-known status) -- a few extra read-only
+    calls, same functions the completeness gate and /diag already use, no writes."""
+    containers = entry.get("containers", {})
+    po_refs = set()
+    for c in containers:
+        for ref in resolve_pos_from_container(c):
+            if ref:
+                po_refs.add(ref)
+    po_status = []
+    for po_type, po_nbr in sorted(po_refs, key=lambda r: r[1] or ""):
+        ok, detail = po_completeness(po_type, po_nbr)
+        po_status.append({"po": po_nbr, "complete": ok,
+                           "status": detail.get("po_status") or detail.get("error") or "unknown"})
+    return {"master": master_token, "ledger_status": entry.get("status"),
+            "containers": containers, "purchase_orders": po_status,
+            "orders": so_pipeline(master_token)}
+
+def _splits_html():
+    """Dashboard page for orders currently split across multiple containers/receipts --
+    the cases the Phase-2 completeness gate is holding rather than shipping yet. One card
+    per master: its containers + pickup dates, live PO receiving status, and the matched
+    Sales Orders' shipment/invoice pipeline stage -- everything needed to answer "why is
+    this still waiting" without a manual /diag lookup."""
+    ledger = load_json(LEDGER_PATH) or {}
+    active = {tok: e for tok, e in ledger.items() if e.get("status") in ("waiting", "partial")}
+    def esc(v):
+        s = "" if v is None else str(v)
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    if not active:
+        body = '<p class=sub>No orders currently split across multiple containers.</p>'
+    else:
+        cards = []
+        for tok, entry in sorted(active.items()):
+            info = split_order_status(tok, entry)
+            cont_rows = "".join(
+                f"<tr><td>{esc(c)}</td><td>{esc(d)}</td></tr>"
+                for c, d in sorted(info["containers"].items(), key=lambda kv: kv[1]))
+            po_rows = "".join(
+                f"<tr><td>{esc(p['po'])}</td><td>{'&#10003; Received in full' if p['complete'] else '&#9678; ' + esc(p['status'])}</td></tr>"
+                for p in info["purchase_orders"]) or "<tr><td colspan=2 class=sub>Could not resolve a Purchase Order</td></tr>"
+            order_rows = "".join(
+                f"<tr><td>{esc(o['order'])}</td><td>{esc(o.get('cust_order') or '')}</td><td>{esc(o['stage'])}</td></tr>"
+                for o in info["orders"]) or "<tr><td colspan=3 class=sub>No open sales order matched</td></tr>"
+            status_label = "Partially shipped" if entry.get("status") == "partial" else "Waiting"
+            cards.append(
+                f'<div class=card><h1 style="font-size:16px">Master {esc(tok)} '
+                f'<span class=pill style="border-color:#5d7682;color:#5d7682">{status_label}</span></h1>'
+                f'<p class=sub>Containers seen so far, in order of pickup date:</p>'
+                f'<div class=twrap><table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table></div>'
+                f'<p class=sub>Underlying Purchase Order(s) -- ALL must be fully received before this ships:</p>'
+                f'<div class=twrap><table><tr><th>Purchase Order</th><th>Status</th></tr>{po_rows}</table></div>'
+                f'<p class=sub>Matched Sales Order(s) once shipped:</p>'
+                f'<div class=twrap><table><tr><th>Order</th><th>Customer order #</th><th>Stage</th></tr>{order_rows}</table></div>'
+                f'</div>')
+        body = "".join(cards)
+    return ('<div class=card><h1 style="font-size:18px">Orders split across containers</h1>'
+            '<p class=sub>Orders currently waiting on more than one container before they can ship -- '
+            'live status, checked against Acumatica just now, not just the last-known ledger state.</p></div>'
+            + body)
+
 def _identity_probe():
     """Raw view of what the identity-detection path actually sees, for diagnosing why the
     'Connected as ...' banner can't name a user. Shows JWT payload KEYS (not full token) and
@@ -1939,7 +2003,7 @@ def page(body, favicon=None):
         badge = '<a class=pill href=/connect>Connect to Acumatica</a>'
     return """<!doctype html><meta charset=utf-8><title>POE Shipment Agent</title>%s<style>%s</style>
 <div class=wrap><div class=brand>SAND + FOG</div><h1>POE Shipment Agent</h1>
-<p class=sub>%s &nbsp; <a class=pill href=/>Dashboard</a> <a class=pill href=/manual>Manual upload</a> <a class=pill href=/guide>Guide</a> <a class=pill href=/history>Shipment history</a> <a class=pill href=/diag>Diagnostics</a></p>
+<p class=sub>%s &nbsp; <a class=pill href=/>Dashboard</a> <a class=pill href=/splits>Split orders</a> <a class=pill href=/manual>Manual upload</a> <a class=pill href=/guide>Guide</a> <a class=pill href=/history>Shipment history</a> <a class=pill href=/diag>Diagnostics</a></p>
 %s</div>""" % (favicon, CSS, badge, body)
 
 def _dashboard_html():
@@ -1969,20 +2033,32 @@ def _dashboard_html():
     elif s["decisions"] == 0:
         warn = '<p class=sub style="color:#b06a5a">&#9888; No decisions logged in the last 24h.</p>'
 
-    by_class = "".join('<span class=pill>%s: %d</span>' % (k, v) for k, v in sorted(s["by_classification"].items()))
+    # Display-only: agent_summary()'s by_classification keeps the raw enum keys (the
+    # digest email/Power-Automate side may match on them) -- map through
+    # _friendly_classification for anything shown on screen, same as everywhere else.
+    by_class = "".join('<span class=pill>%s: %d</span>' % (_friendly_classification(k), v)
+                        for k, v in sorted(s["by_classification"].items()))
+
+    # Cheap count (ledger's own stored status, not a live re-check -- that's what the
+    # dedicated /splits page is for) so a glance here shows whether anything's mid-split.
+    active_splits = sum(1 for e in (load_json(LEDGER_PATH) or {}).values()
+                         if e.get("status") in ("waiting", "partial"))
+    splits_pill = (' &nbsp; <a class=pill style="border-color:#5d7682;color:#5d7682" href=/splits>'
+                    '%d order(s) split across containers</a>' % active_splits) if active_splits else ""
 
     stats = ('<div class=card><h1 style="font-size:16px">Agent dashboard &mdash; last 24h</h1>'
-             '<p class=sub>Mode: %s &nbsp; Queue depth: <b>%s</b> &nbsp; Last decision: <b>%s</b></p>'
+             '<p class=sub>Mode: %s &nbsp; Queue depth: <b>%s</b> &nbsp; Last decision: <b>%s</b>%s</p>'
              '%s'
              '<p><b>%s</b> decisions &middot; <b>%s</b> shipments prepared &middot; '
              '<b>%s</b> flagged for review &middot; <b>%s</b> no action needed</p>'
              '<p>%s</p>'
              '<p><a class=pill href=/agent/log?view=html>Full decision log</a> '
              '<a class=pill href="/agent/log?exceptions_only=1&view=html">Exceptions only</a> '
+             '<a class=pill href=/splits>Split orders</a> '
              '<a class=pill href=/history>Shipment run history</a> '
              '<a class=pill href=/diag>Diagnostics</a> '
              '<a class=pill href=/manual>Manual PDF upload (fallback)</a></p></div>'
-             % (mode_pill, s["queue_depth"], _fmt_ts(s["last_decision_at"]) or "&mdash;", warn,
+             % (mode_pill, s["queue_depth"], _fmt_ts(s["last_decision_at"]) or "&mdash;", splits_pill, warn,
                 s["decisions"], s["shipments_prepared"], s["flagged"], s["no_action"],
                 by_class or "&mdash;"))
     return stats + _dashboard_recent_html(recent)
@@ -2258,6 +2334,8 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, page(body))
         if u.path == "/guide":
             return self._send(200, page(GUIDE))
+        if u.path == "/splits":
+            return self._send(200, page(_splits_html()))
         if u.path == "/history":
             _badge = {"ok": "#5a7d5a", "partial": "#b0653a", "failed": "#b06a5a", "no_matches": "#7d7363"}
             _status_label = {"ok": "Created", "partial": "Partially created", "failed": "Failed",
