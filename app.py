@@ -1259,11 +1259,11 @@ def _friendly_shipment_result(tool_result, esc):
         if res.get("created"):
             already = " (already existed)" if res.get("already_existed") else ""
             created_lines.append(
-                f"Order {order} (PO {po}) &rarr; Shipment {esc(str(res.get('shipment_nbr') or '?'))}, "
+                f"Order {order} (Master PO {po}) &rarr; Shipment {esc(str(res.get('shipment_nbr') or '?'))}, "
                 f"dated {esc(str(res.get('ship_date') or ''))}{already}")
         elif order or po:
             reason = res.get("reason") or res.get("error") or row.get("note") or "not created"
-            other_lines.append(f"Order {order} (PO {po}) &mdash; {esc(str(reason))}")
+            other_lines.append(f"Order {order} (Master PO {po}) &mdash; {esc(str(reason))}")
     if not rows:
         note = data.get("note") or data.get("reason")
         return esc(str(note)) if note else None
@@ -1324,6 +1324,134 @@ def _agent_log_html(rows, exc_only):
             '<th>Email status</th><th>Result</th><th>Why</th><th>Details</th></tr>'
             '%s</table></div></div>') % (title, toggle, CLASSIFICATION_LEGEND, body_rows or
             '<tr><td colspan=7 class=sub>No decisions logged yet.</td></tr>')
+
+# ---------------- unified lookup: one container or Master PO's full story ----------------
+_ISO_CONTAINER_RE = re.compile(r"^[A-Z]{4}\d{6,7}$")
+
+def _lookup_order(query):
+    """Stitch together everything known about one container or Master PO, across the
+    three places its story otherwise lives split up: container_ledger.json (is it still
+    waiting?), agent_log.jsonl (what did the agent decide about each of its containers?),
+    and ship_runs.jsonl (what actually got created?). Pure local-file reads -- no live
+    Acumatica calls, so this is instant and free regardless of the API rate limit.
+
+    A query can be a container (ISO-format) or a Master PO token -- resolves either
+    direction: given a container, finds its Master PO(s) via the ledger; given a Master
+    PO, finds every container recorded against it."""
+    q = (query or "").strip().upper()
+    is_container = bool(_ISO_CONTAINER_RE.match(q))
+    ledger = load_json(LEDGER_PATH) or {}
+    hist = history(limit=0)
+    alog = agent_log_read(limit=0)
+
+    master_tokens = set()
+    containers_involved = set()
+    if is_container:
+        containers_involved.add(q)
+        for tok, entry in ledger.items():
+            if q in (entry.get("containers") or {}):
+                master_tokens.add(tok)
+    else:
+        master_tokens.add(q)
+        if q in ledger:
+            containers_involved.update((ledger[q].get("containers") or {}).keys())
+
+    # History rows matching either a known Master PO or a known/queried container --
+    # discovering more of either along the way (a run's own record is the source of
+    # truth for which containers/tokens actually belong together).
+    history_rows = []
+    for h in hist:
+        conts = h.get("containers") or ""
+        po_hit = any(o.get("po") in master_tokens for o in (h.get("orders") or []))
+        cont_hit = (q in conts) or any(c in conts for c in containers_involved)
+        if po_hit or cont_hit:
+            history_rows.append(h)
+            containers_involved.update(c.strip() for c in conts.split(",") if c.strip())
+            for o in (h.get("orders") or []):
+                if o.get("po"):
+                    master_tokens.add(o.get("po"))
+
+    # A second ledger pass -- history may have surfaced Master PO tokens or containers
+    # the first pass didn't know about yet.
+    ledger_entries = {tok: ledger[tok] for tok in master_tokens if tok in ledger}
+    for entry in ledger_entries.values():
+        containers_involved.update((entry.get("containers") or {}).keys())
+
+    # Agent decisions: matched on container (from tool_args, falling back to the subject).
+    agent_rows = []
+    for r in alog:
+        args = r.get("tool_args") or {}
+        c = args.get("container")
+        if not c:
+            m = _CONTAINER_IN_SUBJECT.search(r.get("subject") or "")
+            c = m.group(1) if m else None
+        if c and (c == q or c in containers_involved):
+            agent_rows.append(r)
+            containers_involved.add(c)
+
+    return {"query": q, "is_container": is_container,
+            "master_tokens": sorted(master_tokens),
+            "containers_involved": sorted(containers_involved),
+            "ledger_entries": ledger_entries,
+            "history_rows": history_rows, "agent_rows": agent_rows}
+
+def _lookup_html(query=None):
+    def esc(v):
+        s = "" if v is None else str(v)
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    form = ('<div class=card><h1 style="font-size:18px">Look up a container or Master PO</h1>'
+            '<p class=sub>Pulls together everything known about one order from the ledger, '
+            'the agent\'s decisions, and the shipment run history -- one place instead of three. '
+            'No Acumatica calls; instant either way.</p>'
+            '<form method=get action=/lookup><input type=text name=q placeholder="e.g. SEKU9013424 or 645410" '
+            f'value="{esc(query or "")}" style="min-width:260px"> <button class=fog>Look up</button></form></div>')
+    if not query:
+        return form
+    info = _lookup_order(query)
+    # NOTE: containers_involved (for a container query) and master_tokens (for a Master PO
+    # query) both always include the query itself, seeded unconditionally in
+    # _lookup_order -- neither can be used to detect "found nothing". ledger_entries/
+    # history_rows/agent_rows are only ever populated by a genuine match, so those are
+    # the real signal.
+    if not info["ledger_entries"] and not info["history_rows"] and not info["agent_rows"]:
+        return form + f'<div class=card><p class=sub>Nothing found for &#8220;{esc(query)}&#8221;.</p></div>'
+
+    parts = [form]
+    parts.append('<div class=card><h1 style="font-size:16px">Summary</h1>'
+                 f'<p class=sub>Master PO(s): <b>{esc(", ".join(info["master_tokens"]) or "&mdash;")}</b> '
+                 f'&nbsp; Container(s): <b>{esc(", ".join(info["containers_involved"]) or "&mdash;")}</b></p></div>')
+
+    for tok in info["master_tokens"]:
+        entry = info["ledger_entries"].get(tok)
+        if not entry:
+            continue
+        status_label = {"waiting": "Waiting", "partial": "Partially shipped", "shipped": "Shipped"}.get(
+            entry.get("status"), entry.get("status") or "&mdash;")
+        checked = entry.get("last_checked")
+        cont_rows = "".join(f"<tr><td>{esc(c)}</td><td>{esc(d)}</td></tr>"
+                            for c, d in sorted((entry.get("containers") or {}).items(), key=lambda kv: kv[1]))
+        parts.append(f'<div class=card><h1 style="font-size:16px">Master PO {esc(tok)} '
+                     f'<span class=pill style="border-color:#5d7682;color:#5d7682">{status_label}</span></h1>'
+                     f'<p class=sub>{"Last checked live: " + esc(_fmt_ts(checked)) if checked else "Not yet checked live"} '
+                     f'&mdash; <a href="/splits?live=1">refresh live</a></p>'
+                     f'<div class=twrap><table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table></div></div>')
+
+    if info["agent_rows"]:
+        parts.append('<div class=card><h1 style="font-size:16px">Agent decisions</h1>'
+                     + _agent_log_html(sorted(info["agent_rows"], key=lambda r: r.get("ts", "")), exc_only=False))
+
+    if info["history_rows"]:
+        hrows = sorted(info["history_rows"], key=lambda h: h.get("ts", ""), reverse=True)
+        rows_html = "".join(
+            f'<tr><td>{esc(_fmt_ts(h.get("ts")))}</td><td>{esc(h.get("status") or "")}</td>'
+            f'<td>{esc(h.get("containers") or "")}</td>'
+            f'<td>{esc(", ".join(sorted({o.get("po") for o in (h.get("orders") or []) if o.get("po")})))}</td>'
+            f'<td>{esc(", ".join(sorted({o.get("shipment_nbr") for o in (h.get("orders") or []) if o.get("shipment_nbr")})))}</td></tr>'
+            for h in hrows)
+        parts.append('<div class=card><h1 style="font-size:16px">Shipment run history</h1>'
+                     '<div class=twrap><table><tr><th>When</th><th>Status</th><th>Containers</th>'
+                     f'<th>Master PO(s)</th><th>Shipment(s)</th></tr>{rows_html}</table></div></div>')
+    return "".join(parts)
 
 # ---------------- process a handover PDF ----------------
 def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None):
@@ -1818,7 +1946,7 @@ def _split_order_card(tok, entry, esc, live=False):
                         f'<a href="/splits?live=1">refresh live</a> for current status.') if checked else \
                        'Purchase order status not yet checked live -- <a href="/splits?live=1">refresh live</a> to check now.'
         return (
-            f'<div class=card><h1 style="font-size:16px">Master {esc(tok)} '
+            f'<div class=card><h1 style="font-size:16px">Master PO {esc(tok)} '
             f'<span class=pill style="border-color:#5d7682;color:#5d7682">{status_label}</span></h1>'
             f'<p class=sub>Containers seen so far, in order of pickup date:</p>'
             f'<div class=twrap><table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table></div>'
@@ -1835,7 +1963,7 @@ def _split_order_card(tok, entry, esc, live=False):
         for o in info["orders"]) or "<tr><td colspan=3 class=sub>No open sales order matched</td></tr>"
     status_label = "Partially shipped" if entry.get("status") == "partial" else "Waiting"
     return (
-        f'<div class=card><h1 style="font-size:16px">Master {esc(tok)} '
+        f'<div class=card><h1 style="font-size:16px">Master PO {esc(tok)} '
         f'<span class=pill style="border-color:#5d7682;color:#5d7682">{status_label}</span></h1>'
         f'<p class=sub>Containers seen so far, in order of pickup date:</p>'
         f'<div class=twrap><table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table></div>'
@@ -2142,7 +2270,7 @@ def page(body, favicon=None):
         badge = '<a class=pill href=/connect>Connect to Acumatica</a>'
     return """<!doctype html><meta charset=utf-8><title>POE Shipment Agent</title>%s<style>%s</style>
 <div class=wrap><div class=brand>SAND + FOG</div><h1>POE Shipment Agent</h1>
-<p class=sub>%s &nbsp; <a class=pill href=/>Dashboard</a> <a class=pill href=/splits>Split orders</a> <a class=pill href=/manual>Manual upload</a> <a class=pill href=/guide>Guide</a> <a class=pill href=/history>Shipment history</a> <a class=pill href=/diag>Diagnostics</a></p>
+<p class=sub>%s &nbsp; <a class=pill href=/>Dashboard</a> <a class=pill href=/lookup>Look up</a> <a class=pill href=/splits>Split orders</a> <a class=pill href=/manual>Manual upload</a> <a class=pill href=/guide>Guide</a> <a class=pill href=/history>Shipment history</a> <a class=pill href=/diag>Diagnostics</a></p>
 %s</div>""" % (favicon, CSS, badge, body)
 
 def _dashboard_html():
@@ -2191,7 +2319,8 @@ def _dashboard_html():
              '<p><b>%s</b> decisions &middot; <b>%s</b> shipments prepared &middot; '
              '<b>%s</b> flagged for review &middot; <b>%s</b> no action needed</p>'
              '<p>%s</p>'
-             '<p><a class=pill href=/agent/log?view=html>Full decision log</a> '
+             '<p><a class=pill href=/lookup>Look up a container/PO</a> '
+             '<a class=pill href=/agent/log?view=html>Full decision log</a> '
              '<a class=pill href="/agent/log?exceptions_only=1&view=html">Exceptions only</a> '
              '<a class=pill href=/splits>Split orders</a> '
              '<a class=pill href=/history>Shipment run history</a> '
@@ -2500,6 +2629,15 @@ class H(BaseHTTPRequestHandler):
                 out = ('<div class=card><h1 style="font-size:16px">Split orders &mdash; error</h1>'
                        '<p class=sub style="color:#b06a5a">%s</p></div>' % str(e).replace("<", "&lt;"))
             return self._send(200, page(out))
+        if u.path == "/lookup":
+            qs = urllib.parse.parse_qs(u.query)
+            q = (qs.get("q", [None])[0] or "").strip()
+            try:
+                out = _lookup_html(q or None)
+            except Exception as e:
+                out = ('<div class=card><h1 style="font-size:16px">Lookup &mdash; error</h1>'
+                       '<p class=sub style="color:#b06a5a">%s</p></div>' % str(e).replace("<", "&lt;"))
+            return self._send(200, page(out))
         if u.path == "/history":
             _badge = {"ok": "#5a7d5a", "partial": "#b0653a", "failed": "#b06a5a", "no_matches": "#7d7363"}
             _status_label = {"ok": "Created", "partial": "Partially created", "failed": "Failed",
@@ -2509,6 +2647,15 @@ class H(BaseHTTPRequestHandler):
                 label = _status_label.get(status, status or "&mdash;")
                 pill = f'<span class=pill style="border-color:{_badge.get(status, "#c9c0ad")}">{label}</span>'
                 orders = h.get("orders") or []
+                # The Master PO number(s) behind this run, visible directly -- previously only
+                # findable by expanding "N order(s)" below. NOTE: this is the retail Master PO
+                # token (e.g. 645410), not the internal Acumatica Purchase Order record (e.g.
+                # 007534, shown on /splits) -- two genuinely different numbers, not just a
+                # naming choice. One master PO fans out to several DC Sales Orders (same po,
+                # different order/shipment per DC) -- dedupe to the unique list so a normal
+                # DC-split run shows one Master PO, not a repeated copy per DC.
+                po_list = sorted({o.get("po") for o in orders if o.get("po")})
+                po_cell = ", ".join(po_list) if po_list else "&mdash;"
                 if orders:
                     detail = "".join(
                         "<div>%s &rarr; %s &mdash; %s</div>" % (
@@ -2551,14 +2698,14 @@ class H(BaseHTTPRequestHandler):
                         f"<td>{acu_cell}</td>"
                         f"<td>{source_cell}</td>"
                         f"<td>{pill}</td><td>{h.get('created','')}/{h.get('orders_matched','')}</td>"
-                        f"<td>{cont_cell}</td><td>{detail_cell}</td></tr>")
+                        f"<td>{cont_cell}</td><td>{po_cell}</td><td>{detail_cell}</td></tr>")
             rows = "".join(_hrow(h) for h in history())
             body = ('<div class=card><h1 style="font-size:16px">Run history</h1>'
                     '<p class=sub>Every shipment-creation run, kept permanently on the tool&#39;s disk (not just this session). '
                     'Times are Pacific. Expand the last column for per-order/shipment detail. &#8220;Acumatica user&#8221; is who was '
                     'actually connected when the write ran (set <code>EXPECTED_ACU_USER</code> to flag any run under a different account).</p>'
                     '<div class=twrap><table><tr><th>Received</th><th>Triggered by</th><th>Acumatica user</th><th>Source</th><th>Status</th>'
-                    '<th>Created/Matched</th><th>Containers</th><th>Orders</th></tr>' + rows + '</table></div></div>')
+                    '<th>Created/Matched</th><th>Containers</th><th>Master PO(s)</th><th>Orders</th></tr>' + rows + '</table></div></div>')
             return self._send(200, page(body))
         return self._send(404, page("<div class=card>Not found</div>"))
 
