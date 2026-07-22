@@ -941,6 +941,25 @@ def history(limit=200):
     out = list(reversed(out))
     return out[:limit] if limit else out
 
+def _find_later_success(container, after_ts, hist_rows):
+    """Did a LATER run (e.g. a manual retry after a timeout exception) succeed for this
+    same container? agent_log.jsonl is append-only by design (a permanent record of what
+    the agent decided at the time) -- a retry never edits an old flagged row, it just adds
+    a new one to ship_runs.jsonl. Without this check, a resolved exception sits flagged
+    forever, which reads as an open problem long after it's actually been fixed. Pure
+    local-file lookup (history() reads ship_runs.jsonl) -- no live Acumatica calls, cheap
+    to run per row on every page render."""
+    if not container or not after_ts:
+        return None
+    for h in hist_rows:
+        if h.get("ts", "") <= after_ts:
+            continue
+        if container not in (h.get("containers") or ""):
+            continue
+        if h.get("status") == "ok" and h.get("created"):
+            return h
+    return None
+
 # ---------------- agent decision log ----------------
 # The mailbox-agent (separate Claude Agent SDK service) posts ONE row per decision it
 # makes about a mailbox item -- not per LLM turn. This is its durable, human-reviewable
@@ -1264,21 +1283,29 @@ def _agent_log_html(rows, exc_only):
     def esc(v):
         s = "" if v is None else str(v)
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    hist_rows = history(limit=0)  # local file read only, no live calls -- cheap per page load
     def _row(r):
         flagged = bool(r.get("exception_flag"))
-        rowstyle = ' style="background:#f6ece8"' if flagged else ""
-        what = esc(_friendly_classification(r.get("classification")))
-        status = _status_pill(r)
         m = _CONTAINER_IN_SUBJECT.search(r.get("subject") or "")
-        container = esc(m.group(1)) if m else esc(r.get("subject") or "")
         args = r.get("tool_args") or {}
+        container_raw = args.get("container") or (m.group(1) if m else None)
+        resolved = _find_later_success(container_raw, r.get("ts", ""), hist_rows) if flagged else None
+        rowstyle = ' style="background:#eaf1e8"' if resolved else (' style="background:#f6ece8"' if flagged else "")
+        what = esc(_friendly_classification(r.get("classification")))
+        status = ('<span class=pill style="border-color:#5a7d5a;color:#5a7d5a">&#10003; Resolved on retry</span>'
+                   if resolved else _status_pill(r))
+        container = esc(container_raw) if container_raw else esc(r.get("subject") or "")
         ship_date = esc(str(args.get("ship_date") or ""))
         result_txt = _friendly_shipment_result(r.get("tool_result"), esc)
         detail = (f"<details><summary>What happened</summary><div>{result_txt}</div></details>"
                   if result_txt else "&mdash;")
         note = esc(r.get("rationale") or "")
         if flagged:
-            exc_note = f'<span style="color:#b06a5a">{esc(r.get("exception_reason") or "needs review")}</span>'
+            if resolved:
+                exc_note = (f'<span style="color:#5a7d5a">Shipped on a later retry '
+                            f'({esc(_fmt_ts(resolved.get("ts")))}) -- no action needed now.</span>')
+            else:
+                exc_note = f'<span style="color:#b06a5a">{esc(r.get("exception_reason") or "needs review")}</span>'
             note = f"{exc_note}<br>{note}" if note else exc_note
         return (f"<tr{rowstyle}><td>{esc(_fmt_ts(r.get('ts')))}</td>"
                 f"<td title=\"{esc(r.get('subject') or '')}\">{container}</td>"
@@ -2181,17 +2208,27 @@ def _dashboard_recent_html(rows):
     def esc(v):
         s = "" if v is None else str(v)
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    hist_rows = history(limit=0)  # local file read only, no live calls -- cheap per page load
     def _row(r):
         flagged = bool(r.get("exception_flag"))
-        rowstyle = ' style="background:#f6ece8"' if flagged else ""
         m = _CONTAINER_IN_SUBJECT.search(r.get("subject") or "")
-        container = esc(m.group(1)) if m else esc(r.get("subject") or "")
-        exc = esc(r.get("exception_reason") or "") if flagged else ""
+        container_raw = m.group(1) if m else None
+        resolved = _find_later_success(container_raw, r.get("ts", ""), hist_rows) if flagged else None
+        rowstyle = ' style="background:#eaf1e8"' if resolved else (' style="background:#f6ece8"' if flagged else "")
+        container = esc(container_raw) if container_raw else esc(r.get("subject") or "")
+        status = ('<span class=pill style="border-color:#5a7d5a;color:#5a7d5a">&#10003; Resolved on retry</span>'
+                   if resolved else _status_pill(r))
+        if not flagged:
+            exc_cell = "<td></td>"
+        elif resolved:
+            exc_cell = '<td style="color:#5a7d5a">Shipped on a later retry -- no action needed now.</td>'
+        else:
+            exc_cell = f'<td style="color:#b06a5a">{esc(r.get("exception_reason") or "")}</td>'
         return (f"<tr{rowstyle}><td>{esc(_fmt_ts(r.get('ts')))}</td>"
                 f"<td title=\"{esc(r.get('subject') or '')}\">{container}</td>"
                 f"<td>{esc(_friendly_classification(r.get('classification')))}</td>"
-                f"<td>{_status_pill(r)}</td>"
-                f'<td style="color:#b06a5a">{exc}</td></tr>')
+                f"<td>{status}</td>"
+                f"{exc_cell}</tr>")
     body = "".join(_row(r) for r in rows)
     return ('<div class=card><h1 style="font-size:16px">Recent activity (last %d)</h1>'
             '<p class=sub>Times are Pacific. %s</p>'
