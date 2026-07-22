@@ -2509,6 +2509,13 @@ class H(BaseHTTPRequestHandler):
                 label = _status_label.get(status, status or "&mdash;")
                 pill = f'<span class=pill style="border-color:{_badge.get(status, "#c9c0ad")}">{label}</span>'
                 orders = h.get("orders") or []
+                # The Purchase Order number(s) behind this run, visible directly -- previously
+                # only findable by expanding "N order(s)" below. One master PO fans out to
+                # several DC Sales Orders (same po, different order/shipment per DC) -- dedupe
+                # to the unique PO list so a normal DC-split run shows one PO, not a repeated
+                # copy per DC.
+                po_list = sorted({o.get("po") for o in orders if o.get("po")})
+                po_cell = ", ".join(po_list) if po_list else "&mdash;"
                 if orders:
                     detail = "".join(
                         "<div>%s &rarr; %s &mdash; %s</div>" % (
@@ -2551,14 +2558,14 @@ class H(BaseHTTPRequestHandler):
                         f"<td>{acu_cell}</td>"
                         f"<td>{source_cell}</td>"
                         f"<td>{pill}</td><td>{h.get('created','')}/{h.get('orders_matched','')}</td>"
-                        f"<td>{cont_cell}</td><td>{detail_cell}</td></tr>")
+                        f"<td>{cont_cell}</td><td>{po_cell}</td><td>{detail_cell}</td></tr>")
             rows = "".join(_hrow(h) for h in history())
             body = ('<div class=card><h1 style="font-size:16px">Run history</h1>'
                     '<p class=sub>Every shipment-creation run, kept permanently on the tool&#39;s disk (not just this session). '
                     'Times are Pacific. Expand the last column for per-order/shipment detail. &#8220;Acumatica user&#8221; is who was '
                     'actually connected when the write ran (set <code>EXPECTED_ACU_USER</code> to flag any run under a different account).</p>'
                     '<div class=twrap><table><tr><th>Received</th><th>Triggered by</th><th>Acumatica user</th><th>Source</th><th>Status</th>'
-                    '<th>Created/Matched</th><th>Containers</th><th>Orders</th></tr>' + rows + '</table></div></div>')
+                    '<th>Created/Matched</th><th>Containers</th><th>Purchase Order(s)</th><th>Orders</th></tr>' + rows + '</table></div></div>')
             return self._send(200, page(body))
         return self._send(404, page("<div class=card>Not found</div>"))
 
