@@ -815,7 +815,7 @@ def _failure_reason(order_type, order_nbr):
     return "Nothing available to ship (backordered or no stock in the ship-from warehouse)"
 
 
-def set_shipment_date_and_container(shipment_id, ship_nbr, date=None, container_ref=None):
+def set_shipment_date_and_container(shipment_id, ship_nbr, date=None, container_ref=None, attempt_put=True):
     """PUT ShipmentDate (and the container custom field) onto an EXISTING shipment, then
     read it back to verify the date actually stuck.
 
@@ -831,22 +831,33 @@ def set_shipment_date_and_container(shipment_id, ship_nbr, date=None, container_
     an exact-filter list query all failed differently) -- shipment_id must instead come from
     _latest_shipment_for_order()'s $expand=Shipments read via the parent order, which is
     proven to work. Never invented or left empty, since an empty/missing id in the body is
-    exactly the condition that caused the earlier accidental-insert attempt."""
+    exactly the condition that caused the earlier accidental-insert attempt.
+
+    2026-07-22: the PUT itself is confirmed to always fail (500, wrong id-space -- the id
+    from SalesOrder's Shipments sub-view isn't the Shipment entity's own id) -- every real
+    create_shipment run since 2026-07-14 has hit this, it just went unnoticed because the
+    date happened to match "today" anyway. attempt_put=False (used by create_shipment's
+    automated path) skips the PUT and its guaranteed-failure round-trip entirely, keeping
+    only the verification read -- one fewer wasted Acumatica call per shipment, which
+    matters when a single /autoship call fans out to several DC orders in one request and
+    the extra round-trips were stacking up toward real request-timeout risk. /fixshipdate
+    (a human explicitly asking to correct a date) still attempts the real PUT via the
+    default attempt_put=True, since that's the entire point of calling it by hand."""
     out = {}
     if not shipment_id:
         out["ship_date_put_error"] = "no shipment id available -- refusing to PUT without one (would risk an insert, not an update)"
         return out
-    update = {"id": shipment_id}
-    if date: update["ShipmentDate"] = {"value": date}
-    if container_ref and CFG["container_field"]:
-        update.setdefault("custom", {}).setdefault("Document", {})[CFG["container_field"]] = \
-            {"type": "CustomStringField", "value": container_ref}
-    if len(update) <= 1:  # only the id, nothing to actually change
-        return out
-    pst, presp = api("PUT", f"{ENTITY}/Shipment", update)
-    if pst not in (200, 204):
-        out["ship_date_put_status"] = pst
-        out["ship_date_put_error"] = presp if isinstance(presp, str) else json.dumps(presp)[:500]
+    if attempt_put:
+        update = {"id": shipment_id}
+        if date: update["ShipmentDate"] = {"value": date}
+        if container_ref and CFG["container_field"]:
+            update.setdefault("custom", {}).setdefault("Document", {})[CFG["container_field"]] = \
+                {"type": "CustomStringField", "value": container_ref}
+        if len(update) > 1:  # more than just the id -- something to actually change
+            pst, presp = api("PUT", f"{ENTITY}/Shipment", update)
+            if pst not in (200, 204):
+                out["ship_date_put_status"] = pst
+                out["ship_date_put_error"] = presp if isinstance(presp, str) else json.dumps(presp)[:500]
     vst, vdata = api("GET", f"{ENTITY}/Shipment/{ship_nbr}?$select=ShipmentDate")
     actual = ((vdata.get("ShipmentDate") or {}).get("value") or "")[:10] \
         if vst == 200 and isinstance(vdata, dict) else None
@@ -894,7 +905,11 @@ def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None, p
         ship = _latest_shipment_for_order(order_type, order_nbr)
         res["shipment_nbr"] = ship.get("shipment_nbr") if ship else None
         if ship:
-            res.update(set_shipment_date_and_container(ship.get("id"), ship.get("shipment_nbr"), date, container_ref))
+            # attempt_put=False: the PUT is confirmed to always fail here (wrong id-space) --
+            # skip it in this automated path to save a guaranteed-wasted round-trip per
+            # order, which matters when one /autoship call fans out to several DC orders.
+            res.update(set_shipment_date_and_container(ship.get("id"), ship.get("shipment_nbr"),
+                                                         date, container_ref, attempt_put=False))
         res["verified"] = bool(ship)
         if not ship:
             # Acumatica's action reported done, but no shipment can be found for this
