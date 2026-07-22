@@ -634,21 +634,40 @@ def resolve_pos_from_container(container):
     return found
 
 def po_completeness(po_type, po_nbr):
-    """Is this Purchase Order fully received? Uses the PO's own header Status field --
-    confirmed live (via /diag's po_completeness_probe) that Status flips to 'Completed'
-    exactly when every line's received qty (QtyOnReceipts) reaches its ordered qty
-    (OrderQty), correctly aggregated across however many separate PurchaseReceipt
-    documents it took to get there. Exact eq filter, never substringof (500s on this
-    tenant). FAILS CLOSED: any lookup error or missing/unexpected Status is treated as
-    NOT complete -- never silently 'ready to ship' on an ambiguous read."""
+    """Is this Purchase Order fully received? Checks each Detail line's own `Completed`
+    flag (Acumatica computes this directly from received-vs-ordered qty per line) rather
+    than the header Status string.
+
+    FIXED 2026-07-22 (real false-negative found in production): originally checked
+    Status == 'Completed' only. But a PO that finishes receiving and later gets closed
+    out (e.g. once billing/period-close wraps up) moves on to Status 'Closed' -- a LATER
+    terminal status on this tenant, not an alternate one. Real confirmed case: PO 008174
+    (container SEKU9013424) was fully received (Open Quantity 0 in Acumatica's own
+    Purchase Orders export) but sat at Status 'Closed', so the old check wrongly left it
+    'waiting' forever -- there's no future event that would ever move a Closed PO back to
+    'Completed', so this wasn't just slow, it would never have shipped.
+
+    Checking each line's own Completed flag is correct regardless of which terminal
+    status string the header ends up showing -- and, unlike just also accepting 'Closed'
+    outright, still correctly refuses a PO that was closed EARLY, before being fully
+    received (Closed does not always mean fully received; a per-line Completed=false
+    does reliably mean not received, so this is the safer signal to gate on either way).
+
+    Exact eq filter, never substringof (500s on this tenant). FAILS CLOSED: any lookup
+    error, a PO with no Detail lines, or an unreadable Completed flag is treated as NOT
+    complete -- never silently 'ready to ship' on an ambiguous read."""
     if not po_nbr:
         return False, {"error": "no PO number"}
     flt = urllib.parse.quote(f"OrderNbr eq '{po_nbr}'")
-    st, d = api("GET", f"{ENTITY}/PurchaseOrder?$filter={flt}")
+    st, d = api("GET", f"{ENTITY}/PurchaseOrder?$filter={flt}&$expand=Details")
     if st != 200 or not isinstance(d, list) or not d:
         return False, {"error": f"PO lookup failed (status {st})", "po": po_nbr}
     status = (d[0].get("Status") or {}).get("value")
-    return status == "Completed", {"po": po_nbr, "po_status": status}
+    details = d[0].get("Details") or []
+    if not details:
+        return False, {"error": "PO has no Detail lines to check", "po": po_nbr, "po_status": status}
+    all_complete = all(bool((line.get("Completed") or {}).get("value")) for line in details)
+    return all_complete, {"po": po_nbr, "po_status": status}
 
 def containers_completeness(container):
     """Combines resolve_pos_from_container + po_completeness across ALL of a container's
