@@ -128,18 +128,17 @@ TOOLS = [
                        "this for EVERY email about a container, regardless of status -- "
                        "including 'Scheduled for Pickup', 'Picked Up', 'Empty returned', "
                        "not just 'Available for Pickup'. Returns shipped=true/false and, "
-                       "if true, when and which Master PO(s). Real incident (2026-07-23): "
-                       "NRT sent 'Available for Pickup' for a container, a shipment was "
-                       "correctly created, then NRT sent a CONTRADICTORY 'Scheduled for "
-                       "Pickup' for the SAME container 45 minutes later -- a status EARLIER "
-                       "in the lifecycle than what already shipped. The container lifecycle "
-                       "order is: Scheduled for Pickup < Available for Pickup < Picked Up < "
-                       "Empty returned. If this check shows shipped=true and the CURRENT "
-                       "email's status is EARLIER in that order than Available for Pickup "
-                       "(i.e. Scheduled for Pickup), that's a genuine anomaly -- NRT's "
-                       "earlier notice may have been premature or erroneous. A status that "
-                       "is LATER (Picked Up, Empty returned) after already shipping is "
-                       "normal, not an anomaly.",
+                       "if true, when and which Master PO(s). The container lifecycle order "
+                       "is: Available for Pickup < Scheduled for Pickup < Picked Up < Empty "
+                       "returned -- 'Available for Pickup' is the FIRST tracked stage, so "
+                       "any OTHER status arriving after a shipment already exists is the "
+                       "normal, expected continuation, not an anomaly -- do not flag it. "
+                       "The one genuinely suspicious case is a SECOND 'Available for "
+                       "Pickup' email for a container that's already shipped (a duplicate "
+                       "or resend) -- but create_shipment already detects and flags that "
+                       "server-side on its own (reason=pickup_after_already_shipped), so "
+                       "you don't need to re-derive it here either. Use this tool mainly "
+                       "for accurate logging/context, not as a trigger for exception=true.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -216,8 +215,8 @@ For EVERY email, after you've read the container number and status, call \
 check_container_status for that container BEFORE calling finish -- regardless of what the \
 status is. This is a read-only check (safe to call every time, no side effects): it tells \
 you whether a shipment already exists for this container from an earlier email. The \
-container lifecycle order is: Scheduled for Pickup < Available for Pickup < Picked Up < \
-Empty returned.
+container lifecycle order is: Available for Pickup < Scheduled for Pickup < Picked Up < \
+Empty returned -- "Available for Pickup" is the FIRST tracked stage.
 
 - If the body status is "Available for Pickup" (allow minor wording variants like \
 "Available to Pickup"): this is the revenue/shipment trigger. Call create_shipment with \
@@ -233,21 +232,11 @@ once complete; nothing more for you to do.
 order resolved, or a pickup arrived for an order already marked shipped), that DOES \
 need a human -- call finish with exception=true and explain.
 - Any OTHER status (Scheduled for Pickup, in transit, arrived at port, delayed, on hold, \
-Picked Up, Empty returned, etc.): do NOT create a shipment.
-   - If check_container_status shows shipped=false: routine. Call finish with \
-classification nrt_other_status, exception=false, no action.
-   - If check_container_status shows shipped=true AND the current status is EARLIER in \
-the lifecycle than Available for Pickup (i.e. this email says "Scheduled for Pickup"): \
-this is a genuine anomaly -- confirmed real incident (2026-07-23): NRT sent "Available \
-for Pickup" for a container (correctly triggering a shipment), then sent a CONTRADICTORY \
-"Scheduled for Pickup" for the SAME container 45 minutes later, meaning NRT's earlier \
-notice may have been premature or erroneous. Call finish with classification ambiguous, \
-exception=true, and name the Master PO(s) already shipped (from check_container_status) \
-so a human can verify whether the shipment needs correcting.
-   - If check_container_status shows shipped=true but the current status is LATER in the \
-lifecycle (Picked Up, Empty returned): that's the normal, expected continuation after \
-already shipping, not an anomaly. Call finish with classification nrt_other_status, \
-exception=false, no action.
+Picked Up, Empty returned, etc.): do NOT create a shipment. Since "Available for Pickup" \
+is the first stage, any of these arriving AFTER a shipment already exists (per \
+check_container_status) is the normal, expected continuation -- NOT an anomaly, don't \
+flag it. Call finish with classification nrt_other_status, exception=false, no action, \
+regardless of what check_container_status returns.
 
 If the email isn't an NRT status email at all (wrong sender, no container number, some \
 other message that landed in this folder), or anything is unclear or conflicting: do NOT \
