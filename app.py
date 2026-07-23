@@ -960,6 +960,35 @@ def _find_later_success(container, after_ts, hist_rows):
             return h
     return None
 
+def container_ship_history(container):
+    """Has a shipment already been created off THIS container? For the mailbox-agent to
+    call on every NRT status email, not just "Available for Pickup" triggers.
+
+    Real incident, 2026-07-23: NRT sent a genuine "Available for Pickup" email for
+    TRHU7302491/KKFU8060560, which correctly triggered create_shipment (30 shipments
+    created, exactly as designed) -- then NRT sent a CONTRADICTORY "Scheduled for
+    Pickup" email for the SAME containers 45 minutes later, walking the status backward.
+    That second email correctly wasn't a trigger, so the agent logged "no action" -- but
+    had no way to know a shipment had just been created off what turned out to be a
+    premature/erroneous notice from NRT itself. Nothing here was wrong: the resolution
+    chain, the completeness gate, and the LLM's reading of both emails were all accurate
+    to what NRT actually sent -- the source system contradicted itself.
+
+    This makes that contradiction visible in real time instead of requiring someone to
+    notice it days later by cross-referencing exports by hand: the agent checks this for
+    EVERY email regardless of status, and if a shipment already exists for this container
+    while the CURRENT status has moved backward, that's flagged as an exception. Checks
+    the permanent history file, not just the current batch, so it also catches the
+    correction arriving in a LATER cron cycle, not only the same one. Local file read
+    only, no live Acumatica calls."""
+    if not container:
+        return {"shipped": False}
+    for h in history(limit=0):
+        if container in (h.get("containers") or "") and h.get("status") == "ok" and h.get("created"):
+            return {"shipped": True, "ts": h.get("ts"),
+                    "master_pos": sorted({o.get("po") for o in (h.get("orders") or []) if o.get("po")})}
+    return {"shipped": False}
+
 # ---------------- agent decision log ----------------
 # The mailbox-agent (separate Claude Agent SDK service) posts ONE row per decision it
 # makes about a mailbox item -- not per LLM turn. This is its durable, human-reviewable
@@ -2541,6 +2570,18 @@ class H(BaseHTTPRequestHandler):
             if qs.get("view", [""])[0] == "html" or self._authed():
                 return self._send(200, page(_agent_log_html(rows, exc_only), favicon=AGENT_FAVICON))
             return self._send(200, json.dumps(rows), "application/json")
+        if u.path == "/containerstatus":
+            # For the mailbox-agent to call on EVERY NRT status email, not just triggers --
+            # catches NRT sending a status update that walks BACKWARD after a shipment
+            # already exists for this container (see container_ship_history's docstring
+            # for the real 2026-07-23 incident this closes). Read-only, no Acumatica calls.
+            qs = urllib.parse.parse_qs(u.query)
+            want = AGENT_TOKEN
+            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            if not (token_ok or self._authed()):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            container = (qs.get("container", [""])[0] or "").strip().upper()
+            return self._send(200, json.dumps(container_ship_history(container)), "application/json")
         if u.path == "/agent/summary":
             # Rollup for the notification digest (a scheduled Power Automate flow reads
             # this and emails/Teams-messages Parker). AGENT_TOKEN-authed. ?hours=N window.
