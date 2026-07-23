@@ -43,7 +43,7 @@ Config (env vars):
     MAX_ITEMS_PER_RUN    safety cap on items processed per run (default 50)
 """
 import os, re, json, base64, html, time, datetime
-import urllib.request, urllib.error
+import urllib.request, urllib.error, urllib.parse
 
 import anthropic
 
@@ -122,6 +122,33 @@ def strip_html(body):
 # create a PO receipt or anything else -- the overseas PO-receipt path is a separate agent.
 TOOLS = [
     {
+        "name": "check_container_status",
+        "description": "Check whether a shipment has ALREADY been created off this "
+                       "container, from an earlier email (possibly a previous run). Call "
+                       "this for EVERY email about a container, regardless of status -- "
+                       "including 'Scheduled for Pickup', 'Picked Up', 'Empty returned', "
+                       "not just 'Available for Pickup'. Returns shipped=true/false and, "
+                       "if true, when and which Master PO(s). The container lifecycle order "
+                       "is: Available for Pickup < Scheduled for Pickup < Picked Up < Empty "
+                       "returned -- 'Available for Pickup' is the FIRST tracked stage, so "
+                       "any OTHER status arriving after a shipment already exists is the "
+                       "normal, expected continuation, not an anomaly -- do not flag it. "
+                       "The one genuinely suspicious case is a SECOND 'Available for "
+                       "Pickup' email for a container that's already shipped (a duplicate "
+                       "or resend) -- but create_shipment already detects and flags that "
+                       "server-side on its own (reason=pickup_after_already_shipped), so "
+                       "you don't need to re-derive it here either. Use this tool mainly "
+                       "for accurate logging/context, not as a trigger for exception=true.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "container": {"type": "string", "description": "ISO container number"},
+            },
+            "required": ["container"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "create_shipment",
         "description": "Create an UNCONFIRMED (On Hold) Acumatica shipment for the given container. "
                        "Use ONLY for NRT emails whose status is 'Available for Pickup'. ship_date "
@@ -184,6 +211,13 @@ These are NRT container-status emails (from noreply@nrsonline.com, subject "Stat
 - Container # XXXX"). The subject is ALWAYS the generic "Status Update" line -- the actual \
 STATUS is only in the email body, so you must read the body to know what this email means.
 
+For EVERY email, after you've read the container number and status, call \
+check_container_status for that container BEFORE calling finish -- regardless of what the \
+status is. This is a read-only check (safe to call every time, no side effects): it tells \
+you whether a shipment already exists for this container from an earlier email. The \
+container lifecycle order is: Available for Pickup < Scheduled for Pickup < Picked Up < \
+Empty returned -- "Available for Pickup" is the FIRST tracked stage.
+
 - If the body status is "Available for Pickup" (allow minor wording variants like \
 "Available to Pickup"): this is the revenue/shipment trigger. Call create_shipment with \
 the container number (from the subject/body) and ship_date = the email's received date \
@@ -197,8 +231,12 @@ once complete; nothing more for you to do.
    - If create_shipment comes back with needs_review=true instead (e.g. no open sales \
 order resolved, or a pickup arrived for an order already marked shipped), that DOES \
 need a human -- call finish with exception=true and explain.
-- Any OTHER status (in transit, arrived at port, delayed, on hold, empty returned, etc.): \
-do NOT create a shipment. Call finish with classification nrt_other_status, no action.
+- Any OTHER status (Scheduled for Pickup, in transit, arrived at port, delayed, on hold, \
+Picked Up, Empty returned, etc.): do NOT create a shipment. Since "Available for Pickup" \
+is the first stage, any of these arriving AFTER a shipment already exists (per \
+check_container_status) is the normal, expected continuation -- NOT an anomaly, don't \
+flag it. Call finish with classification nrt_other_status, exception=false, no action, \
+regardless of what check_container_status returns.
 
 If the email isn't an NRT status email at all (wrong sender, no container number, some \
 other message that landed in this folder), or anything is unclear or conflicting: do NOT \
@@ -213,6 +251,13 @@ def run_tool(name, args, item, decision):
     """Execute a tool call. Returns (result_for_model, did_write). Records enough on
     `decision` to build the audit-log row. In shadow mode the write (create_shipment) is
     intercepted: logged as 'would have called', nothing sent."""
+    if name == "check_container_status":
+        # Read-only -- runs even in shadow mode, same as any other read. Not gated behind
+        # SHADOW_MODE at all; only WRITES (create_shipment) are intercepted there.
+        container = urllib.parse.quote((args.get("container") or "").strip())
+        st, data = _http("GET", f"/containerstatus?container={container}&token={AGENT_TOKEN}", AGENT_TOKEN)
+        return (data if st == 200 else {"error": f"containerstatus HTTP {st}", "detail": data}), False
+
     if name == "create_shipment":
         decision["action_taken"] = "create_shipment"
         decision["tool_args"] = args

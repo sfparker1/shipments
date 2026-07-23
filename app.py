@@ -688,6 +688,45 @@ def containers_completeness(container):
         complete = complete and ok
     return complete, detail
 
+def expected_containers_for_master(master_token):
+    """Every container Acumatica's OWN receipts say belongs to this master -- the union
+    across every receipt whose VendorRef resolves to this master, regardless of how many
+    separate uploads it took (mirrors the /diag po_completeness_probe pattern)."""
+    containers = set()
+    for r in load_recent_receipts():
+        if master_token in _extract_order_tokens(r.get("vendor_ref")):
+            containers.update(r.get("containers") or [])
+    return containers
+
+def containers_confirmed_available(master_token):
+    """Has EVERY container Acumatica's receipts say belongs to this master ALSO been
+    individually confirmed 'Available for Pickup' (or later) by its own NRT email --
+    not just "the Purchase Order shows fully received in Acumatica"?
+
+    Real incident, 2026-07-23/24 (Light Forever / L26US-051, then MRKU5545922 /
+    MSGU9216100): a multi-container consolidated PO's underlying Purchase Order can show
+    fully RECEIVED in Acumatica -- a warehouse-side fact, driven by whenever the packing
+    list got processed into a receipt -- while one or more of its OWN containers have
+    never sent an "Available for Pickup" NRT email at all. Confirmed real: MRKU5545922
+    had ZERO NRT status emails ever, while its sibling MSGU9216100 had a complete, normal
+    progression (Available -> Scheduled -> Picked Up -> Empty) -- and a shipment was
+    created for POs depending on MRKU5545922 anyway, because ONE container's confirmation
+    was enough to satisfy the (PO-receiving-only) gate. Revenue recognition is anchored to
+    the port-pickup event (an NRT fact), not the warehouse-receiving event (an Acumatica
+    fact) -- both must hold, not just the PO's own Status. Parker's rule, stated directly:
+    a shipment must not be created until ALL of a PO's containers show Available for
+    Pickup (or later).
+
+    "Confirmed" = present in container_ledger.json for this master -- ledger_record()
+    only ever fires from a real NRT trigger event (see process_manual), so a container
+    that never sent its own email is correctly never in there. Returns (all_confirmed,
+    missing_containers, expected_containers)."""
+    expected = expected_containers_for_master(master_token)
+    entry = ledger_entry(master_token) or {}
+    confirmed = set((entry.get("containers") or {}).keys())
+    missing = expected - confirmed
+    return (not missing), sorted(missing), sorted(expected)
+
 # ---------------- matching ----------------
 _OPEN_ORDERS = {"rows": None, "ts": 0}
 OPEN_TTL = 600   # cache open sales orders for 10 min
@@ -959,6 +998,35 @@ def _find_later_success(container, after_ts, hist_rows):
         if h.get("status") == "ok" and h.get("created"):
             return h
     return None
+
+def container_ship_history(container):
+    """Has a shipment already been created off THIS container? For the mailbox-agent to
+    call on every NRT status email, not just "Available for Pickup" triggers.
+
+    Real incident, 2026-07-23: NRT sent a genuine "Available for Pickup" email for
+    TRHU7302491/KKFU8060560, which correctly triggered create_shipment (30 shipments
+    created, exactly as designed) -- then NRT sent a CONTRADICTORY "Scheduled for
+    Pickup" email for the SAME containers 45 minutes later, walking the status backward.
+    That second email correctly wasn't a trigger, so the agent logged "no action" -- but
+    had no way to know a shipment had just been created off what turned out to be a
+    premature/erroneous notice from NRT itself. Nothing here was wrong: the resolution
+    chain, the completeness gate, and the LLM's reading of both emails were all accurate
+    to what NRT actually sent -- the source system contradicted itself.
+
+    This makes that contradiction visible in real time instead of requiring someone to
+    notice it days later by cross-referencing exports by hand: the agent checks this for
+    EVERY email regardless of status, and if a shipment already exists for this container
+    while the CURRENT status has moved backward, that's flagged as an exception. Checks
+    the permanent history file, not just the current batch, so it also catches the
+    correction arriving in a LATER cron cycle, not only the same one. Local file read
+    only, no live Acumatica calls."""
+    if not container:
+        return {"shipped": False}
+    for h in history(limit=0):
+        if container in (h.get("containers") or "") and h.get("status") == "ok" and h.get("created"):
+            return {"shipped": True, "ts": h.get("ts"),
+                    "master_pos": sorted({o.get("po") for o in (h.get("orders") or []) if o.get("po")})}
+    return {"shipped": False}
 
 # ---------------- agent decision log ----------------
 # The mailbox-agent (separate Claude Agent SDK service) posts ONE row per decision it
@@ -1585,14 +1653,35 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         complete, completeness_detail = containers_completeness(container)
         for token in resolved:
             ledger_stamp_checked(token)
-        if not complete:
+        # SECOND, INDEPENDENT gate (2026-07-24, real incident): the PO-receiving check
+        # above is a warehouse-side fact (has Acumatica recorded all the qty as received);
+        # it is NOT the same as "has every container this PO depends on been individually
+        # confirmed Available for Pickup by NRT" (a port-pickup fact). A PO can show fully
+        # received while a sibling container has never sent its own NRT email at all --
+        # confirmed real, see containers_confirmed_available's docstring. Revenue
+        # recognition is anchored to the port-pickup event, so BOTH gates must pass.
+        container_gaps = {}
+        for token in resolved:
+            all_confirmed, missing, expected = containers_confirmed_available(token)
+            if not all_confirmed:
+                container_gaps[token] = {"missing_containers": missing, "expected_containers": expected}
+        if not complete or container_gaps:
             for token in resolved:
                 ledger_set_status(token, "waiting")
+            if container_gaps:
+                note = ("not every container for this order has been individually confirmed "
+                         "Available for Pickup by NRT yet -- still waiting on: " +
+                         "; ".join(f"master {tok}: {', '.join(g['missing_containers'])}"
+                                   for tok, g in container_gaps.items()))
+                reason = "containers_not_all_confirmed"
+            else:
+                note = ("underlying Purchase Order isn't fully received yet -- waiting for "
+                         "the remaining container(s) before shipping this order; no action needed")
+                reason = "po_incomplete"
             return {"container": container, "waiting_on_containers": True, "created": 0,
-                    "orders_matched": 0, "reason": "po_incomplete",
-                    "note": "underlying Purchase Order isn't fully received yet -- waiting for "
-                            "the remaining container(s) before shipping this order; no action needed",
-                    "completeness_detail": completeness_detail}
+                    "orders_matched": 0, "reason": reason, "note": note,
+                    "completeness_detail": completeness_detail,
+                    "container_gaps": container_gaps or None}
         all_pos = resolved
         unresolved = not resolved
 
@@ -2541,6 +2630,18 @@ class H(BaseHTTPRequestHandler):
             if qs.get("view", [""])[0] == "html" or self._authed():
                 return self._send(200, page(_agent_log_html(rows, exc_only), favicon=AGENT_FAVICON))
             return self._send(200, json.dumps(rows), "application/json")
+        if u.path == "/containerstatus":
+            # For the mailbox-agent to call on EVERY NRT status email, not just triggers --
+            # catches NRT sending a status update that walks BACKWARD after a shipment
+            # already exists for this container (see container_ship_history's docstring
+            # for the real 2026-07-23 incident this closes). Read-only, no Acumatica calls.
+            qs = urllib.parse.parse_qs(u.query)
+            want = AGENT_TOKEN
+            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            if not (token_ok or self._authed()):
+                return self._send(403, json.dumps({"error": "auth required"}), "application/json")
+            container = (qs.get("container", [""])[0] or "").strip().upper()
+            return self._send(200, json.dumps(container_ship_history(container)), "application/json")
         if u.path == "/agent/summary":
             # Rollup for the notification digest (a scheduled Power Automate flow reads
             # this and emails/Teams-messages Parker). AGENT_TOKEN-authed. ?hours=N window.
