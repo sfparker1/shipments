@@ -1641,14 +1641,29 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         for token in resolved:
             entry = ledger_entry(token)
             if entry and entry.get("status") == "shipped":
-                # Anomaly: new inventory for a master we already shipped as complete.
-                # Something's inconsistent -- flag for a human rather than silently
-                # re-shipping (would risk a duplicate) or silently dropping it.
-                return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
-                        "reason": "pickup_after_already_shipped",
-                        "note": f"master {token} was already marked shipped, but a new pickup "
-                                "event just arrived for it -- a clerk should investigate",
-                        "ledger_entry": entry}
+                # Don't blindly trust the local ledger's "shipped" flag -- verify against
+                # Acumatica's LIVE state first. Real case (2026-07-23): master 362039's
+                # shipments were deleted after being found erroneous (a separate incident),
+                # but the ledger was never told -- so a genuine NEW pickup event for a
+                # sibling container (DRYU9475020) got wrongly flagged as
+                # pickup_after_already_shipped even though the Sales Orders were, correctly,
+                # back to fully Open/unshipped. One bounded live check per matched order,
+                # only on this already-rare path (a master marked shipped getting ANOTHER
+                # pickup event) -- reuses the same proven idempotency lookup used elsewhere.
+                still_shipped = any(
+                    _latest_shipment_for_order(m["order_type"], m["order_nbr"], retries=1, delay=0)
+                    for m in find_sales_orders_batch([token]).get(token, []))
+                if still_shipped:
+                    return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
+                            "reason": "pickup_after_already_shipped",
+                            "note": f"master {token} was already marked shipped, but a new pickup "
+                                    "event just arrived for it -- a clerk should investigate",
+                            "ledger_entry": entry}
+                # The ledger was stale -- no live shipment actually exists anymore (e.g. it
+                # was deleted after being found erroneous). Reset so this master gets
+                # re-evaluated normally instead of being permanently stuck flagging a
+                # false anomaly on every future pickup event.
+                ledger_set_status(token, "waiting")
             ledger_record(token, container, pickup_date)
         complete, completeness_detail = containers_completeness(container)
         for token in resolved:
