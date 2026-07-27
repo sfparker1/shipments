@@ -633,6 +633,37 @@ def resolve_pos_from_container(container):
             found.append(None)
     return found
 
+def resolve_pos_by_master(container):
+    """Per-master pairing of a container's receipts to their internal Purchase Orders --
+    same targeted $expand=Details fetch as resolve_pos_from_container(), but keyed by the
+    master/Ecomm token from each receipt's OWN VendorRef instead of returned as one flat
+    list. Needed because a single pickup event can resolve to SEVERAL unrelated masters at
+    once (confirmed real, 2026-07-27: container ONEU9300392 sits on 5 separate receipts,
+    one per master, 141970/378306/645410/645411/645399) -- gating them as one aggregate
+    unit wrongly held back 4 masters that were fully ready just because a 5th (645399,
+    waiting on sibling container FSCU5863132) wasn't. Returns {master_token: (po_type,
+    po_nbr) or None}; None means that receipt's Details didn't resolve to exactly one PO
+    -- fail closed for that master only, not its siblings."""
+    container = (container or "").strip().upper()
+    receipts = [r for r in load_recent_receipts() if container in r.get("containers", [])]
+    out = {}
+    for r in receipts:
+        tokens = _extract_order_tokens(r.get("vendor_ref"))
+        if not tokens:
+            continue
+        flt = urllib.parse.quote(f"ReceiptNbr eq '{r['receipt_nbr']}'")
+        st, d = api("GET", f"{ENTITY}/PurchaseReceipt?$filter={flt}&$expand=Details")
+        ref = None
+        if st == 200 and isinstance(d, list) and d:
+            details = d[0].get("Details") or []
+            po_nbrs = {(dd.get("POOrderNbr") or {}).get("value") for dd in details if dd.get("POOrderNbr")}
+            po_types = {(dd.get("POOrderType") or {}).get("value") for dd in details if dd.get("POOrderType")}
+            if len(po_nbrs) == 1 and po_nbrs != {None}:
+                ref = ((next(iter(po_types)) if po_types else None), next(iter(po_nbrs)))
+        for tok in tokens:
+            out[tok] = ref
+    return out
+
 def po_completeness(po_type, po_nbr):
     """Is this Purchase Order fully received? Checks each Detail line's own `Completed`
     flag (Acumatica computes this directly from received-vs-ordered qty per line) rather
@@ -668,26 +699,6 @@ def po_completeness(po_type, po_nbr):
         return False, {"error": "PO has no Detail lines to check", "po": po_nbr, "po_status": status}
     all_complete = all(bool((line.get("Completed") or {}).get("value")) for line in details)
     return all_complete, {"po": po_nbr, "po_status": status}
-
-def containers_completeness(container):
-    """Combines resolve_pos_from_container + po_completeness across ALL of a container's
-    resolved POs -- every one of them must be Completed for the container's order to be
-    considered ready to ship. Returns (complete: bool, detail: list) -- fails closed if
-    resolution itself came back empty or ambiguous (a genuinely single-container, fully
-    resolved order still passes this the same as it does today; nothing changes for the
-    normal case)."""
-    refs = resolve_pos_from_container(container)
-    if not refs or any(r is None for r in refs):
-        return False, [{"error": "one or more receipts for this container did not resolve "
-                                  "to exactly one Purchase Order"}]
-    detail = []
-    complete = True
-    for po_type, po_nbr in refs:
-        ok, d = po_completeness(po_type, po_nbr)
-        d["complete"] = ok
-        detail.append(d)
-        complete = complete and ok
-    return complete, detail
 
 def expected_containers_for_master(master_token):
     """Every container Acumatica's OWN receipts say belongs to this master -- the union
@@ -1053,9 +1064,14 @@ def agent_log(entry):
         pass
     return row
 
-def agent_log_read(limit=200, exceptions_only=False, message_id=None):
-    """Newest-first. exceptions_only filters to flagged rows for quick review;
-    message_id returns every row for one source email (the idempotency lookup)."""
+def agent_log_read(limit=200, exceptions_only=False, pickup_only=False, message_id=None):
+    """Newest-first. exceptions_only filters to flagged rows for quick review; pickup_only
+    (the dashboard's default view, per Parker's request 2026-07-27) drops the routine NRT
+    noise -- Scheduled/Picked up/Empty-returned status emails, non-NRT mail, skipped/
+    ambiguous ones -- keeping only genuine "Available for pickup" triggers PLUS anything
+    flagged for review (an exception should never be hidden just because the email that
+    caused it wasn't itself a pickup trigger). message_id returns every row for one source
+    email (the idempotency lookup), bypassing both filters."""
     out = []
     try:
         with open(AGENTLOG_PATH) as f:
@@ -1067,6 +1083,9 @@ def agent_log_read(limit=200, exceptions_only=False, message_id=None):
     out = list(reversed(out))
     if exceptions_only:
         out = [r for r in out if r.get("exception_flag")]
+    elif pickup_only:
+        out = [r for r in out if r.get("classification") == "nrt_available_for_pickup"
+                                 or r.get("exception_flag")]
     return out[:limit] if limit else out
 
 def agent_summary(hours=24):
@@ -1310,7 +1329,7 @@ def _friendly_shipment_result(tool_result, esc):
     if data.get("waiting_on_containers"):
         detail = [d for d in (data.get("completeness_detail") or []) if isinstance(d, dict)]
         total = len(detail)
-        # Count the actual `complete` boolean containers_completeness() already computed
+        # Count the actual `complete` boolean the per-master gate loop already computed
         # (per-line Completed check) -- NOT the raw header po_status string. A PO that's
         # genuinely fully received can still show header status "Closed" (a later terminal
         # status on this tenant, see po_completeness()'s docstring), so comparing po_status
@@ -1346,22 +1365,41 @@ def _friendly_shipment_result(tool_result, esc):
         elif order or po:
             reason = res.get("reason") or res.get("error") or row.get("note") or "not created"
             other_lines.append(f"Order {order} (Master PO {po}) &mdash; {esc(str(reason))}")
+    parts = []
     if not rows:
         note = data.get("note") or data.get("reason")
-        return esc(str(note)) if note else None
-    parts = []
-    if created_lines:
-        parts.append("<br>".join(created_lines))
-    if other_lines:
-        parts.append(("<br>" if created_lines else "") + "<br>".join(other_lines))
+        if note:
+            parts.append(esc(str(note)))
+    else:
+        if created_lines:
+            parts.append("<br>".join(created_lines))
+        if other_lines:
+            parts.append(("<br>" if created_lines else "") + "<br>".join(other_lines))
+    # Some sibling master(s) in this same pickup event shipped above (or matched, above);
+    # these are still gated on their own -- see the per-master gate comment in
+    # process_manual (real case: ONEU9300392 -> 645399 waiting on FSCU5863132 while its
+    # 4 sibling masters shipped in the same event).
+    still_waiting = data.get("still_waiting_masters") or []
+    if still_waiting:
+        gaps = data.get("container_gaps") or {}
+        missing = sorted({c for tok in still_waiting
+                           for c in (gaps.get(tok, {}).get("missing_containers") or [])})
+        note2 = f"<div class=sub>Still waiting on master(s) {esc(', '.join(still_waiting))}"
+        if missing:
+            note2 += f" &mdash; missing NRT pickup confirmation for: {esc(', '.join(missing))}"
+        note2 += ".</div>"
+        parts.append(note2)
     return "".join(parts) if parts else None
 
 _CONTAINER_IN_SUBJECT = re.compile(r"Container\s*#\s*(\S+)", re.I)
 
-def _agent_log_html(rows, exc_only):
+def _agent_log_html(rows, mode="all"):
     """Scannable decision table -- one row per decision, exceptions highlighted. Plain-
     English throughout: no raw JSON, no code-shaped field names -- the Details column uses
-    _friendly_shipment_result instead of a JSON dump, and times display in Pacific."""
+    _friendly_shipment_result instead of a JSON dump, and times display in Pacific.
+    `mode` picks which pre-filtered `rows` this is (for the title/toggle only -- the
+    filtering itself already happened in agent_log_read()): 'pickup' (default dashboard
+    view, Available-for-pickup triggers + exceptions only), 'exceptions', or 'all'."""
     def esc(v):
         s = "" if v is None else str(v)
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -1395,8 +1433,11 @@ def _agent_log_html(rows, exc_only):
                 f"<td>{what}</td><td>{status}</td>"
                 f"<td>{note}</td><td>{detail}</td></tr>")
     body_rows = "".join(_row(r) for r in rows)
-    title = "Agent decisions" + (" &mdash; exceptions only" if exc_only else "")
-    toggle = ('<a class=pill href="/agent/log">all</a> '
+    title_suffix = {"pickup": " &mdash; available for pickup", "exceptions": " &mdash; exceptions only",
+                    "all": " &mdash; all classifications"}.get(mode, "")
+    title = "Agent decisions" + title_suffix
+    toggle = ('<a class=pill href="/agent/log">available for pickup</a> '
+              '<a class=pill href="/agent/log?all=1">all classifications</a> '
               '<a class=pill href="/agent/log?exceptions_only=1">exceptions only</a>')
     return ('<div class=card><h1 style="font-size:16px">%s</h1>'
             '<p class=sub>One row per decision the mailbox-agent made (not per LLM turn). '
@@ -1520,7 +1561,7 @@ def _lookup_html(query=None):
 
     if info["agent_rows"]:
         parts.append('<div class=card><h1 style="font-size:16px">Agent decisions</h1>'
-                     + _agent_log_html(sorted(info["agent_rows"], key=lambda r: r.get("ts", "")), exc_only=False))
+                     + _agent_log_html(sorted(info["agent_rows"], key=lambda r: r.get("ts", "")), mode="all"))
 
     if info["history_rows"]:
         hrows = sorted(info["history_rows"], key=lambda h: h.get("ts", ""), reverse=True)
@@ -1630,6 +1671,9 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
     if not container:
         return {"error": "container is required."}
 
+    still_waiting = []
+    container_gaps = {}
+    completeness_detail = []
     if pos:
         all_pos = list(dict.fromkeys(p.strip() for p in pos if p and p.strip()))
         unresolved = False
@@ -1679,7 +1723,7 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                 # false anomaly on every future pickup event.
                 ledger_set_status(token, "waiting")
             ledger_record(token, container, pickup_date)
-        complete, completeness_detail = containers_completeness(container)
+        po_refs = resolve_pos_by_master(container)
         for token in resolved:
             ledger_stamp_checked(token)
         # SECOND, INDEPENDENT gate (2026-07-24, real incident): the PO-receiving check
@@ -1689,14 +1733,34 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         # received while a sibling container has never sent its own NRT email at all --
         # confirmed real, see containers_confirmed_available's docstring. Revenue
         # recognition is anchored to the port-pickup event, so BOTH gates must pass.
+        #
+        # Evaluated PER MASTER, not aggregated across the whole container event (fixed
+        # 2026-07-27, real case: container ONEU9300392 resolves to 5 unrelated masters at
+        # once -- 141970/378306/645410/645411/645399 -- via 5 separate receipts, and
+        # treating them as one all-or-nothing unit wrongly held back the 4 that were
+        # fully ready just because the 5th (645399) was still waiting on sibling
+        # container FSCU5863132. A master that passes both gates ships now; a sibling
+        # sharing the same pickup event that doesn't stays "waiting" on its own -- Parker
+        # confirmed this is the intended behavior.
+        completeness_detail = []
         container_gaps = {}
+        ready = []
         for token in resolved:
+            ref = po_refs.get(token)
+            if ref is None:
+                po_ok, po_detail = False, {"error": "receipt for this master did not resolve "
+                                                      "to exactly one Purchase Order"}
+            else:
+                po_ok, po_detail = po_completeness(*ref)
+            completeness_detail.append(dict(po_detail, master=token, complete=po_ok))
             all_confirmed, missing, expected = containers_confirmed_available(token)
             if not all_confirmed:
                 container_gaps[token] = {"missing_containers": missing, "expected_containers": expected}
-        if not complete or container_gaps:
-            for token in resolved:
+            if po_ok and all_confirmed:
+                ready.append(token)
+            else:
                 ledger_set_status(token, "waiting")
+        if not ready:
             if container_gaps:
                 note = ("not every container for this order has been individually confirmed "
                          "Available for Pickup by NRT yet -- still waiting on: " +
@@ -1711,8 +1775,9 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                     "orders_matched": 0, "reason": reason, "note": note,
                     "completeness_detail": completeness_detail,
                     "container_gaps": container_gaps or None}
-        all_pos = resolved
+        all_pos = ready
         unresolved = not resolved
+        still_waiting = sorted(set(resolved) - set(ready))
 
     matched = find_sales_orders_batch(all_pos)
     if all_pos and not any(matched.get(p) for p in all_pos):
@@ -1774,6 +1839,14 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
     summary = {"container": container, "source": source, "po_count": len(all_pos),
                "unresolved_containers": unresolved_containers,
                "orders_matched": to_create, "created": created, "dry_run": dry_run, "rows": rows}
+    if still_waiting:
+        # Some of this pickup event's masters shipped above; these siblings are still
+        # gated (Gate 1 and/or Gate 2) and stay "waiting" -- surfaced alongside the
+        # created rows rather than as a separate blocking event, see the per-master gate
+        # comment above.
+        summary["still_waiting_masters"] = still_waiting
+        summary["container_gaps"] = container_gaps or None
+        summary["completeness_detail"] = completeness_detail
     if not dry_run:
         if to_create == 0:
             status = "no_matches"
@@ -2398,7 +2471,11 @@ def _dashboard_html():
     PDF-upload tool (the old default landing page) moved to /manual -- still there as a
     fallback, just no longer the front door now that the agent handles the common case."""
     s = agent_summary(hours=24)
-    recent = agent_log_read(limit=15)
+    # Pickup-only by default (2026-07-27, Parker's request): the routine NRT status noise
+    # (Scheduled/Picked up/Empty-returned, non-NRT mail, skipped/ambiguous) was cluttering
+    # the home page -- exceptions still always show regardless of classification, see
+    # agent_log_read()'s docstring. Full history remains one click away via /agent/log?all=1.
+    recent = agent_log_read(limit=15, pickup_only=True)
 
     mode_color = {"live": "#5a7d5a", "shadow": "#7d7363", "mixed": "#b0653a", "n/a": "#c9c0ad"}
     mode_pill = ('<span class=pill style="border-color:%s">%s</span>'
@@ -2438,7 +2515,8 @@ def _dashboard_html():
              '<b>%s</b> flagged for review &middot; <b>%s</b> no action needed</p>'
              '<p>%s</p>'
              '<p><a class=pill href=/lookup>Look up a container/PO</a> '
-             '<a class=pill href=/agent/log?view=html>Full decision log</a> '
+             '<a class=pill href=/agent/log?view=html>Pickup decisions</a> '
+             '<a class=pill href="/agent/log?all=1&view=html">Full decision log</a> '
              '<a class=pill href="/agent/log?exceptions_only=1&view=html">Exceptions only</a> '
              '<a class=pill href=/splits>Split orders</a> '
              '<a class=pill href=/history>Shipment run history</a> '
@@ -2477,8 +2555,9 @@ def _dashboard_recent_html(rows):
                 f"<td>{status}</td>"
                 f"{exc_cell}</tr>")
     body = "".join(_row(r) for r in rows)
-    return ('<div class=card><h1 style="font-size:16px">Recent activity (last %d)</h1>'
-            '<p class=sub>Times are Pacific. %s</p>'
+    return ('<div class=card><h1 style="font-size:16px">Recent pickup decisions (last %d)</h1>'
+            '<p class=sub>Times are Pacific. Available-for-pickup triggers and exceptions only -- '
+            '<a href="/agent/log?all=1&view=html">see every email, all classifications</a>. %s</p>'
             '<div class=twrap><table><tr><th>Received</th><th>Container</th><th>Email status</th><th>Result</th>'
             '<th>Exception</th></tr>%s</table></div></div>'
             % (len(rows), CLASSIFICATION_LEGEND, body or
@@ -2644,6 +2723,8 @@ class H(BaseHTTPRequestHandler):
             # The mailbox-agent's decision audit trail. JSON for the agent's own
             # idempotency check (?message_id=...) and programmatic reads; a rendered HTML
             # table (?view=html) for a person to scan a day's decisions in under a minute.
+            # Default view is pickup_only (2026-07-27, Parker's request) -- routine NRT
+            # status noise hidden, exceptions always still shown; ?all=1 for everything.
             qs = urllib.parse.parse_qs(u.query)
             want = AGENT_TOKEN
             token_ok = bool(want) and qs.get("token", [""])[0] == want
@@ -2651,13 +2732,16 @@ class H(BaseHTTPRequestHandler):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             msg_id = qs.get("message_id", [""])[0].strip() or None
             exc_only = qs.get("exceptions_only", ["0"])[0] == "1"
+            show_all = qs.get("all", ["0"])[0] == "1"
+            mode = "exceptions" if exc_only else ("all" if show_all else "pickup")
             try:
                 limit = int(qs.get("limit", ["200"])[0])
             except Exception:
                 limit = 200
-            rows = agent_log_read(limit=limit, exceptions_only=exc_only, message_id=msg_id)
+            rows = agent_log_read(limit=limit, exceptions_only=exc_only,
+                                   pickup_only=(mode == "pickup"), message_id=msg_id)
             if qs.get("view", [""])[0] == "html" or self._authed():
-                return self._send(200, page(_agent_log_html(rows, exc_only), favicon=AGENT_FAVICON))
+                return self._send(200, page(_agent_log_html(rows, mode), favicon=AGENT_FAVICON))
             return self._send(200, json.dumps(rows), "application/json")
         if u.path == "/containerstatus":
             # For the mailbox-agent to call on EVERY NRT status email, not just triggers --
@@ -2871,10 +2955,10 @@ class H(BaseHTTPRequestHandler):
             # whose LAST container's pickup email fires before its receipt posts in
             # Acumatica has no future NRT event to re-trigger it -- it would sit "waiting"
             # forever even after the PO genuinely becomes complete. Re-runs the exact same
-            # completeness gate process_manual already uses (picking any one of the
-            # master's recorded containers is enough -- containers_completeness() checks
-            # the underlying PO, not just that one container). Same write stakes as
-            # /autoship, same token.
+            # per-master completeness gate process_manual already uses (picking any one of
+            # the master's recorded containers is enough -- resolve_pos_by_master() checks
+            # that master's own underlying PO, not just that one container). Same write
+            # stakes as /autoship, same token.
             want = AUTOSHIP_TOKEN
             got = (self.headers.get("Authorization", "") or "").removeprefix("Bearer ").strip()
             if not (want and hmac.compare_digest(got.encode(), want.encode())):
