@@ -684,6 +684,7 @@ def containers_completeness(container):
     complete = True
     for po_type, po_nbr in refs:
         ok, d = po_completeness(po_type, po_nbr)
+        d["complete"] = ok
         detail.append(d)
         complete = complete and ok
     return complete, detail
@@ -1309,9 +1310,22 @@ def _friendly_shipment_result(tool_result, esc):
     if data.get("waiting_on_containers"):
         detail = [d for d in (data.get("completeness_detail") or []) if isinstance(d, dict)]
         total = len(detail)
-        received = sum(1 for d in detail if d.get("po_status") == "Completed")
+        # Count the actual `complete` boolean containers_completeness() already computed
+        # (per-line Completed check) -- NOT the raw header po_status string. A PO that's
+        # genuinely fully received can still show header status "Closed" (a later terminal
+        # status on this tenant, see po_completeness()'s docstring), so comparing po_status
+        # to the literal string "Completed" undercounts real completions. Real case,
+        # 2026-07-27: container ONEU9300392's 5 underlying POs were all genuinely complete
+        # (Completed=true on every Detail line, billed and closed) but this display showed
+        # "0 of 5 received in full" -- purely cosmetic; the actual gate below wasn't fooled.
+        received = sum(1 for d in detail if d.get("complete"))
         counts = (f"<div class=sub>{received} of {total} purchase orders received in full &mdash; "
                   f'<a href=/splits>see Split orders</a> for the breakdown.</div>') if total else ""
+        gaps = data.get("container_gaps") or {}
+        if gaps:
+            missing = sorted({c for g in gaps.values() for c in (g.get("missing_containers") or [])})
+            counts += (f"<div class=sub>Still waiting on NRT pickup confirmation for: "
+                       f"{esc(', '.join(missing))}.</div>")
         return ("Waiting on the rest of this order to arrive &mdash; no shipment created yet; "
                 "it'll ship automatically once every container is in." + counts)
     if data.get("out_of_scope"):
