@@ -1064,9 +1064,14 @@ def agent_log(entry):
         pass
     return row
 
-def agent_log_read(limit=200, exceptions_only=False, message_id=None):
-    """Newest-first. exceptions_only filters to flagged rows for quick review;
-    message_id returns every row for one source email (the idempotency lookup)."""
+def agent_log_read(limit=200, exceptions_only=False, pickup_only=False, message_id=None):
+    """Newest-first. exceptions_only filters to flagged rows for quick review; pickup_only
+    (the dashboard's default view, per Parker's request 2026-07-27) drops the routine NRT
+    noise -- Scheduled/Picked up/Empty-returned status emails, non-NRT mail, skipped/
+    ambiguous ones -- keeping only genuine "Available for pickup" triggers PLUS anything
+    flagged for review (an exception should never be hidden just because the email that
+    caused it wasn't itself a pickup trigger). message_id returns every row for one source
+    email (the idempotency lookup), bypassing both filters."""
     out = []
     try:
         with open(AGENTLOG_PATH) as f:
@@ -1078,6 +1083,9 @@ def agent_log_read(limit=200, exceptions_only=False, message_id=None):
     out = list(reversed(out))
     if exceptions_only:
         out = [r for r in out if r.get("exception_flag")]
+    elif pickup_only:
+        out = [r for r in out if r.get("classification") == "nrt_available_for_pickup"
+                                 or r.get("exception_flag")]
     return out[:limit] if limit else out
 
 def agent_summary(hours=24):
@@ -1385,10 +1393,13 @@ def _friendly_shipment_result(tool_result, esc):
 
 _CONTAINER_IN_SUBJECT = re.compile(r"Container\s*#\s*(\S+)", re.I)
 
-def _agent_log_html(rows, exc_only):
+def _agent_log_html(rows, mode="all"):
     """Scannable decision table -- one row per decision, exceptions highlighted. Plain-
     English throughout: no raw JSON, no code-shaped field names -- the Details column uses
-    _friendly_shipment_result instead of a JSON dump, and times display in Pacific."""
+    _friendly_shipment_result instead of a JSON dump, and times display in Pacific.
+    `mode` picks which pre-filtered `rows` this is (for the title/toggle only -- the
+    filtering itself already happened in agent_log_read()): 'pickup' (default dashboard
+    view, Available-for-pickup triggers + exceptions only), 'exceptions', or 'all'."""
     def esc(v):
         s = "" if v is None else str(v)
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -1422,8 +1433,11 @@ def _agent_log_html(rows, exc_only):
                 f"<td>{what}</td><td>{status}</td>"
                 f"<td>{note}</td><td>{detail}</td></tr>")
     body_rows = "".join(_row(r) for r in rows)
-    title = "Agent decisions" + (" &mdash; exceptions only" if exc_only else "")
-    toggle = ('<a class=pill href="/agent/log">all</a> '
+    title_suffix = {"pickup": " &mdash; available for pickup", "exceptions": " &mdash; exceptions only",
+                    "all": " &mdash; all classifications"}.get(mode, "")
+    title = "Agent decisions" + title_suffix
+    toggle = ('<a class=pill href="/agent/log">available for pickup</a> '
+              '<a class=pill href="/agent/log?all=1">all classifications</a> '
               '<a class=pill href="/agent/log?exceptions_only=1">exceptions only</a>')
     return ('<div class=card><h1 style="font-size:16px">%s</h1>'
             '<p class=sub>One row per decision the mailbox-agent made (not per LLM turn). '
@@ -1547,7 +1561,7 @@ def _lookup_html(query=None):
 
     if info["agent_rows"]:
         parts.append('<div class=card><h1 style="font-size:16px">Agent decisions</h1>'
-                     + _agent_log_html(sorted(info["agent_rows"], key=lambda r: r.get("ts", "")), exc_only=False))
+                     + _agent_log_html(sorted(info["agent_rows"], key=lambda r: r.get("ts", "")), mode="all"))
 
     if info["history_rows"]:
         hrows = sorted(info["history_rows"], key=lambda h: h.get("ts", ""), reverse=True)
@@ -2457,7 +2471,11 @@ def _dashboard_html():
     PDF-upload tool (the old default landing page) moved to /manual -- still there as a
     fallback, just no longer the front door now that the agent handles the common case."""
     s = agent_summary(hours=24)
-    recent = agent_log_read(limit=15)
+    # Pickup-only by default (2026-07-27, Parker's request): the routine NRT status noise
+    # (Scheduled/Picked up/Empty-returned, non-NRT mail, skipped/ambiguous) was cluttering
+    # the home page -- exceptions still always show regardless of classification, see
+    # agent_log_read()'s docstring. Full history remains one click away via /agent/log?all=1.
+    recent = agent_log_read(limit=15, pickup_only=True)
 
     mode_color = {"live": "#5a7d5a", "shadow": "#7d7363", "mixed": "#b0653a", "n/a": "#c9c0ad"}
     mode_pill = ('<span class=pill style="border-color:%s">%s</span>'
@@ -2497,7 +2515,8 @@ def _dashboard_html():
              '<b>%s</b> flagged for review &middot; <b>%s</b> no action needed</p>'
              '<p>%s</p>'
              '<p><a class=pill href=/lookup>Look up a container/PO</a> '
-             '<a class=pill href=/agent/log?view=html>Full decision log</a> '
+             '<a class=pill href=/agent/log?view=html>Pickup decisions</a> '
+             '<a class=pill href="/agent/log?all=1&view=html">Full decision log</a> '
              '<a class=pill href="/agent/log?exceptions_only=1&view=html">Exceptions only</a> '
              '<a class=pill href=/splits>Split orders</a> '
              '<a class=pill href=/history>Shipment run history</a> '
@@ -2536,8 +2555,9 @@ def _dashboard_recent_html(rows):
                 f"<td>{status}</td>"
                 f"{exc_cell}</tr>")
     body = "".join(_row(r) for r in rows)
-    return ('<div class=card><h1 style="font-size:16px">Recent activity (last %d)</h1>'
-            '<p class=sub>Times are Pacific. %s</p>'
+    return ('<div class=card><h1 style="font-size:16px">Recent pickup decisions (last %d)</h1>'
+            '<p class=sub>Times are Pacific. Available-for-pickup triggers and exceptions only -- '
+            '<a href="/agent/log?all=1&view=html">see every email, all classifications</a>. %s</p>'
             '<div class=twrap><table><tr><th>Received</th><th>Container</th><th>Email status</th><th>Result</th>'
             '<th>Exception</th></tr>%s</table></div></div>'
             % (len(rows), CLASSIFICATION_LEGEND, body or
@@ -2703,6 +2723,8 @@ class H(BaseHTTPRequestHandler):
             # The mailbox-agent's decision audit trail. JSON for the agent's own
             # idempotency check (?message_id=...) and programmatic reads; a rendered HTML
             # table (?view=html) for a person to scan a day's decisions in under a minute.
+            # Default view is pickup_only (2026-07-27, Parker's request) -- routine NRT
+            # status noise hidden, exceptions always still shown; ?all=1 for everything.
             qs = urllib.parse.parse_qs(u.query)
             want = AGENT_TOKEN
             token_ok = bool(want) and qs.get("token", [""])[0] == want
@@ -2710,13 +2732,16 @@ class H(BaseHTTPRequestHandler):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             msg_id = qs.get("message_id", [""])[0].strip() or None
             exc_only = qs.get("exceptions_only", ["0"])[0] == "1"
+            show_all = qs.get("all", ["0"])[0] == "1"
+            mode = "exceptions" if exc_only else ("all" if show_all else "pickup")
             try:
                 limit = int(qs.get("limit", ["200"])[0])
             except Exception:
                 limit = 200
-            rows = agent_log_read(limit=limit, exceptions_only=exc_only, message_id=msg_id)
+            rows = agent_log_read(limit=limit, exceptions_only=exc_only,
+                                   pickup_only=(mode == "pickup"), message_id=msg_id)
             if qs.get("view", [""])[0] == "html" or self._authed():
-                return self._send(200, page(_agent_log_html(rows, exc_only), favicon=AGENT_FAVICON))
+                return self._send(200, page(_agent_log_html(rows, mode), favicon=AGENT_FAVICON))
             return self._send(200, json.dumps(rows), "application/json")
         if u.path == "/containerstatus":
             # For the mailbox-agent to call on EVERY NRT status email, not just triggers --
