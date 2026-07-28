@@ -738,10 +738,20 @@ def confirmed_pickup_containers():
     every currently-stuck case gets picked up automatically the next time this is called --
     no manual backfill needed, it's recomputed fresh from data already on disk.
 
+    Filters on action_taken == "create_shipment" (the tool was actually invoked), NOT
+    classification == "nrt_available_for_pickup". Real bug caught 2026-07-28 testing this
+    fix live: agent.py's own system prompt tells the agent to classify a genuine
+    "Available for Pickup" email as nrt_waiting_on_containers whenever create_shipment
+    comes back waiting_on_containers=true -- which is the COMMON case for any container in
+    one of these multi-master groups, not the exception. Filtering on classification
+    excluded almost every real trigger except the rare one that shipped immediately;
+    action_taken is set unconditionally whenever the tool was called (see agent.py
+    run_tool()'s create_shipment branch), regardless of what finish() classified it as.
+
     Local file read only, no live Acumatica calls. Returns {container: latest ship_date}."""
     out = {}
     for r in agent_log_read(limit=0):
-        if r.get("classification") != "nrt_available_for_pickup":
+        if r.get("action_taken") != "create_shipment":
             continue
         args = r.get("tool_args") or {}
         c = (args.get("container") or "").strip().upper()
