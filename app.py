@@ -203,8 +203,18 @@ def ledger_set_status(master_token, status, note=None):
     return data[master_token]
 
 def ledger_latest_date(master_token):
+    """Latest confirmed pickup date across every container this master's OWN receipts say
+    it depends on -- sourced primarily from confirmed_pickup_containers() (the permanent
+    agent_log.jsonl record, see its docstring for why), not just this master's own
+    container_ledger.json entry, which can be missing a real confirmation if Acumatica's
+    receipt didn't exist yet at the moment that container's NRT trigger fired. Also folds
+    in the ledger entry's own dates (belt-and-suspenders -- covers anything recorded by a
+    path that doesn't log to agent_log.jsonl, e.g. a manual /autoship test)."""
+    dates = []
+    expected = expected_containers_for_master(master_token)
+    dates.extend(d for c, d in confirmed_pickup_containers().items() if c in expected)
     data = load_json(LEDGER_PATH) or {}
-    dates = list((data.get(master_token) or {}).get("containers", {}).values())
+    dates.extend((data.get(master_token) or {}).get("containers", {}).values())
     return max(dates) if dates else None
 
 def ledger_stamp_checked(master_token):
@@ -710,6 +720,38 @@ def expected_containers_for_master(master_token):
             containers.update(r.get("containers") or [])
     return containers
 
+def confirmed_pickup_containers():
+    """The definitive record of which containers have genuinely sent an 'Available for
+    Pickup' NRT trigger, and the ship_date the agent recorded for each -- derived from
+    agent_log.jsonl (append-only, permanent) rather than from any one master's own
+    container_ledger.json entry.
+
+    Why this has to be the source of truth rather than the ledger: container_ledger.json
+    only ever gets a container recorded under whichever master(s) container_scope()
+    happened to resolve to AT THE MOMENT the NRT trigger fired (see process_manual). If
+    Acumatica had no receipt yet linking that container to any master at that instant --
+    real confirmed case, 2026-07-24: FBIU5266985 triggered before receipts 007316-007324
+    (which tie it to 9 masters) existed -- the resolved-token list was empty, so
+    ledger_record() never ran, and the confirmation was silently dropped, permanently,
+    since "Available for Pickup" only fires once per container. Scanning the permanent log
+    instead means a real confirmation is never lost to Acumatica receipt timing, and
+    every currently-stuck case gets picked up automatically the next time this is called --
+    no manual backfill needed, it's recomputed fresh from data already on disk.
+
+    Local file read only, no live Acumatica calls. Returns {container: latest ship_date}."""
+    out = {}
+    for r in agent_log_read(limit=0):
+        if r.get("classification") != "nrt_available_for_pickup":
+            continue
+        args = r.get("tool_args") or {}
+        c = (args.get("container") or "").strip().upper()
+        d = args.get("ship_date")
+        if not c or not d:
+            continue
+        if c not in out or d > out[c]:
+            out[c] = d
+    return out
+
 def containers_confirmed_available(master_token):
     """Has EVERY container Acumatica's receipts say belongs to this master ALSO been
     individually confirmed 'Available for Pickup' (or later) by its own NRT email --
@@ -729,13 +771,20 @@ def containers_confirmed_available(master_token):
     a shipment must not be created until ALL of a PO's containers show Available for
     Pickup (or later).
 
-    "Confirmed" = present in container_ledger.json for this master -- ledger_record()
-    only ever fires from a real NRT trigger event (see process_manual), so a container
-    that never sent its own email is correctly never in there. Returns (all_confirmed,
-    missing_containers, expected_containers)."""
+    "Confirmed" = present in confirmed_pickup_containers() -- the permanent agent_log.jsonl
+    record of every real NRT trigger, NOT container_ledger.json's per-master dict. Real bug
+    found 2026-07-28: FBIU5266985 sent a genuine "Available for Pickup" email on 2026-07-24,
+    correctly processed by the agent -- but at that moment Acumatica had NO receipt yet
+    linking it to any master (those receipts, tying it to 9 masters, weren't created until
+    ~2026-07-27/28). With zero resolved master tokens, ledger_record()'s "for token in
+    resolved" loop ran zero times -- the confirmation was silently dropped, permanently,
+    since that email never fires twice. Once those receipts appeared, all 9 masters
+    correctly expected FBIU5266985 but could never see it confirmed. Deriving from the
+    permanent log instead means a real confirmation is never lost to Acumatica receipt
+    timing, and needs no manual backfill -- see confirmed_pickup_containers()'s docstring.
+    Returns (all_confirmed, missing_containers, expected_containers)."""
     expected = expected_containers_for_master(master_token)
-    entry = ledger_entry(master_token) or {}
-    confirmed = set((entry.get("containers") or {}).keys())
+    confirmed = expected & set(confirmed_pickup_containers().keys())
     missing = expected - confirmed
     return (not missing), sorted(missing), sorted(expected)
 
