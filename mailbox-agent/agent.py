@@ -151,8 +151,11 @@ TOOLS = [
     {
         "name": "create_shipment",
         "description": "Create an UNCONFIRMED (On Hold) Acumatica shipment for the given container. "
-                       "Use ONLY for NRT emails whose status is 'Available for Pickup'. ship_date "
-                       "must be the date the email was received (provided in the email metadata). "
+                       "Use for NRT emails whose status is 'Available for Pickup', OR a later status "
+                       "(Scheduled for Pickup/Picked Up/Empty returned) when check_container_status "
+                       "shows no shipment exists yet -- see the system prompt's missed-trigger-backfill "
+                       "case. ship_date must be the date the email was received (provided in the email "
+                       "metadata). "
                        "Never releases/confirms -- a clerk does that in Acumatica. The result can come "
                        "back three ways: (1) created -- done, call finish normally; (2) "
                        "waiting_on_containers=true -- this order's Purchase Order isn't fully received "
@@ -186,7 +189,8 @@ TOOLS = [
             "properties": {
                 "classification": {
                     "type": "string",
-                    "enum": ["nrt_available_for_pickup", "nrt_waiting_on_containers", "nrt_other_status",
+                    "enum": ["nrt_available_for_pickup", "nrt_late_pickup_confirmation",
+                              "nrt_waiting_on_containers", "nrt_other_status",
                               "not_nrt", "ambiguous", "skip"],
                 },
                 "action_summary": {"type": "string", "description": "One phrase, e.g. 'created shipment' / 'no action'"},
@@ -232,11 +236,24 @@ once complete; nothing more for you to do.
 order resolved, or a pickup arrived for an order already marked shipped), that DOES \
 need a human -- call finish with exception=true and explain.
 - Any OTHER status (Scheduled for Pickup, in transit, arrived at port, delayed, on hold, \
-Picked Up, Empty returned, etc.): do NOT create a shipment. Since "Available for Pickup" \
-is the first stage, any of these arriving AFTER a shipment already exists (per \
-check_container_status) is the normal, expected continuation -- NOT an anomaly, don't \
-flag it. Call finish with classification nrt_other_status, exception=false, no action, \
-regardless of what check_container_status returns.
+Picked Up, Empty returned, etc.): do NOT create a shipment by default. Since "Available \
+for Pickup" is the first stage, any of these arriving AFTER a shipment already exists \
+(per check_container_status) is the normal, expected continuation -- NOT an anomaly, \
+don't flag it. Call finish with classification nrt_other_status, exception=false, no \
+action.
+   - EXCEPTION -- missed-trigger backfill: if the status is specifically "Scheduled for \
+Pickup", "Picked Up", or "Empty returned" (NOT "in transit"/"arrived at port"/"delayed"/ \
+"on hold", which don't reliably imply this) AND check_container_status shows \
+shipped=false (no shipment exists yet for this container): treat this the same as \
+"Available for Pickup". Reaching any of these later stages necessarily means the \
+container WAS available at some point, even though NRT apparently never sent that \
+specific email -- a real, confirmed gap on NRT's side (Parker confirmed this directly, \
+2026-07-28), not something to second-guess. Call create_shipment with the container \
+number and ship_date = the email's received date, exactly as in the normal trigger case, \
+then call finish with classification nrt_late_pickup_confirmation and a rationale noting \
+the intermediate "Available for Pickup" email was missed. Handle \
+waiting_on_containers=true / needs_review=true exactly as in the normal trigger case \
+above.
 
 If the email isn't an NRT status email at all (wrong sender, no container number, some \
 other message that landed in this folder), or anything is unclear or conflicting: do NOT \

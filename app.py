@@ -1143,7 +1143,8 @@ def agent_log_read(limit=200, exceptions_only=False, pickup_only=False, message_
     if exceptions_only:
         out = [r for r in out if r.get("exception_flag")]
     elif pickup_only:
-        out = [r for r in out if r.get("classification") == "nrt_available_for_pickup"
+        out = [r for r in out if r.get("classification") in
+                                 ("nrt_available_for_pickup", "nrt_late_pickup_confirmation")
                                  or r.get("exception_flag")]
     return out[:limit] if limit else out
 
@@ -1310,6 +1311,7 @@ def _fmt_ts(ts):
 # entity like &middot; would double-escape and show up as literal text on screen.
 CLASSIFICATION_LABELS = {
     "nrt_available_for_pickup": "Available for pickup",
+    "nrt_late_pickup_confirmation": "Available for pickup (late-confirmed)",
     "nrt_waiting_on_containers": "Waiting on containers",
     "nrt_other_status": "NRT update, not a pickup",
     "not_nrt": "Not an NRT email",
