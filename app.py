@@ -1103,7 +1103,14 @@ def _find_later_success(container, after_ts, hist_rows):
     a new one to ship_runs.jsonl. Without this check, a resolved exception sits flagged
     forever, which reads as an open problem long after it's actually been fixed. Pure
     local-file lookup (history() reads ship_runs.jsonl) -- no live Acumatica calls, cheap
-    to run per row on every page render."""
+    to run per row on every page render.
+
+    "Success" is EITHER a real shipment created (status=='ok' and created), OR every PO in
+    that later run resolving to already_fulfilled (see find_fulfilled_sales_orders()) --
+    real gap found 2026-07-29: an "already fulfilled" outcome has created=0/status=
+    'no_matches' (nothing to create, it's already done), so without this it would never
+    show as resolved even after a fresh recheck correctly recognized it -- old flagged rows
+    from before that fix deployed would stay flagged forever despite nothing being wrong."""
     if not container or not after_ts:
         return None
     for h in hist_rows:
@@ -1112,6 +1119,9 @@ def _find_later_success(container, after_ts, hist_rows):
         if container not in (h.get("containers") or ""):
             continue
         if h.get("status") == "ok" and h.get("created"):
+            return h
+        orders = h.get("orders") or []
+        if orders and all(str(o.get("reason") or "").startswith("already fulfilled") for o in orders):
             return h
     return None
 
