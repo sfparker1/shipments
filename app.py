@@ -1096,7 +1096,15 @@ def history(limit=200):
     out = list(reversed(out))
     return out[:limit] if limit else out
 
-def _find_later_success(container, after_ts, hist_rows):
+def _flagged_row_masters(r):
+    """Every master/PO token an already-flagged agent_log row's OWN stored tool_result
+    named at decision time (from data.rows) -- pure local read of data already on the row,
+    no live call. Used by _find_later_success() to match a later resolving run by shared
+    master, not just by container name."""
+    data = ((r or {}).get("tool_result") or {}).get("data") or {}
+    return {row.get("po") for row in (data.get("rows") or []) if row.get("po")}
+
+def _find_later_success(container, after_ts, hist_rows, master_tokens=None):
     """Did a LATER run (e.g. a manual retry after a timeout exception) succeed for this
     same container? agent_log.jsonl is append-only by design (a permanent record of what
     the agent decided at the time) -- a retry never edits an old flagged row, it just adds
@@ -1105,23 +1113,38 @@ def _find_later_success(container, after_ts, hist_rows):
     local-file lookup (history() reads ship_runs.jsonl) -- no live Acumatica calls, cheap
     to run per row on every page render.
 
-    "Success" is EITHER a real shipment created (status=='ok' and created), OR every PO in
-    that later run resolving to already_fulfilled (see find_fulfilled_sales_orders()) --
-    real gap found 2026-07-29: an "already fulfilled" outcome has created=0/status=
-    'no_matches' (nothing to create, it's already done), so without this it would never
-    show as resolved even after a fresh recheck correctly recognized it -- old flagged rows
-    from before that fix deployed would stay flagged forever despite nothing being wrong."""
+    "Success" is EITHER a real shipment created (status=='ok' and created), OR every
+    RELEVANT PO in that later run resolving to already_fulfilled (see
+    find_fulfilled_sales_orders()) -- real gap found 2026-07-29: an "already fulfilled"
+    outcome has created=0/status='no_matches' (nothing to create, it's already done), so
+    without this it would never show as resolved even after a fresh recheck correctly
+    recognized it -- old flagged rows from before that fix deployed would stay flagged
+    forever despite nothing being wrong.
+
+    master_tokens (optional): the master tokens THIS flagged row's own tool_result already
+    named (via _flagged_row_masters) -- matches a later run by shared master, not just by
+    container name, since a multi-master group's resolving event may be triggered by a
+    DIFFERENT sibling container than the one this row named. Real case, 2026-07-29:
+    TCLU8945399/KKFU8019382/TGBU9728306 shared masters with siblings (BSIU9862220,
+    TCLU9773571, TCLU9422089...) that resolved via a different container in the same
+    recheck run -- container-only matching left them flagged forever even though their
+    masters were genuinely fine."""
     if not container or not after_ts:
         return None
+    master_tokens = master_tokens or set()
     for h in hist_rows:
         if h.get("ts", "") <= after_ts:
             continue
-        if container not in (h.get("containers") or ""):
+        h_orders = h.get("orders") or []
+        h_masters = {o.get("po") for o in h_orders if o.get("po")}
+        by_container = container in (h.get("containers") or "")
+        by_master = bool(master_tokens) and bool(master_tokens & h_masters)
+        if not (by_container or by_master):
             continue
         if h.get("status") == "ok" and h.get("created"):
             return h
-        orders = h.get("orders") or []
-        if orders and all(str(o.get("reason") or "").startswith("already fulfilled") for o in orders):
+        relevant = [o for o in h_orders if o.get("po") in master_tokens] if by_master and not by_container else h_orders
+        if relevant and all(str(o.get("reason") or "").startswith("already fulfilled") for o in relevant):
             return h
     return None
 
@@ -1533,7 +1556,8 @@ def _agent_log_html(rows, mode="all"):
         m = _CONTAINER_IN_SUBJECT.search(r.get("subject") or "")
         args = r.get("tool_args") or {}
         container_raw = args.get("container") or (m.group(1) if m else None)
-        resolved = _find_later_success(container_raw, r.get("ts", ""), hist_rows) if flagged else None
+        resolved = (_find_later_success(container_raw, r.get("ts", ""), hist_rows, _flagged_row_masters(r))
+                    if flagged else None)
         rowstyle = ' style="background:#eaf1e8"' if resolved else (' style="background:#f6ece8"' if flagged else "")
         what = esc(_friendly_classification(r.get("classification")))
         status = ('<span class=pill style="border-color:#5a7d5a;color:#5a7d5a">&#10003; Resolved on retry</span>'
@@ -2680,7 +2704,8 @@ def _dashboard_recent_html(rows):
         flagged = bool(r.get("exception_flag"))
         m = _CONTAINER_IN_SUBJECT.search(r.get("subject") or "")
         container_raw = m.group(1) if m else None
-        resolved = _find_later_success(container_raw, r.get("ts", ""), hist_rows) if flagged else None
+        resolved = (_find_later_success(container_raw, r.get("ts", ""), hist_rows, _flagged_row_masters(r))
+                    if flagged else None)
         rowstyle = ' style="background:#eaf1e8"' if resolved else (' style="background:#f6ece8"' if flagged else "")
         container = esc(container_raw) if container_raw else esc(r.get("subject") or "")
         status = ('<span class=pill style="border-color:#5a7d5a;color:#5a7d5a">&#10003; Resolved on retry</span>'
