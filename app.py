@@ -879,6 +879,51 @@ def find_sales_orders_batch(pos):
                 results[p].append(o)
     return results
 
+_ALL_ORDERS = {"rows": None, "ts": 0}
+ALL_ORDERS_TTL = 3600  # non-open orders barely change -- hourly is plenty, unlike the 10-min open cache
+
+def load_all_orders(force=False):
+    """Every sales order regardless of status -- a separate, longer-lived cache from
+    load_open_orders(), used ONLY as a fallback (see find_fulfilled_sales_orders) when a
+    master has zero OPEN matches. Real case, 2026-07-29: the missed-trigger-backfill fix
+    worked through a large backlog of old NRT emails at once, and MANY of the masters it
+    tried to ship turned out to be legacy orders Parker's team had already fulfilled
+    (manually, before this automation existed) -- 'no open sales order' flagged every one
+    of them as needing review, even though nothing was actually wrong. Same shape as
+    load_open_orders(), just without the Status filter."""
+    now = time.time()
+    if not force and _ALL_ORDERS["rows"] is not None and now - _ALL_ORDERS["ts"] < ALL_ORDERS_TTL:
+        return _ALL_ORDERS["rows"]
+    rows = []
+    q = f"{ENTITY}/SalesOrder?$select=OrderType,OrderNbr,CustomerOrder,CustomerID,Status"
+    st, data = api("GET", q)
+    if st == 200 and isinstance(data, list):
+        for so in data:
+            g = lambda k: (so.get(k) or {}).get("value")
+            rows.append({"order_type": g("OrderType"), "order_nbr": g("OrderNbr"),
+                         "cust_order": g("CustomerOrder") or "", "customer": g("CustomerID"),
+                         "status": g("Status")})
+        _ALL_ORDERS["rows"] = rows
+        _ALL_ORDERS["ts"] = now
+    return rows
+
+def find_fulfilled_sales_orders(pos):
+    """For masters with zero OPEN matches: is there a NON-open order (Completed/Closed/
+    Cancelled) instead? Distinguishes 'already fulfilled before this automation ran' (no
+    action needed, not a real problem) from a genuine gap (no sales order exists at all,
+    which DOES need a human). Only meaningfully called on that rare fallback path, not
+    the normal hot path."""
+    orders = [o for o in load_all_orders() if o["status"] != "Open"]
+    results = {p: [] for p in pos}
+    for o in orders:
+        co = o["cust_order"]
+        if not co:
+            continue
+        for p in pos:
+            if _co_matches_master(co, p):
+                results[p].append(o)
+    return results
+
 # ---------------- shipment creation (validate via /diag first) ----------------
 def _latest_shipment_for_order(order_type, order_nbr, retries=3, delay=1.0):
     """Find the most recent real Shipment for an order, right after CreateShipment's
@@ -1413,7 +1458,7 @@ def _friendly_shipment_result(tool_result, esc):
     if data.get("needs_review"):
         return f"Needs a person to look at this &mdash; {esc(str(data.get('note') or data.get('reason') or ''))}"
     rows = data.get("rows") or []
-    created_lines, other_lines = [], []
+    created_lines, fulfilled_lines, other_lines = [], [], []
     for row in rows:
         res = row.get("result") or {}
         po = esc(str(row.get("po") or ""))
@@ -1423,6 +1468,11 @@ def _friendly_shipment_result(tool_result, esc):
             created_lines.append(
                 f"Order {order} (Master PO {po}) &rarr; Shipment {esc(str(res.get('shipment_nbr') or '?'))}, "
                 f"dated {esc(str(res.get('ship_date') or ''))}{already}")
+        elif row.get("already_fulfilled"):
+            # Distinct from a genuine flag -- see find_fulfilled_sales_orders()'s docstring.
+            # Kept visually separate so a mixed result (some genuinely flagged, some just
+            # already done) doesn't read as "all of these need review."
+            fulfilled_lines.append(f"Master PO {po} &mdash; {esc(str(row.get('note') or ''))}")
         elif order or po:
             reason = res.get("reason") or res.get("error") or row.get("note") or "not created"
             other_lines.append(f"Order {order} (Master PO {po}) &mdash; {esc(str(reason))}")
@@ -1434,8 +1484,11 @@ def _friendly_shipment_result(tool_result, esc):
     else:
         if created_lines:
             parts.append("<br>".join(created_lines))
+        if fulfilled_lines:
+            parts.append(('<div class=sub style="color:#7d7363">' if created_lines or other_lines else "")
+                          + "<br>".join(fulfilled_lines) + ("</div>" if created_lines or other_lines else ""))
         if other_lines:
-            parts.append(("<br>" if created_lines else "") + "<br>".join(other_lines))
+            parts.append(("<br>" if created_lines or fulfilled_lines else "") + "<br>".join(other_lines))
     # Some sibling master(s) in this same pickup event shipped above (or matched, above);
     # these are still gated on their own -- see the per-master gate comment in
     # process_manual (real case: ONEU9300392 -> 645399 waiting on FSCU5863132 while its
@@ -1845,16 +1898,34 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         # Same stale-cache guard as process_file() -- see its comment above.
         load_open_orders(force=True)
         matched = find_sales_orders_batch(all_pos)
+    unmatched = [po for po in all_pos if not matched.get(po)]
+    # Before flagging "no open sales order" as needing review: is there a non-open
+    # (Completed/Closed/Cancelled) order instead, meaning this was already fulfilled --
+    # likely manually, before this automation existed -- rather than genuinely missing?
+    # See find_fulfilled_sales_orders()'s docstring for the real incident this fixes.
+    fulfilled = find_fulfilled_sales_orders(unmatched) if unmatched else {}
     rows = []; log_orders = []; to_create = 0; created = 0
     po_all_created = {}  # po/master token -> did every matched order for it end up created?
     for po in all_pos:
         matches = matched.get(po, [])
         if not matches:
-            rows.append({"po": po, "confidence": "flag", "note": "no open sales order", "orders": []})
+            fulfilled_orders = fulfilled.get(po) or []
+            if fulfilled_orders:
+                statuses = sorted({o["status"] for o in fulfilled_orders if o.get("status")})
+                note = (f"already fulfilled -- {len(fulfilled_orders)} sales order(s) found with "
+                        f"status {', '.join(statuses)}; likely completed before this automation "
+                        "ran, no action needed")
+                rows.append({"po": po, "confidence": "ok", "note": note, "orders": [],
+                             "already_fulfilled": True})
+            else:
+                note = "no open sales order"
+                rows.append({"po": po, "confidence": "flag", "note": note, "orders": []})
             if not dry_run:
                 log_orders.append({"po": po, "order": None, "shipment_nbr": None,
-                                    "created": False, "reason": "no open sales order"})
-            po_all_created[po] = False
+                                    "created": False, "reason": note})
+            # An already-fulfilled master is done, not pending -- mark it "shipped" so it
+            # stops re-flagging on every future recheck, same as a real successful creation.
+            po_all_created[po] = bool(fulfilled_orders)
             continue
         po_ok = True
         for m in matches:

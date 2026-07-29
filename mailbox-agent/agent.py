@@ -156,15 +156,20 @@ TOOLS = [
                        "shows no shipment exists yet -- see the system prompt's missed-trigger-backfill "
                        "case. ship_date must be the date the email was received (provided in the email "
                        "metadata). "
-                       "Never releases/confirms -- a clerk does that in Acumatica. The result can come "
-                       "back three ways: (1) created -- done, call finish normally; (2) "
-                       "waiting_on_containers=true -- this order's Purchase Order isn't fully received "
-                       "yet (its containers are still arriving across separate shipments); this is "
-                       "NORMAL, not an error -- call finish with exception=false and classification "
-                       "nrt_waiting_on_containers, no further action needed, it'll ship automatically "
-                       "once complete; (3) needs_review=true (e.g. no open sales order resolved, or a "
-                       "pickup arrived for an order already shipped) -- this DOES need a human, call "
-                       "finish with exception=true and explain.",
+                       "Never releases/confirms -- a clerk does that in Acumatica. The result's `rows` "
+                       "list has one entry per matched master; check each row, not just the top-level "
+                       "`created` count: (1) a row with created=true -- that master shipped, no action; "
+                       "(2) a row with already_fulfilled=true -- a non-open (Completed/Closed/Cancelled) "
+                       "sales order already exists for it, meaning it was fulfilled before this "
+                       "automation existed; this is NORMAL, not an error, call finish with "
+                       "exception=false; (3) waiting_on_containers=true at the top level -- this order's "
+                       "Purchase Order isn't fully received yet; NORMAL, not an error -- call finish with "
+                       "exception=false and classification nrt_waiting_on_containers, it'll ship "
+                       "automatically once complete; (4) a row that's neither created, already_fulfilled, "
+                       "nor matched to any open OR fulfilled order at all (genuinely no sales order "
+                       "exists) -- OR needs_review=true at the top level (e.g. a pickup arrived for an "
+                       "order already shipped) -- these DO need a human, call finish with exception=true "
+                       "and explain which specific master(s).",
         "input_schema": {
             "type": "object",
             "properties": {
