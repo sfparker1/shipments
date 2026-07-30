@@ -192,13 +192,23 @@ def ledger_record(master_token, container, pickup_date):
     save_json(LEDGER_PATH, data)
     return entry
 
-def ledger_set_status(master_token, status, note=None):
+def ledger_set_status(master_token, status, note=None, reset_first_seen=False):
+    """reset_first_seen (default False, preserves the normal SLA-clock behavior): pass True
+    only when a master is genuinely starting a NEW waiting period, not continuing an old
+    one -- e.g. the stale-ledger-verification case in process_manual, where a master
+    previously marked 'shipped' turns out to have no live shipment anymore (deleted after
+    being found erroneous) and is reset to 'waiting'. Without this, ledger_check_sla()
+    would measure from the ORIGINAL first_seen date -- possibly months ago -- and could
+    immediately flag a master that just re-entered 'waiting' today as stuck for months,
+    a false alarm (not a missed one, but still wrong)."""
     data = load_json(LEDGER_PATH) or {}
     if master_token not in data:
         return None
     data[master_token]["status"] = status
     if note:
         data[master_token]["note"] = note
+    if reset_first_seen:
+        data[master_token]["first_seen"] = time.strftime("%Y-%m-%d")
     save_json(LEDGER_PATH, data)
     return data[master_token]
 
@@ -1759,9 +1769,15 @@ def _lookup_html(query=None):
                        '<p>Check the container number or Master PO, or it may not have come through the agent yet.</p></div></div>')
 
     parts = [form]
+    # FIXED 2026-07-29 (found while checking a different fix): esc()-wrapping the WHOLE
+    # "join(...) or fallback" expression re-escapes the literal &mdash; entity into visible
+    # "&mdash;" text on screen instead of rendering an em dash -- only the real joined
+    # value needs escaping, never the pre-built fallback entity.
+    master_tokens_display = esc(", ".join(info["master_tokens"])) if info["master_tokens"] else "&mdash;"
+    containers_display = esc(", ".join(info["containers_involved"])) if info["containers_involved"] else "&mdash;"
     parts.append('<div class=card><h2>Summary</h2>'
-                 f'<p class=sub>Master PO(s): <b>{esc(", ".join(info["master_tokens"]) or "&mdash;")}</b> '
-                 f'&nbsp; Container(s): <b>{esc(", ".join(info["containers_involved"]) or "&mdash;")}</b></p></div>')
+                 f'<p class=sub>Master PO(s): <b>{master_tokens_display}</b> '
+                 f'&nbsp; Container(s): <b>{containers_display}</b></p></div>')
 
     master_cards = []
     for tok in info["master_tokens"]:
@@ -1961,8 +1977,11 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                 # The ledger was stale -- no live shipment actually exists anymore (e.g. it
                 # was deleted after being found erroneous). Reset so this master gets
                 # re-evaluated normally instead of being permanently stuck flagging a
-                # false anomaly on every future pickup event.
-                ledger_set_status(token, "waiting")
+                # false anomaly on every future pickup event. reset_first_seen=True: this
+                # is a genuinely NEW waiting period, not a continuation -- without it,
+                # ledger_check_sla() would measure from whenever this master first
+                # appeared, possibly months ago, and could immediately flag it as stuck.
+                ledger_set_status(token, "waiting", reset_first_seen=True)
             ledger_record(token, container, pickup_date)
         po_refs = resolve_pos_by_master(container)
         for token in resolved:
@@ -2973,7 +2992,8 @@ def _diag_html(d, sample_po, sample_container, sample_receipt):
             f'<div class=sub style="margin:2px 0 0">Resolved to internal PO(s) {esc(", ".join(probe.get("distinct_po_order_nbrs_across_receipts") or []) or "none")}</div></div></div>'
             f'<div class=kv-grid><div class=kv><label>Open sales orders</label><div class=v>{len(matches)}</div></div>'
             f'<div class=kv><label>Receipts checked</label><div class=v>{len(probe.get("receipts_checked") or [])}</div></div>'
-            f'<div class=kv><label>PO status</label><div class=v style="font-size:13px">{esc(probe.get("po_status") or "&mdash;")}</div></div></div></div>')
+            f'<div class=kv><label>PO status</label><div class=v style="font-size:13px">'
+            f'{esc(probe.get("po_status")) if probe.get("po_status") else "&mdash;"}</div></div></div></div>')
     elif sample_receipt and d.get("sample_receipt_raw") is not None:
         raw = d.get("sample_receipt_raw") or {}
         result = ('<div class="card result-card"><div class=result-head><span class=r-icon>&#128203;</span>'
@@ -3030,6 +3050,23 @@ def _dashboard_html():
     elif s["decisions"] == 0:
         warn = '<p class=sub style="color:var(--rust)">&#9888; No decisions logged in the last 24h.</p>'
 
+    # ledger_check_sla()'s result was already computed inside agent_summary() (used by the
+    # Power Automate digest email) but never shown here -- real gap found 2026-07-29: a
+    # master stuck "waiting"/"partial" past LEDGER_SLA_DAYS had no way to reach Parker
+    # except through that external, unverified email template. Now shown directly.
+    stale = s.get("ledger_stale") or []
+    stale_html = ""
+    if stale:
+        stale_rows = "".join(
+            f'<div class=member-row><span class=m-po>'
+            f'<a href="/lookup?q={urllib.parse.quote(e["master"])}">{esc(e["master"])}</a></span>'
+            f'<span class=m-containers>{esc(", ".join(e.get("containers") or []))}</span>'
+            f'<span class="pill rust">{e["days_waiting"]}d stuck</span></div>'
+            for e in stale)
+        stale_html = ('<div class=group-card style="border-left:4px solid var(--rust)">'
+            f'<div class=group-card-head><h3>&#9888; {len(stale)} master PO(s) stuck past '
+            f'{LEDGER_SLA_DAYS} days</h3></div>{stale_rows}</div>')
+
     # Display-only: agent_summary()'s by_classification keeps the raw enum keys (the
     # digest email/Power-Automate side may match on them) -- map through
     # _friendly_classification and MERGE by the resulting label (nrt_available_for_pickup
@@ -3078,7 +3115,9 @@ def _dashboard_html():
         '<div class=divider></div><div class=g-item>Queue depth <b>%s</b></div>'
         '<div class=divider></div><div class=g-item>Last decision <b>%s</b></div>%s</div>'
         % ({"live": "moss", "shadow": "line-strong", "mixed": "rust", "n/a": "line-strong"}.get(s["mode"], "line-strong"),
-           mode_pill, s["queue_depth"], esc(_fmt_ts(s["last_decision_at"]) or "&mdash;"), splits_chip))
+           mode_pill, s["queue_depth"],
+           esc(_fmt_ts(s["last_decision_at"])) if s["last_decision_at"] else "&mdash;",
+           splits_chip))
 
     # Only the /agent/log view variants -- everything else here used to duplicate a link
     # already in the persistent top nav (Look up, Split orders, Shipment history,
@@ -3091,7 +3130,7 @@ def _dashboard_html():
     header = ('<div class=section-head><h1 style="font-size:20px">Agent dashboard</h1></div>'
               '<p class=section-sub>Last 24 hours.</p>%s' % warn)
 
-    return (header + kpis + glance
+    return (header + kpis + glance + stale_html
             + ('<div class=class-row>%s</div>' % class_chips if class_chips else '')
             + quicklinks + _dashboard_recent_html(recent))
 
