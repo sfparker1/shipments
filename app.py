@@ -117,9 +117,15 @@ def load_json(path):
 # either saves, whichever saves last silently wins, dropping the other thread's update. A
 # single RLock (reentrant so a locked function calling another locked function can't
 # self-deadlock) around each such read-modify-write critical section closes that. Does NOT
-# cover WATCHLIST_PATH (Maersk/FCR is out of scope for now) or TOKEN_PATH (separate, already-
-# known, lower-severity issue -- not part of this fix).
+# cover WATCHLIST_PATH (Maersk/FCR is out of scope for now) or TOKEN_PATH (see _TOKEN_LOCK
+# below instead -- deliberately a SEPARATE lock, not this one).
 _JSON_LOCK = threading.RLock()
+
+# access_token()'s refresh path makes a real network call to Acumatica's OAuth endpoint
+# (_token_request, up to a 60s timeout) while holding this lock. Kept separate from
+# _JSON_LOCK on purpose: if it shared that lock, one slow token refresh would stall every
+# unrelated ledger/ingest/shipdates write for the whole duration of the network call.
+_TOKEN_LOCK = threading.RLock()
 
 # ---------------- Maersk watch-list (state store for the local checker script) ----------------
 # Render can't reliably reach maersk.com itself (Akamai blocks the cloud/datacenter IP range
@@ -365,12 +371,22 @@ def refresh_token(tok):
     save_json(TOKEN_PATH, new); return new
 
 def access_token():
-    tok = load_json(TOKEN_PATH)
-    if not tok: return None
-    if time.time() - tok.get("obtained", 0) > tok.get("expires_in", 3600) - 120:
-        try: tok = refresh_token(tok)
-        except Exception: return None
-    return tok.get("access_token")
+    # Locked end-to-end so two near-simultaneous requests with an expired token can't both
+    # decide to refresh at once. Without this, both would load the same (still old, both see
+    # it as expired) token and each call refresh_token() with the SAME refresh_token value --
+    # many OAuth providers rotate/invalidate a refresh_token on use, so the second call could
+    # fail outright (that request then gets "not connected"), and even if the provider allows
+    # reuse, whichever save_json() finishes last wins, silently discarding the other's result.
+    # Re-loading fresh AFTER acquiring the lock (not reusing whatever was loaded before it)
+    # means a thread that had to wait sees the OTHER thread's already-completed refresh and
+    # skips redoing it.
+    with _TOKEN_LOCK:
+        tok = load_json(TOKEN_PATH)
+        if not tok: return None
+        if time.time() - tok.get("obtained", 0) > tok.get("expires_in", 3600) - 120:
+            try: tok = refresh_token(tok)
+            except Exception: return None
+        return tok.get("access_token")
 
 def api(method, path, body=None, token=None):
     token = token or access_token()
