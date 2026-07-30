@@ -1910,8 +1910,19 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
     for c in containers:
         for p in receipt_pos_by_container.get(c, []):
             if p not in all_pos: all_pos.append(p)
-    unresolved_containers = [c for c in containers
-                              if not receipt_pos_by_container.get(c) and not text_pos_by_container.get(c)]
+    no_po_containers = [c for c in containers
+                        if not receipt_pos_by_container.get(c) and not text_pos_by_container.get(c)]
+    # Split by WHY no PO was found -- container_scope() (same check process_manual() already
+    # uses) tells 3PL-bound units (revenue recognized at the 3PL, not at port; expected,
+    # nothing to review) apart from a genuine gap (no receipt yet, or a receipt with no
+    # recognizable order token -- needs a human look). Previously both cases were lumped
+    # into one red "unresolved" flag on this page and in /history, which read as "something's
+    # wrong" for a container that's actually working exactly as designed.
+    out_of_scope_containers = []
+    unresolved_containers = []
+    for c in no_po_containers:
+        scope, _ = container_scope(c)
+        (out_of_scope_containers if scope == "out_of_scope" else unresolved_containers).append(c)
 
     matched = find_sales_orders_batch(all_pos)
     if all_pos and not any(matched.get(p) for p in all_pos):
@@ -1961,6 +1972,7 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
                "route": f'{parsed["pol"]} -> {parsed["pod"]}', "eta": parsed["eta"],
                "containers": containers, "po_count": len(all_pos),
                "unresolved_containers": unresolved_containers,
+               "out_of_scope_containers": out_of_scope_containers,
                "orders_matched": to_create, "created": created, "dry_run": dry_run, "rows": rows}
     if not dry_run:
         if to_create == 0:
@@ -1980,6 +1992,7 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
                  "user": user, "acumatica_user": connected_user(), "status": status,
                  "orders_matched": to_create, "created": created,
                  "containers": container_ref, "unresolved_containers": unresolved_containers,
+                 "out_of_scope_containers": out_of_scope_containers,
                  "ship_date": ship_date, "orders": log_orders})
     return summary
 
@@ -3308,6 +3321,9 @@ function render(d,dry){
  if((d.unresolved_containers||[]).length){
    h+='<p class=sub style="color:var(--rust)">&#9888; No PO could be found for '+d.unresolved_containers.length+' container(s) ('+d.unresolved_containers.join(', ')+') -- checked both the advice text and PO Receipts. Verify manually (e.g. against the packing list) before assuming this handover is fully covered.</p>';
  }
+ if((d.out_of_scope_containers||[]).length){
+   h+='<p class=sub>'+d.out_of_scope_containers.length+' container(s) ('+d.out_of_scope_containers.join(', ')+') are 3PL-bound -- revenue recognizes at the 3PL, not at port pickup, so no shipment is expected here. Not an error.</p>';
+ }
  h+='<p class=sub>'+d.po_count+' PO#s found (advice text + PO Receipts) &middot; '+d.orders_matched+' open sales orders matched'+(dry?'':' &middot; '+d.created+' shipments created')+'</p>';
  h+='<table><tr><th></th><th>PO#</th><th>Sales order</th><th>Customer</th><th>Result</th></tr>';
  for(const row of d.rows){
@@ -3599,9 +3615,12 @@ class H(BaseHTTPRequestHandler):
                 else:
                     detail_cell = "&mdash;"
                 unresolved = h.get("unresolved_containers") or []
+                out_of_scope = h.get("out_of_scope_containers") or []
                 cont_cell = h.get("containers", "")
                 if unresolved:
                     cont_cell += f' <span class="pill rust">&#9888; unresolved: {", ".join(unresolved)}</span>'
+                if out_of_scope:
+                    cont_cell += f' <span class="pill">3PL, no shipment expected: {", ".join(out_of_scope)}</span>'
                 # Which Acumatica identity actually performed this write (not the app-level
                 # "By" caller/source tag) -- flag red if it doesn't match EXPECTED_ACU_USER, so
                 # segregation-of-duties drift shows up per-run in the permanent log, not only
