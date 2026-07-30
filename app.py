@@ -17,7 +17,7 @@ internal PO# -> that PO's VendorRef (where the retail PO text lives) -> match
 against Sales Orders. Optional env overrides: RECEIPT_CONTAINER_FIELD /
 RECEIPT_CONTAINER_VIEW (skip auto-discovery), RECEIPT_LOOKBACK_DAYS (default 180).
 """
-import os, re, json, time, base64, hashlib, hmac, secrets, datetime
+import os, re, json, time, base64, hashlib, hmac, secrets, datetime, threading
 import urllib.parse, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
@@ -111,6 +111,16 @@ def load_json(path):
         with open(path) as f: return json.load(f)
     except Exception: return None
 
+# ThreadingHTTPServer means two requests can genuinely run this process's code at the same
+# instant. save_json()/load_json() themselves are just single-file I/O -- the actual risk is
+# a caller doing load -> mutate one key -> save: if two threads both load the old state before
+# either saves, whichever saves last silently wins, dropping the other thread's update. A
+# single RLock (reentrant so a locked function calling another locked function can't
+# self-deadlock) around each such read-modify-write critical section closes that. Does NOT
+# cover WATCHLIST_PATH (Maersk/FCR is out of scope for now) or TOKEN_PATH (separate, already-
+# known, lower-severity issue -- not part of this fix).
+_JSON_LOCK = threading.RLock()
+
 # ---------------- Maersk watch-list (state store for the local checker script) ----------------
 # Render can't reliably reach maersk.com itself (Akamai blocks the cloud/datacenter IP range
 # it deploys from -- confirmed live: browser launches fine, page load times out). So the
@@ -184,13 +194,14 @@ def ledger_record(master_token, container, pickup_date):
     shipment-creation loop below it fails partway through."""
     if not master_token or not container:
         return None
-    data = load_json(LEDGER_PATH) or {}
-    entry = data.setdefault(master_token, {"containers": {}, "status": "waiting",
-                                            "first_seen": pickup_date, "last_updated": pickup_date})
-    entry["containers"][container] = pickup_date
-    entry["last_updated"] = pickup_date
-    save_json(LEDGER_PATH, data)
-    return entry
+    with _JSON_LOCK:
+        data = load_json(LEDGER_PATH) or {}
+        entry = data.setdefault(master_token, {"containers": {}, "status": "waiting",
+                                                "first_seen": pickup_date, "last_updated": pickup_date})
+        entry["containers"][container] = pickup_date
+        entry["last_updated"] = pickup_date
+        save_json(LEDGER_PATH, data)
+        return entry
 
 def ledger_set_status(master_token, status, note=None, reset_first_seen=False):
     """reset_first_seen (default False, preserves the normal SLA-clock behavior): pass True
@@ -201,16 +212,17 @@ def ledger_set_status(master_token, status, note=None, reset_first_seen=False):
     would measure from the ORIGINAL first_seen date -- possibly months ago -- and could
     immediately flag a master that just re-entered 'waiting' today as stuck for months,
     a false alarm (not a missed one, but still wrong)."""
-    data = load_json(LEDGER_PATH) or {}
-    if master_token not in data:
-        return None
-    data[master_token]["status"] = status
-    if note:
-        data[master_token]["note"] = note
-    if reset_first_seen:
-        data[master_token]["first_seen"] = time.strftime("%Y-%m-%d")
-    save_json(LEDGER_PATH, data)
-    return data[master_token]
+    with _JSON_LOCK:
+        data = load_json(LEDGER_PATH) or {}
+        if master_token not in data:
+            return None
+        data[master_token]["status"] = status
+        if note:
+            data[master_token]["note"] = note
+        if reset_first_seen:
+            data[master_token]["first_seen"] = time.strftime("%Y-%m-%d")
+        save_json(LEDGER_PATH, data)
+        return data[master_token]
 
 def ledger_latest_date(master_token):
     """Latest confirmed pickup date across every container this master's OWN receipts say
@@ -232,10 +244,11 @@ def ledger_stamp_checked(master_token):
     distinct from last_updated (which tracks container pickup dates, not live-check time).
     Lets /splits show a cached, zero-API-call view by default with an honest 'as of' time,
     rather than needing a live call just to know how stale the cache is."""
-    data = load_json(LEDGER_PATH) or {}
-    if master_token in data:
-        data[master_token]["last_checked"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        save_json(LEDGER_PATH, data)
+    with _JSON_LOCK:
+        data = load_json(LEDGER_PATH) or {}
+        if master_token in data:
+            data[master_token]["last_checked"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            save_json(LEDGER_PATH, data)
 
 def ledger_entry(master_token):
     return (load_json(LEDGER_PATH) or {}).get(master_token)
@@ -1416,22 +1429,26 @@ def agent_summary(hours=24):
 # just wait in the queue. Dedup is by the email's internetMessageId so a Power Automate
 # retry can't enqueue the same message twice while it's still waiting.
 def ingest_enqueue(payload):
-    os.makedirs(INGEST_DIR, exist_ok=True)
-    msg_id = (payload.get("message_id") or "").strip()
-    if msg_id:
-        for fn in os.listdir(INGEST_DIR):
-            if not fn.endswith(".json"):
-                continue
-            existing = load_json(os.path.join(INGEST_DIR, fn)) or {}
-            if existing.get("message_id") == msg_id:
-                return existing.get("id"), True  # already queued -> idempotent no-op
-    item_id = base64.urlsafe_b64encode(hashlib.sha256(
-        (msg_id or repr(payload.get("subject"))).encode()).digest()).decode().rstrip("=")[:20]
-    item = dict(payload)
-    item["id"] = item_id
-    item["enqueued_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    save_json(os.path.join(INGEST_DIR, item_id + ".json"), item)
-    return item_id, False
+    # Locked end-to-end (the dedup scan AND the write): two Power Automate retries landing
+    # on separate threads at the same instant could otherwise both pass the "not found yet"
+    # scan before either had written its file, enqueuing the same email twice.
+    with _JSON_LOCK:
+        os.makedirs(INGEST_DIR, exist_ok=True)
+        msg_id = (payload.get("message_id") or "").strip()
+        if msg_id:
+            for fn in os.listdir(INGEST_DIR):
+                if not fn.endswith(".json"):
+                    continue
+                existing = load_json(os.path.join(INGEST_DIR, fn)) or {}
+                if existing.get("message_id") == msg_id:
+                    return existing.get("id"), True  # already queued -> idempotent no-op
+        item_id = base64.urlsafe_b64encode(hashlib.sha256(
+            (msg_id or repr(payload.get("subject"))).encode()).digest()).decode().rstrip("=")[:20]
+        item = dict(payload)
+        item["id"] = item_id
+        item["enqueued_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        save_json(os.path.join(INGEST_DIR, item_id + ".json"), item)
+        return item_id, False
 
 def ingest_list():
     out = []
@@ -3468,13 +3485,14 @@ class H(BaseHTTPRequestHandler):
             token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
-            cur = {} if qs.get("reset", ["0"])[0] == "1" else (load_json(SHIPDATES_PATH) or {})
-            n = 0
-            for pr in qs.get("pairs", [""])[0].split(","):
-                if ":" in pr:
-                    k, v = pr.split(":", 1); k = k.strip(); v = v.strip()
-                    if k and v: cur[k] = v; n += 1
-            save_json(SHIPDATES_PATH, cur)
+            with _JSON_LOCK:
+                cur = {} if qs.get("reset", ["0"])[0] == "1" else (load_json(SHIPDATES_PATH) or {})
+                n = 0
+                for pr in qs.get("pairs", [""])[0].split(","):
+                    if ":" in pr:
+                        k, v = pr.split(":", 1); k = k.strip(); v = v.strip()
+                        if k and v: cur[k] = v; n += 1
+                save_json(SHIPDATES_PATH, cur)
             return self._send(200, json.dumps({"stored": n, "total": len(cur)}), "application/json")
         if u.path == "/setcontainerdates":
             qs = urllib.parse.parse_qs(u.query)
@@ -3482,13 +3500,14 @@ class H(BaseHTTPRequestHandler):
             token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
-            cur = {} if qs.get("reset", ["0"])[0] == "1" else (load_json(CONTAINERDATES_PATH) or {})
-            n = 0
-            for pr in qs.get("pairs", [""])[0].split(","):
-                if ":" in pr:
-                    k, v = pr.split(":", 1); k = k.strip(); v = v.strip()
-                    if k and v: cur[k] = v; n += 1
-            save_json(CONTAINERDATES_PATH, cur)
+            with _JSON_LOCK:
+                cur = {} if qs.get("reset", ["0"])[0] == "1" else (load_json(CONTAINERDATES_PATH) or {})
+                n = 0
+                for pr in qs.get("pairs", [""])[0].split(","):
+                    if ":" in pr:
+                        k, v = pr.split(":", 1); k = k.strip(); v = v.strip()
+                        if k and v: cur[k] = v; n += 1
+                save_json(CONTAINERDATES_PATH, cur)
             return self._send(200, json.dumps({"stored": n, "total": len(cur)}), "application/json")
         if not self._authed():
             return self._send(200, LOGIN)
