@@ -491,22 +491,33 @@ def _fetch_all_pages(path, page_size=500, max_pages=10):
 
 def discover_receipt_container_field():
     """Find the container-number custom/UDF field on PurchaseReceipt -- the
-    PO-receipts tool writes this same field (mirrors its own discovery logic)."""
+    PO-receipts tool writes this same field (mirrors its own discovery logic).
+
+    FIXED 2026-07-29 (real bug caught in audit, not yet observed live): `checked` used to
+    be set to True BEFORE the schema API call ran, unconditionally -- so a single
+    transient failure (timeout, 5xx, rate-limit) on whichever call happened to be the
+    first one after a deploy/restart would permanently cache "field not found" for the
+    rest of that process's life. Every downstream caller (load_recent_receipts, and
+    everything built on it -- process_manual, process_file, /diag, /splits, /lookup) would
+    silently stop resolving ANY container until the next restart, with no error message
+    pointing to why. Now only caches "not found" once a real 200 response actually said
+    so -- a transient failure just retries on the next call instead."""
     if _RCPT_CONTAINER_FIELD["checked"]:
         return _RCPT_CONTAINER_FIELD["field"], _RCPT_CONTAINER_FIELD["view"]
-    _RCPT_CONTAINER_FIELD["checked"] = True  # only ever hit the schema endpoint once per process
     env_f = cfg("RECEIPT_CONTAINER_FIELD")
     if env_f:
-        _RCPT_CONTAINER_FIELD.update(field=env_f, view=cfg("RECEIPT_CONTAINER_VIEW", "Document"))
+        _RCPT_CONTAINER_FIELD.update(field=env_f, view=cfg("RECEIPT_CONTAINER_VIEW", "Document"), checked=True)
         return _RCPT_CONTAINER_FIELD["field"], _RCPT_CONTAINER_FIELD["view"]
     st, data = api("GET", f"{ENTITY}/PurchaseReceipt/$adHocSchema")
-    if st == 200 and isinstance(data, dict):
-        for view, fields in (data.get("custom") or {}).items():
-            for fname, meta in fields.items():
-                label = ((meta or {}).get("displayName") or "") + " " + fname
-                if re.search(r"contain|ctnr|cont(\.|\s)*no", label, re.I) and not re.search(r"\beta\b|arriv|estimat", label, re.I):
-                    _RCPT_CONTAINER_FIELD.update(field=fname, view=view)
-                    return fname, view
+    if st != 200 or not isinstance(data, dict):
+        return None, None  # transient failure -- NOT cached, retry next call
+    _RCPT_CONTAINER_FIELD["checked"] = True  # a real answer came back -- safe to cache now, found or not
+    for view, fields in (data.get("custom") or {}).items():
+        for fname, meta in fields.items():
+            label = ((meta or {}).get("displayName") or "") + " " + fname
+            if re.search(r"contain|ctnr|cont(\.|\s)*no", label, re.I) and not re.search(r"\beta\b|arriv|estimat", label, re.I):
+                _RCPT_CONTAINER_FIELD.update(field=fname, view=view)
+                return fname, view
     return None, None
 
 def load_recent_receipts(force=False):
@@ -2381,9 +2392,23 @@ def _split_order_card(tok, entry, esc, live=False):
     status_label = "Partially shipped" if entry.get("status") == "partial" else "Waiting"
     pill_class = "pill fog"
     if not live:
+        # Real confusion, 2026-07-29: this card used to list ONLY the containers already
+        # confirmed (entry["containers"]) -- with dates on every row, it reads as "all of
+        # these are done, so why is this still waiting?" The actual reason is usually a
+        # SIBLING container Acumatica's own receipts say belongs to this master, which
+        # hasn't sent its own Available-for-pickup confirmation yet -- invisible here
+        # unless it's shown explicitly. expected_containers_for_master() and
+        # containers_confirmed_available() are both purely local (load_recent_receipts()
+        # is already cached, confirmed_pickup_containers() is a local log read) -- adding
+        # them here costs zero additional Acumatica calls, so the "zero API calls" promise
+        # for the cached view still holds.
+        _, missing, _ = containers_confirmed_available(tok)
         cont_rows = "".join(
             f"<tr><td class=mc>{esc(c)}</td><td class=md>{esc(d)}</td></tr>"
             for c, d in sorted(entry.get("containers", {}).items(), key=lambda kv: kv[1]))
+        cont_rows += "".join(
+            f'<tr><td class=mc>{esc(c)}</td><td class=md style="color:var(--rust)">not confirmed yet</td></tr>'
+            for c in missing)
         checked = entry.get("last_checked")
         checked_note = (f"Purchase order status as of last check ({esc(_fmt_ts(checked))}) -- "
                         f'<a href="/splits?live=1">refresh live</a> for current status.') if checked else \
@@ -2394,9 +2419,13 @@ def _split_order_card(tok, entry, esc, live=False):
             f'<table class=mini-table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table>'
             f'<div class=as-of>{checked_note}</div></div>')
     info = split_order_status(tok, entry)
+    _, live_missing, _ = containers_confirmed_available(tok)
     cont_rows = "".join(
         f"<tr><td class=mc>{esc(c)}</td><td class=md>{esc(d)}</td></tr>"
         for c, d in sorted(info["containers"].items(), key=lambda kv: kv[1]))
+    cont_rows += "".join(
+        f'<tr><td class=mc>{esc(c)}</td><td class=md style="color:var(--rust)">not confirmed yet</td></tr>'
+        for c in live_missing)
     po_rows = "".join(
         f"<tr><td class=mc>{esc(p['po'])}</td><td class=md>{'&#10003; Received in full' if p['complete'] else '&#9678; ' + esc(p['status'])}</td></tr>"
         for p in info["purchase_orders"]) or "<tr><td colspan=2 class=sub>Could not resolve a Purchase Order</td></tr>"
@@ -2771,6 +2800,7 @@ tbody tr.row-neutral::before{background:var(--line-strong)} tbody tr.row-fog::be
 .master-card-head .m-id,.group-card-head h3{font:600 15px var(--font-mono);color:var(--stone);margin:0}
 .mini-table{width:100%;border-collapse:collapse;font-size:12.5px}
 .mini-table th{padding:6px 0;border-bottom:1px solid var(--line);font-size:10.5px}
+.mini-table th:last-child{text-align:right}
 .mini-table td{padding:6px 0;border-bottom:1px solid var(--line)}
 .mini-table tr:last-child td{border-bottom:none}
 .mini-table .mc{font-family:var(--font-mono);color:var(--stone)}
