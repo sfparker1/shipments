@@ -1198,7 +1198,11 @@ def _find_later_success(container, after_ts, hist_rows, master_tokens=None):
             continue
         h_orders = h.get("orders") or []
         h_masters = {o.get("po") for o in h_orders if o.get("po")}
-        by_container = container in (h.get("containers") or "")
+        # Exact token match, not a bare substring check -- see container_ship_history()'s
+        # comment for why `container in "..."` risks a false match against a sibling
+        # container ref in the same run.
+        h_containers = {c.strip() for c in (h.get("containers") or "").split(",") if c.strip()}
+        by_container = container in h_containers
         by_master = bool(master_tokens) and bool(master_tokens & h_masters)
         if not (by_container or by_master):
             continue
