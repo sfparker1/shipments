@@ -486,18 +486,26 @@ RECEIPTS_TTL = 600  # 10 min, same as the open-orders cache
 RECEIPT_LOOKBACK_DAYS = int(cfg("RECEIPT_LOOKBACK_DAYS", "180"))
 
 def _fetch_all_pages(path, page_size=500, max_pages=10):
-    """GET with $top/$skip paging, capped at max_pages as a safety limit."""
+    """GET with $top/$skip paging, capped at max_pages as a safety limit. Returns
+    (rows, ok) -- ok=False means the loop broke early because of an API error/bad
+    response, NOT because it legitimately ran out of data. Callers must not treat an
+    empty result as "this really is everything" when ok is False -- see
+    load_recent_receipts()'s cache-skip logic, added after finding the same "cached a
+    transient failure as a confirmed empty result" bug class in
+    discover_receipt_container_field()."""
     rows = []
+    ok = True
     sep = "&" if "?" in path else "?"
     for page in range(max_pages):
         q = f"{path}{sep}$top={page_size}&$skip={page * page_size}"
         st, data = api("GET", q)
         if st != 200 or not isinstance(data, list):
+            ok = False
             break
         rows.extend(data)
         if len(data) < page_size:
             break
-    return rows
+    return rows, ok
 
 def discover_receipt_container_field():
     """Find the container-number custom/UDF field on PurchaseReceipt -- the
@@ -556,7 +564,7 @@ def load_recent_receipts(force=False):
     # paging stops naturally when a short page arrives; max_pages is just a runaway guard. Rows
     # are header-only now, so deep paging is cheap. (Was max_pages=6 -> capped at 3000 -> missed
     # everything recent.)
-    data = _fetch_all_pages(path, page_size=500, max_pages=40)
+    data, fetch_ok = _fetch_all_pages(path, page_size=500, max_pages=40)
     rows = []
     for r in data:
         cont = ((r.get("custom") or {}).get(view, {}).get(field) or {}).get("value")
@@ -569,7 +577,14 @@ def load_recent_receipts(force=False):
         rows.append({"containers": conts, "container_raw": cont.strip(),
                      "receipt_nbr": (r.get("ReceiptNbr") or {}).get("value"),
                      "vendor_ref": (r.get("VendorRef") or {}).get("value") or ""})
-    _RECEIPTS_CACHE.update(rows=rows, ts=now, raw_total=len(data))
+    # Same bug class as discover_receipt_container_field(): don't cache a suspicious
+    # empty result caused by an API failure as though it were a confirmed "zero receipts"
+    # answer -- that would make every container look unresolved for the full 10-minute
+    # TTL. A genuinely empty page-1 response (fetch_ok=True) is still cached normally; a
+    # partial-but-nonempty result from a later page failing mid-pagination is also cached
+    # (better than nothing, and it'll refresh again after the TTL either way).
+    if fetch_ok or rows:
+        _RECEIPTS_CACHE.update(rows=rows, ts=now, raw_total=len(data))
     return rows
 
 def containers_to_pos(containers):
