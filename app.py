@@ -1250,15 +1250,20 @@ def agent_summary(hours=24):
     cutoff = time.time() - hours * 3600
     rows = [r for r in all_rows if _epoch(r) >= cutoff]
     by_class = {}
-    prepared = flagged = no_action = 0
+    # prepared: every create_shipment call regardless of outcome -- kept exactly as before
+    # for existing consumers (the digest email may key on this). shipped/waiting/flagged/
+    # no_action are a NEW, mutually exclusive partition of every row, in the same priority
+    # order _status_pill() already uses for the per-row pill (exception first, then
+    # trigger-vs-not, then waiting-vs-shipped) -- so the dashboard's KPI tiles sum to
+    # `decisions` exactly and never disagree with what an individual row's own pill shows.
+    prepared = shipped = waiting = flagged = no_action = 0
     exceptions = []
     for r in rows:
         c = r.get("classification") or "unknown"
         by_class[c] = by_class.get(c, 0) + 1
-        if r.get("action_taken") == "create_shipment":
+        is_prepared = r.get("action_taken") == "create_shipment"
+        if is_prepared:
             prepared += 1
-        else:
-            no_action += 1
         if r.get("exception_flag"):
             flagged += 1
             exceptions.append({
@@ -1266,6 +1271,14 @@ def agent_summary(hours=24):
                 "classification": c, "reason": r.get("exception_reason") or "(none)",
                 "message_id": r.get("message_id") or "",
             })
+        elif not is_prepared:
+            no_action += 1
+        else:
+            data = ((r.get("tool_result") or {}).get("data")) or {}
+            if data.get("waiting_on_containers"):
+                waiting += 1
+            else:
+                shipped += 1
     live = sum(1 for r in rows if r.get("mode") == "live")
     if not rows:
         mode = "n/a"
@@ -1314,7 +1327,9 @@ def agent_summary(hours=24):
         "window_hours": hours,
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "decisions": len(rows),
-        "shipments_prepared": prepared,   # in shadow these are "would-be"; see mode
+        "shipments_prepared": prepared,   # in shadow these are "would-be"; see mode -- unchanged, existing consumers may key on this
+        "shipped": shipped,                # NEW: of `prepared`, the ones that actually shipped (or were already fulfilled)
+        "waiting": waiting,                 # NEW: of `prepared`, still waiting on sibling containers
         "flagged": flagged,
         "no_action": no_action,
         "mode": mode,
@@ -1399,18 +1414,33 @@ def _fmt_ts(ts):
 # entity like &middot; would double-escape and show up as literal text on screen.
 CLASSIFICATION_LABELS = {
     "nrt_available_for_pickup": "Available for pickup",
-    "nrt_late_pickup_confirmation": "Available for pickup (late-confirmed)",
+    "nrt_late_pickup_confirmation": "Available for pickup",
     "nrt_waiting_on_containers": "Waiting on containers",
-    "nrt_other_status": "NRT update, not a pickup",
+    "nrt_other_status": "Just a status update",
     "not_nrt": "Not an NRT email",
     "ambiguous": "Ambiguous",
     "skip": "Skipped",
+}
+# A small muted explanation shown under the primary label in the decision-log table only
+# (not folded into the label itself as a parenthetical, and not used in aggregate/chip
+# views, where nrt_late_pickup_confirmation correctly merges into plain "Available for
+# pickup" -- see CLASSIFICATION_LABELS above). Keyed by the raw classification string.
+CLASSIFICATION_SUBTEXT = {
+    "nrt_late_pickup_confirmation": "caught after the fact",
 }
 CLASSIFICATION_LEGEND = ("<b>Email status:</b> what the agent decided this email was about &mdash; "
     "<b>Available for pickup</b> is the shipment trigger; the others result in no shipment.")
 
 def _friendly_classification(c):
     return CLASSIFICATION_LABELS.get(c, c or "&mdash;")
+
+def _classification_cell(c, esc):
+    """Email-status table cell: primary label plus an optional small muted secondary line
+    (e.g. a pickup confirmed from a later status email, not the original trigger) -- kept
+    as its own line rather than jammed into the label as a parenthetical qualifier."""
+    label = esc(_friendly_classification(c))
+    sub = CLASSIFICATION_SUBTEXT.get(c)
+    return f'{label}<span class=status-sub>{esc(sub)}</span>' if sub else label
 
 # The run-history "user" field is either a real app-login username (manual PDF upload) or
 # an "auto:<source>" tag (an automated trigger -- the live agent, or a manual API test).
@@ -1426,6 +1456,22 @@ def _friendly_run_source(user_val):
         return RUN_SOURCE_LABELS.get(src, f"Automated &middot; {src}" if src != "unknown" else "Automated")
     return user_val
 
+def _row_severity(r):
+    """The single severity bucket a decision row belongs in -- drives both the status pill
+    and the row's left-edge stripe color, so the two never disagree. One of: 'rust' (needs
+    review), 'fog' (shadow/waiting), 'moss' (shipped), 'neutral' (no action)."""
+    if r.get("exception_flag"):
+        return "rust"
+    if r.get("action_taken") == "create_shipment":
+        if r.get("mode") != "live":
+            return "fog"
+        data = (r.get("tool_result") or {}).get("data") or {}
+        if data.get("waiting_on_containers"):
+            return "fog"
+        if data.get("created"):
+            return "moss"
+    return "neutral"
+
 def _status_pill(r):
     """One colored badge that says, at a glance, what happened -- replaces the separate
     raw Action/Mode text columns. Derived from fields already on every decision row:
@@ -1434,17 +1480,16 @@ def _status_pill(r):
     waiting_on_containers=true outcome (Phase 2 completeness gate) isn't mislabeled as a
     success just because the tool was CALLED; nothing was actually created."""
     if r.get("exception_flag"):
-        return '<span class=pill style="border-color:#b06a5a;color:#b06a5a">&#9888; Needs review</span>'
+        return '<span class="pill rust">&#9888; Needs review</span>'
     if r.get("action_taken") == "create_shipment":
         if r.get("mode") != "live":
-            return '<span class=pill style="border-color:#5d7682;color:#5d7682">&#9678; Would create &middot; shadow</span>'
+            return '<span class="pill fog">&#9678; Would create &middot; shadow</span>'
         data = (r.get("tool_result") or {}).get("data") or {}
         if data.get("waiting_on_containers"):
-            return '<span class=pill style="border-color:#5d7682;color:#5d7682">&#8987; Waiting on containers</span>'
+            return '<span class="pill fog">&#8987; Waiting on containers</span>'
         if data.get("created"):
-            return '<span class=pill style="border-color:#5a7d5a;color:#5a7d5a">&#10003; Shipment created</span>'
-        return '<span class=pill style="border-color:#c9c0ad">No action needed</span>'
-    return '<span class=pill style="border-color:#c9c0ad">No action needed</span>'
+            return '<span class="pill moss">&#10003; Shipment created</span>'
+    return '<span class=pill>No action needed</span>'
 
 def _fmt_kv(d, esc):
     """Flat dict -> 'Key: value &middot; Key2: value2' instead of a raw JSON dump -- used
@@ -1528,7 +1573,7 @@ def _friendly_shipment_result(tool_result, esc):
         if created_lines:
             parts.append("<br>".join(created_lines))
         if fulfilled_lines:
-            parts.append(('<div class=sub style="color:#7d7363">' if created_lines or other_lines else "")
+            parts.append(('<div class=sub style="color:var(--taupe)">' if created_lines or other_lines else "")
                           + "<br>".join(fulfilled_lines) + ("</div>" if created_lines or other_lines else ""))
         if other_lines:
             parts.append(("<br>" if created_lines or fulfilled_lines else "") + "<br>".join(other_lines))
@@ -1568,9 +1613,9 @@ def _agent_log_html(rows, mode="all"):
         container_raw = args.get("container") or (m.group(1) if m else None)
         resolved = (_find_later_success(container_raw, r.get("ts", ""), hist_rows, _flagged_row_masters(r))
                     if flagged else None)
-        rowstyle = ' style="background:#eaf1e8"' if resolved else (' style="background:#f6ece8"' if flagged else "")
-        what = esc(_friendly_classification(r.get("classification")))
-        status = ('<span class=pill style="border-color:#5a7d5a;color:#5a7d5a">&#10003; Resolved on retry</span>'
+        sev = "moss" if resolved else _row_severity(r)
+        what = _classification_cell(r.get("classification"), esc)
+        status = ('<span class="pill moss">&#10003; Resolved on retry</span>'
                    if resolved else _status_pill(r))
         container = esc(container_raw) if container_raw else esc(r.get("subject") or "")
         ship_date = esc(str(args.get("ship_date") or ""))
@@ -1580,15 +1625,15 @@ def _agent_log_html(rows, mode="all"):
         note = esc(r.get("rationale") or "")
         if flagged:
             if resolved:
-                exc_note = (f'<span style="color:#5a7d5a">Shipped on a later retry '
+                exc_note = (f'<span style="color:var(--moss)">Shipped on a later retry '
                             f'({esc(_fmt_ts(resolved.get("ts")))}) -- no action needed now.</span>')
             else:
-                exc_note = f'<span style="color:#b06a5a">{esc(r.get("exception_reason") or "needs review")}</span>'
+                exc_note = f'<span style="color:var(--rust)">{esc(r.get("exception_reason") or "needs review")}</span>'
             note = f"{exc_note}<br>{note}" if note else exc_note
-        return (f"<tr{rowstyle}><td>{esc(_fmt_ts(r.get('ts')))}</td>"
-                f"<td title=\"{esc(r.get('subject') or '')}\">{container}</td>"
-                f"<td>{ship_date}</td>"
-                f"<td>{what}</td><td>{status}</td>"
+        return (f'<tr class="row-{sev}"><td class=t-time>{esc(_fmt_ts(r.get("ts")))}</td>'
+                f'<td class=t-container title="{esc(r.get("subject") or "")}">{container}</td>'
+                f"<td class=t-time>{ship_date}</td>"
+                f"<td class=t-status>{what}</td><td>{status}</td>"
                 f"<td>{note}</td><td>{detail}</td></tr>")
     body_rows = "".join(_row(r) for r in rows)
     title_suffix = {"pickup": " &mdash; available for pickup", "exceptions": " &mdash; exceptions only",
@@ -1676,6 +1721,8 @@ def _lookup_order(query):
             "ledger_entries": ledger_entries,
             "history_rows": history_rows, "agent_rows": agent_rows}
 
+LOOKUP_STATUS_PILL = {"waiting": "pill fog", "partial": "pill fog", "shipped": "pill moss"}
+
 def _lookup_html(query=None):
     def esc(v):
         s = "" if v is None else str(v)
@@ -1684,8 +1731,9 @@ def _lookup_html(query=None):
             '<p class=sub>Pulls together everything known about one order from the ledger, '
             'the agent\'s decisions, and the shipment run history -- one place instead of three. '
             'No Acumatica calls; instant either way.</p>'
-            '<form method=get action=/lookup><input type=text name=q placeholder="e.g. SEKU9013424 or 645410" '
-            f'value="{esc(query or "")}" style="min-width:260px"> <button class=fog>Look up</button></form></div>')
+            '<form method=get action=/lookup class=search-row>'
+            f'<input type=text name=q placeholder="e.g. SEKU9013424 or 645410" value="{esc(query or "")}">'
+            '<button class=fog>Look up</button></form></div>')
     if not query:
         return form
     info = _lookup_order(query)
@@ -1695,43 +1743,50 @@ def _lookup_html(query=None):
     # history_rows/agent_rows are only ever populated by a genuine match, so those are
     # the real signal.
     if not info["ledger_entries"] and not info["history_rows"] and not info["agent_rows"]:
-        return form + f'<div class=card><p class=sub>Nothing found for &#8220;{esc(query)}&#8221;.</p></div>'
+        return form + ('<div class=card><div class=empty-state><span class=e-icon>&#128269;</span>'
+                       f'<h3>Nothing found for &#8220;{esc(query)}&#8221;</h3>'
+                       '<p>Check the container number or Master PO, or it may not have come through the agent yet.</p></div></div>')
 
     parts = [form]
-    parts.append('<div class=card><h1 style="font-size:16px">Summary</h1>'
+    parts.append('<div class=card><h2>Summary</h2>'
                  f'<p class=sub>Master PO(s): <b>{esc(", ".join(info["master_tokens"]) or "&mdash;")}</b> '
                  f'&nbsp; Container(s): <b>{esc(", ".join(info["containers_involved"]) or "&mdash;")}</b></p></div>')
 
+    master_cards = []
     for tok in info["master_tokens"]:
         entry = info["ledger_entries"].get(tok)
         if not entry:
             continue
         status_label = {"waiting": "Waiting", "partial": "Partially shipped", "shipped": "Shipped"}.get(
             entry.get("status"), entry.get("status") or "&mdash;")
+        pill_class = LOOKUP_STATUS_PILL.get(entry.get("status"), "pill")
         checked = entry.get("last_checked")
-        cont_rows = "".join(f"<tr><td>{esc(c)}</td><td>{esc(d)}</td></tr>"
+        cont_rows = "".join(f'<tr><td class=mc>{esc(c)}</td><td class=md>{esc(d)}</td></tr>'
                             for c, d in sorted((entry.get("containers") or {}).items(), key=lambda kv: kv[1]))
-        parts.append(f'<div class=card><h1 style="font-size:16px">Master PO {esc(tok)} '
-                     f'<span class=pill style="border-color:#5d7682;color:#5d7682">{status_label}</span></h1>'
-                     f'<p class=sub>{"Last checked live: " + esc(_fmt_ts(checked)) if checked else "Not yet checked live"} '
-                     f'&mdash; <a href="/splits?live=1">refresh live</a></p>'
-                     f'<div class=twrap><table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table></div></div>')
+        master_cards.append(
+            f'<div class=master-card><div class=master-card-head><span class=m-id>{esc(tok)}</span>'
+            f'<span class={pill_class}>{status_label}</span></div>'
+            f'<table class=mini-table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table>'
+            f'<div class=as-of>{"Last checked live: " + esc(_fmt_ts(checked)) if checked else "Not yet checked live"} '
+            f'&mdash; <a href="/splits?live=1">refresh live</a></div></div>')
+    if master_cards:
+        parts.append('<div class=master-grid>%s</div>' % "".join(master_cards))
 
     if info["agent_rows"]:
-        parts.append('<div class=card><h1 style="font-size:16px">Agent decisions</h1>'
+        parts.append('<div class=section-head><h2>Agent decisions</h2></div>'
                      + _agent_log_html(sorted(info["agent_rows"], key=lambda r: r.get("ts", "")), mode="all"))
 
     if info["history_rows"]:
         hrows = sorted(info["history_rows"], key=lambda h: h.get("ts", ""), reverse=True)
         rows_html = "".join(
-            f'<tr><td>{esc(_fmt_ts(h.get("ts")))}</td><td>{esc(h.get("status") or "")}</td>'
-            f'<td>{esc(h.get("containers") or "")}</td>'
+            f'<tr><td class=t-time>{esc(_fmt_ts(h.get("ts")))}</td><td>{esc(h.get("status") or "")}</td>'
+            f'<td class=t-container>{esc(h.get("containers") or "")}</td>'
             f'<td>{esc(", ".join(sorted({o.get("po") for o in (h.get("orders") or []) if o.get("po")})))}</td>'
             f'<td>{esc(", ".join(sorted({o.get("shipment_nbr") for o in (h.get("orders") or []) if o.get("shipment_nbr")})))}</td></tr>'
             for h in hrows)
-        parts.append('<div class=card><h1 style="font-size:16px">Shipment run history</h1>'
+        parts.append('<div class=section-head><h2>Shipment run history</h2></div>'
                      '<div class=twrap><table><tr><th>When</th><th>Status</th><th>Containers</th>'
-                     f'<th>Master PO(s)</th><th>Shipment(s)</th></tr>{rows_html}</table></div></div>')
+                     f'<th>Master PO(s)</th><th>Shipment(s)</th></tr>{rows_html}</table></div>')
     return "".join(parts)
 
 # ---------------- process a handover PDF ----------------
@@ -2284,7 +2339,10 @@ def _splits_html(limit=10, live=False):
         s = "" if v is None else str(v)
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     if not active:
-        body = '<p class=sub>No orders currently split across multiple containers.</p>'
+        body = ('<div class=card><div class=empty-state><span class=e-icon>&#10003;</span>'
+                '<h3>Nothing waiting on a split right now</h3>'
+                '<p>Every order with more than one container has shipped. New splits will show up here automatically.</p>'
+                '</div></div>')
     else:
         ordered = sorted(active.items(), key=lambda kv: kv[1].get("first_seen") or "")
         shown, hidden = ordered[:limit], ordered[limit:]
@@ -2297,23 +2355,22 @@ def _splits_html(limit=10, live=False):
             except Exception as e:
                 # One master's data shouldn't be able to take the whole page down --
                 # show what broke for this one and keep going.
-                cards.append('<div class=card><h1 style="font-size:16px">Master %s</h1>'
-                              '<p class=sub style="color:#b06a5a">Could not load: %s</p></div>'
+                cards.append('<div class=group-card><h3>Master %s</h3>'
+                              '<p class=sub style="color:var(--rust)">Could not load: %s</p></div>'
                               % (esc(tok), esc(str(e))))
         body = "".join(cards)
         if hidden:
             body += ('<p class=sub>%d more, oldest-waiting-first shown above -- '
                       '<a href="/splits?live=%s&limit=%d">show all %d</a>.</p>'
                       % (len(hidden), "1" if live else "0", len(ordered), len(ordered)))
-    toggle = ('<a class=pill href="/splits?live=1">Refresh live status</a>' if not live
+    toggle = ('<a class="pill fog" href="/splits?live=1">Refresh live status</a>' if not live
               else '<a class=pill href="/splits">Back to cached view</a>')
     freshness = ("Showing live status, just checked against Acumatica." if live else
                  "Showing the last-known status from previous checks -- no Acumatica calls made "
                  "just to view this page.")
-    return ('<div class=card><h1 style="font-size:18px">Orders split across containers</h1>'
-            '<p class=sub>Orders currently waiting on more than one container before they can ship. '
-            '%s</p><p>%s</p></div>'
-            % (freshness, toggle)
+    return ('<div class=section-head><h1 style="font-size:20px">Orders split across containers</h1>%s</div>'
+            '<p class=section-sub>Master POs currently waiting on more than one container before they can ship. %s</p>'
+            % (toggle, freshness)
             + body)
 
 def _split_order_card(tok, entry, esc, live=False):
@@ -2321,41 +2378,40 @@ def _split_order_card(tok, entry, esc, live=False):
     card (bad/unexpected data for that master) can be caught and shown inline without
     taking down the rest of the page. live=False (the default) makes ZERO Acumatica
     calls -- everything comes straight from the ledger entry."""
+    status_label = "Partially shipped" if entry.get("status") == "partial" else "Waiting"
+    pill_class = "pill fog"
     if not live:
         cont_rows = "".join(
-            f"<tr><td>{esc(c)}</td><td>{esc(d)}</td></tr>"
+            f"<tr><td class=mc>{esc(c)}</td><td class=md>{esc(d)}</td></tr>"
             for c, d in sorted(entry.get("containers", {}).items(), key=lambda kv: kv[1]))
-        status_label = "Partially shipped" if entry.get("status") == "partial" else "Waiting"
         checked = entry.get("last_checked")
         checked_note = (f"Purchase order status as of last check ({esc(_fmt_ts(checked))}) -- "
                         f'<a href="/splits?live=1">refresh live</a> for current status.') if checked else \
                        'Purchase order status not yet checked live -- <a href="/splits?live=1">refresh live</a> to check now.'
         return (
-            f'<div class=card><h1 style="font-size:16px">Master PO {esc(tok)} '
-            f'<span class=pill style="border-color:#5d7682;color:#5d7682">{status_label}</span></h1>'
-            f'<p class=sub>Containers seen so far, in order of pickup date:</p>'
-            f'<div class=twrap><table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table></div>'
-            f'<p class=sub>{checked_note}</p></div>')
+            f'<div class=group-card><div class=group-card-head><h3>Master PO {esc(tok)}</h3>'
+            f'<span class={pill_class}>{status_label}</span></div>'
+            f'<table class=mini-table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table>'
+            f'<div class=as-of>{checked_note}</div></div>')
     info = split_order_status(tok, entry)
     cont_rows = "".join(
-        f"<tr><td>{esc(c)}</td><td>{esc(d)}</td></tr>"
+        f"<tr><td class=mc>{esc(c)}</td><td class=md>{esc(d)}</td></tr>"
         for c, d in sorted(info["containers"].items(), key=lambda kv: kv[1]))
     po_rows = "".join(
-        f"<tr><td>{esc(p['po'])}</td><td>{'&#10003; Received in full' if p['complete'] else '&#9678; ' + esc(p['status'])}</td></tr>"
+        f"<tr><td class=mc>{esc(p['po'])}</td><td class=md>{'&#10003; Received in full' if p['complete'] else '&#9678; ' + esc(p['status'])}</td></tr>"
         for p in info["purchase_orders"]) or "<tr><td colspan=2 class=sub>Could not resolve a Purchase Order</td></tr>"
     order_rows = "".join(
-        f"<tr><td>{esc(o['order'])}</td><td>{esc(o.get('cust_order') or '')}</td><td>{esc(o['stage'])}</td></tr>"
+        f"<tr><td class=mc>{esc(o['order'])}</td><td>{esc(o.get('cust_order') or '')}</td><td class=md>{esc(o['stage'])}</td></tr>"
         for o in info["orders"]) or "<tr><td colspan=3 class=sub>No open sales order matched</td></tr>"
-    status_label = "Partially shipped" if entry.get("status") == "partial" else "Waiting"
     return (
-        f'<div class=card><h1 style="font-size:16px">Master PO {esc(tok)} '
-        f'<span class=pill style="border-color:#5d7682;color:#5d7682">{status_label}</span></h1>'
+        f'<div class=group-card><div class=group-card-head><h3>Master PO {esc(tok)}</h3>'
+        f'<span class={pill_class}>{status_label}</span></div>'
         f'<p class=sub>Containers seen so far, in order of pickup date:</p>'
-        f'<div class=twrap><table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table></div>'
-        f'<p class=sub>Underlying Purchase Order(s) -- ALL must be fully received before this ships:</p>'
-        f'<div class=twrap><table><tr><th>Purchase Order</th><th>Status</th></tr>{po_rows}</table></div>'
-        f'<p class=sub>Matched Sales Order(s):</p>'
-        f'<div class=twrap><table><tr><th>Order</th><th>Customer order #</th><th>Stage</th></tr>{order_rows}</table></div>'
+        f'<table class=mini-table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table>'
+        f'<p class=sub style="margin-top:14px">Underlying Purchase Order(s) &mdash; ALL must be fully received before this ships:</p>'
+        f'<table class=mini-table><tr><th>Purchase Order</th><th>Status</th></tr>{po_rows}</table>'
+        f'<p class=sub style="margin-top:14px">Matched Sales Order(s):</p>'
+        f'<table class=mini-table><tr><th>Order</th><th>Customer order #</th><th>Stage</th></tr>{order_rows}</table>'
         f'</div>')
 
 def _identity_probe():
@@ -2594,21 +2650,204 @@ def valid_session(val):
     return hmac.compare_digest(sig, good) and tok in SESSIONS
 
 CSS = """
-:root{--sand:#efece3;--taupe:#7d7363;--stone:#4a4640;--fog:#5d7682;--line:#c9c0ad}
-*{box-sizing:border-box;font-family:Arial,Helvetica,sans-serif}
-body{margin:0;background:var(--sand);color:var(--stone)}
-.wrap{max-width:960px;margin:0 auto;padding:28px}
-.card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:22px;margin-bottom:18px}
-h1{font-size:22px;margin:0 0 4px}.sub{color:var(--taupe);font-size:13px;margin:0 0 16px}
+:root{
+  --sand:#efece3; --paper:#fbf9f5; --stone:#38352f; --taupe:#7d7363;
+  --line:#ddd5c4; --line-strong:#c9c0ad;
+  --fog:#5d7682; --fog-bg:#e9f0f1; --fog-bg-strong:#dbe8ea;
+  --moss:#5a7d5a; --moss-bg:#eaf1e7; --moss-bg-strong:#d9e8d3;
+  --rust:#b0653a; --rust-bg:#f9ece3; --rust-bg-strong:#f3dbc9;
+  --neutral-bg:#f1efe9;
+  --font-display:"Segoe UI Variable Display","Segoe UI",-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif;
+  --font-body:"Segoe UI Variable Text","Segoe UI",-apple-system,BlinkMacSystemFont,Arial,sans-serif;
+  --font-mono:"Cascadia Code","SF Mono",ui-monospace,Consolas,"Courier New",monospace;
+  --shadow-card: 0 1px 2px rgba(56,53,47,.04), 0 1px 8px rgba(56,53,47,.03);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --sand:#1c1a17; --paper:#252220; --stone:#ece7dd; --taupe:#b6ab97;
+    --line:#3c372f; --line-strong:#4a4438;
+    --fog:#8bacb8; --fog-bg:#20282a; --fog-bg-strong:#28353a;
+    --moss:#8fb383; --moss-bg:#1f2a1e; --moss-bg-strong:#26351f;
+    --rust:#e0956c; --rust-bg:#2c2119; --rust-bg-strong:#3a291d;
+    --neutral-bg:#252220;
+    --shadow-card: 0 1px 2px rgba(0,0,0,.25), 0 1px 10px rgba(0,0,0,.2);
+  }
+}
+:root[data-theme="dark"]{
+  --sand:#1c1a17; --paper:#252220; --stone:#ece7dd; --taupe:#b6ab97;
+  --line:#3c372f; --line-strong:#4a4438;
+  --fog:#8bacb8; --fog-bg:#20282a; --fog-bg-strong:#28353a;
+  --moss:#8fb383; --moss-bg:#1f2a1e; --moss-bg-strong:#26351f;
+  --rust:#e0956c; --rust-bg:#2c2119; --rust-bg-strong:#3a291d;
+  --neutral-bg:#252220;
+  --shadow-card: 0 1px 2px rgba(0,0,0,.25), 0 1px 10px rgba(0,0,0,.2);
+}
+:root[data-theme="light"]{
+  --sand:#efece3; --paper:#fbf9f5; --stone:#38352f; --taupe:#7d7363;
+  --line:#ddd5c4; --line-strong:#c9c0ad;
+  --fog:#5d7682; --fog-bg:#e9f0f1; --fog-bg-strong:#dbe8ea;
+  --moss:#5a7d5a; --moss-bg:#eaf1e7; --moss-bg-strong:#d9e8d3;
+  --rust:#b0653a; --rust-bg:#f9ece3; --rust-bg-strong:#f3dbc9;
+  --neutral-bg:#f1efe9;
+  --shadow-card: 0 1px 2px rgba(56,53,47,.04), 0 1px 8px rgba(56,53,47,.03);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--sand);color:var(--stone);font-family:var(--font-body);-webkit-font-smoothing:antialiased}
+.wrap{max-width:1180px;margin:0 auto;padding:28px}
+.card{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:22px 24px;margin-bottom:18px;box-shadow:var(--shadow-card)}
+h1{font:600 22px var(--font-display);letter-spacing:-.01em;margin:0 0 4px}
+.sub{color:var(--taupe);font-size:13px;margin:0 0 16px;line-height:1.5}
 .brand{letter-spacing:.18em;color:var(--taupe);font-weight:700;font-size:12px}
-button{background:var(--stone);color:#fff;border:0;border-radius:8px;padding:10px 16px;cursor:pointer;font-size:14px}
-button.fog{background:var(--fog)}button:disabled{opacity:.5}
-input[type=file],input[type=date],input[type=password],input[type=text]{padding:9px;border:1px solid var(--line);border-radius:8px;background:#faf8f4;width:100%}
-table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line)}
-.twrap{overflow-x:auto}
-.dot{display:inline-block;width:9px;height:9px;border-radius:50%}.ok{background:#5a7d5a}.flag{background:#b06a5a}
-a{color:var(--fog)}.pill{background:var(--sand);border:1px solid var(--line);border-radius:14px;padding:2px 10px;font-size:12px;margin:0 6px 6px 0;display:inline-block}
-pre{background:#2b2b2b;color:#d7d2c6;padding:14px;border-radius:8px;overflow:auto;font-size:12px}
+button{background:var(--stone);color:var(--paper);border:0;border-radius:8px;padding:10px 16px;cursor:pointer;font:600 14px var(--font-body)}
+button.fog{background:var(--fog)}button:hover{opacity:.9}button:disabled{opacity:.5}
+input[type=file],input[type=date],input[type=password],input[type=text]{padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:var(--sand);color:var(--stone);width:100%;font:13px var(--font-body)}
+input:focus-visible,button:focus-visible,a:focus-visible{outline:2px solid var(--fog);outline-offset:1px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:11px 14px;border-bottom:1px solid var(--line)}
+th{font:600 11px var(--font-body);letter-spacing:.05em;text-transform:uppercase;color:var(--taupe)}
+tbody tr:hover{background:var(--neutral-bg)}
+.twrap{overflow-x:auto;background:var(--paper);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow-card)}
+.twrap table{margin:0}.twrap table tr:last-child td{border-bottom:none}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%}.ok{background:var(--moss)}.flag{background:var(--rust)}
+a{color:var(--fog);text-decoration:none}a:hover{text-decoration:underline}
+.pill{background:var(--neutral-bg);color:var(--taupe);border-radius:20px;padding:5px 12px;font:600 12px var(--font-body);
+  margin:0 6px 6px 0;display:inline-flex;align-items:center;gap:5px;white-space:nowrap;text-decoration:none}
+a.pill:hover{background:var(--line);text-decoration:none}
+.pill.moss{background:var(--moss-bg);color:var(--moss)}
+.pill.rust{background:var(--rust-bg);color:var(--rust)}
+.pill.fog{background:var(--fog-bg);color:var(--fog)}
+pre{background:#2b2b2b;color:#d7d2c6;padding:14px;border-radius:8px;overflow:auto;font:12px/1.6 var(--font-mono)}
+code{font-family:var(--font-mono)}
+
+/* ---- shared site header ---- */
+header.site-head{background:var(--paper);border-bottom:1px solid var(--line);margin-bottom:24px}
+.head-inner{max-width:1180px;margin:0 auto;padding:18px 28px}
+.head-top{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:14px}
+.brand-block{display:flex;flex-direction:column;gap:2px}
+.eyebrow{font:600 11px/1 var(--font-body);letter-spacing:.16em;text-transform:uppercase;color:var(--taupe)}
+h1.title{font:600 24px/1.15 var(--font-display);letter-spacing:-.01em;margin:2px 0 0}
+.account-chip{display:flex;align-items:center;gap:10px;font:13px var(--font-body);color:var(--taupe);flex-wrap:wrap}
+.account-chip .dot{width:7px;height:7px;flex-shrink:0}
+.account-chip b{color:var(--stone);font-weight:600}
+nav.pillnav{display:flex;flex-wrap:wrap;gap:8px}
+nav.pillnav a{font:500 13px var(--font-body);color:var(--stone);text-decoration:none;
+  padding:7px 13px;border:1px solid var(--line);border-radius:20px;background:var(--sand);
+  transition:border-color .12s,background .12s}
+nav.pillnav a:hover{border-color:var(--line-strong);background:var(--neutral-bg);text-decoration:none}
+nav.pillnav a.current{background:var(--stone);color:var(--paper);border-color:var(--stone)}
+
+/* ---- KPI band ---- */
+.kpi-band{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px}
+.kpi{position:relative;background:var(--paper);border:1px solid var(--line);border-radius:14px;
+  padding:20px 20px 18px;box-shadow:var(--shadow-card);overflow:hidden}
+.kpi::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px}
+.kpi.moss::before{background:var(--moss)} .kpi.rust::before{background:var(--rust)}
+.kpi.fog::before{background:var(--fog)} .kpi.neutral::before{background:var(--line-strong)}
+.kpi-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.kpi-label{font:600 12.5px var(--font-body);letter-spacing:.02em;color:var(--taupe)}
+.kpi-icon{width:26px;height:26px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0}
+.kpi.moss .kpi-icon{background:var(--moss-bg);color:var(--moss)}
+.kpi.rust .kpi-icon{background:var(--rust-bg);color:var(--rust)}
+.kpi.fog .kpi-icon{background:var(--fog-bg);color:var(--fog)}
+.kpi.neutral .kpi-icon{background:var(--neutral-bg);color:var(--taupe)}
+.kpi-num{font:600 38px/1 var(--font-mono);letter-spacing:-.02em;font-variant-numeric:tabular-nums;color:var(--stone)}
+.kpi-sub{font:400 12.5px var(--font-body);color:var(--taupe);margin-top:6px;line-height:1.4}
+.kpi-sub b{color:var(--stone);font-weight:600}
+@media (max-width:900px){.kpi-band{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:600px){.kpi-band{grid-template-columns:1fr}}
+
+/* ---- at-a-glance strip ---- */
+.glance{display:flex;align-items:center;flex-wrap:wrap;gap:10px 22px;background:var(--paper);
+  border:1px solid var(--line);border-radius:12px;padding:13px 20px;margin-bottom:26px;font-size:13px;box-shadow:var(--shadow-card)}
+.glance .g-item{display:flex;align-items:center;gap:7px;color:var(--taupe)}
+.glance .g-item b{color:var(--stone);font:600 13px var(--font-mono);font-variant-numeric:tabular-nums}
+.mode-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.glance .divider{width:1px;height:16px;background:var(--line)}
+.glance .split-chip{margin-left:auto}
+
+.class-row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:28px}
+.class-chip{display:flex;align-items:center;gap:8px;font:500 12.5px var(--font-body);
+  background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:8px 13px}
+.class-chip .n{font:600 13px var(--font-mono);font-variant-numeric:tabular-nums;color:var(--stone)}
+.class-chip .swatch{width:8px;height:8px;border-radius:2px;display:inline-block}
+
+.section-head{display:flex;align-items:baseline;justify-content:space-between;margin:0 0 4px;gap:12px;flex-wrap:wrap}
+.section-head h1,.section-head h2{margin:0}
+.section-sub{font:400 12.5px var(--font-body);color:var(--taupe);margin:0 0 16px;max-width:70ch;line-height:1.5}
+.section-sub b{color:var(--stone);font-weight:600}
+
+/* ---- decision-log severity rows ---- */
+tbody tr.row-moss,tbody tr.row-rust,tbody tr.row-neutral,tbody tr.row-fog{position:relative}
+tbody tr.row-moss::before,tbody tr.row-rust::before,tbody tr.row-neutral::before,tbody tr.row-fog::before{
+  content:"";position:absolute;left:0;top:0;bottom:0;width:3px}
+tbody tr.row-moss::before{background:var(--moss)} tbody tr.row-rust::before{background:var(--rust)}
+tbody tr.row-neutral::before{background:var(--line-strong)} tbody tr.row-fog::before{background:var(--fog)}
+.t-time{font:400 12.5px var(--font-mono);color:var(--taupe);white-space:nowrap;font-variant-numeric:tabular-nums}
+.t-container{font:600 13px var(--font-mono);color:var(--stone);letter-spacing:.01em}
+.t-status{color:var(--stone)}
+.status-sub{display:block;color:var(--taupe);font-weight:400;font-size:12px;margin-top:2px}
+
+/* ---- lookup ---- */
+.search-row{display:flex;gap:10px}
+.search-row input{flex:1}
+
+/* ---- master/group cards (lookup, splits) ---- */
+.master-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;margin-bottom:22px}
+.master-card,.group-card{background:var(--paper);border:1px solid var(--line);border-radius:12px;
+  padding:16px 18px;box-shadow:var(--shadow-card);margin-bottom:16px}
+.master-card-head,.group-card-head{display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:12px;flex-wrap:wrap;gap:8px}
+.master-card-head .m-id,.group-card-head h3{font:600 15px var(--font-mono);color:var(--stone);margin:0}
+.mini-table{width:100%;border-collapse:collapse;font-size:12.5px}
+.mini-table th{padding:6px 0;border-bottom:1px solid var(--line);font-size:10.5px}
+.mini-table td{padding:6px 0;border-bottom:1px solid var(--line)}
+.mini-table tr:last-child td{border-bottom:none}
+.mini-table .mc{font-family:var(--font-mono);color:var(--stone)}
+.mini-table .md{font-family:var(--font-mono);color:var(--taupe);text-align:right;font-variant-numeric:tabular-nums}
+.member-row{display:flex;align-items:center;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--line);gap:12px;flex-wrap:wrap}
+.member-row:last-child{border-bottom:none}
+.member-row .m-po{font:600 13px var(--font-mono);color:var(--stone);min-width:70px}
+.member-row .m-containers{font-size:12px;color:var(--taupe);flex:1;font-family:var(--font-mono)}
+.as-of{font-size:12px;color:var(--taupe);margin-top:12px}
+
+/* ---- empty state ---- */
+.empty-state{display:flex;flex-direction:column;align-items:center;text-align:center;padding:40px 24px;color:var(--taupe)}
+.empty-state .e-icon{width:40px;height:40px;border-radius:12px;background:var(--neutral-bg);color:var(--taupe);
+  display:flex;align-items:center;justify-content:center;font-size:18px;margin-bottom:12px}
+.empty-state h3{font:600 14px var(--font-body);color:var(--stone);margin:0 0 4px}
+.empty-state p{font-size:12.5px;margin:0;max-width:40ch;line-height:1.5}
+
+/* ---- diagnostics ---- */
+.status-strip{display:flex;align-items:center;gap:18px;flex-wrap:wrap;background:var(--paper);
+  border:1px solid var(--line);border-radius:12px;padding:12px 18px;margin-bottom:22px;font-size:13px;box-shadow:var(--shadow-card)}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--moss);flex-shrink:0}
+.status-strip .s-item{display:flex;align-items:center;gap:7px;color:var(--taupe)}
+.status-strip .s-item b{color:var(--stone);font-weight:600}
+.status-strip .divider{width:1px;height:14px;background:var(--line)}
+.probe-fields{display:grid;grid-template-columns:repeat(3,1fr) auto;gap:10px;align-items:end}
+.field label{display:block;font:600 11px var(--font-body);letter-spacing:.03em;text-transform:uppercase;color:var(--taupe);margin-bottom:6px}
+.field input{font-family:var(--font-mono)}
+.result-card{border-left:4px solid var(--fog)}
+.result-head{display:flex;align-items:center;gap:10px;margin-bottom:16px}
+.result-head .r-icon{width:28px;height:28px;border-radius:8px;background:var(--fog-bg);color:var(--fog);
+  display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0}
+.kv-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px;margin-bottom:18px}
+.kv-grid .kv label{display:block;font:600 10.5px var(--font-body);letter-spacing:.04em;text-transform:uppercase;color:var(--taupe);margin-bottom:4px}
+.kv-grid .kv .v{font:600 15px var(--font-mono);color:var(--stone);font-variant-numeric:tabular-nums}
+.field-label{display:block;font:600 10.5px var(--font-body);letter-spacing:.04em;text-transform:uppercase;color:var(--taupe);margin-bottom:8px}
+.chip-wrap{display:flex;flex-wrap:wrap;gap:6px}
+.chip{font:600 12px var(--font-mono);background:var(--fog-bg);color:var(--fog);padding:4px 10px;border-radius:6px}
+details.section-acc{background:var(--paper);border:1px solid var(--line);border-radius:12px;margin-bottom:12px;box-shadow:var(--shadow-card);overflow:hidden}
+details.section-acc summary{list-style:none;cursor:pointer;padding:15px 20px;display:flex;align-items:center;
+  justify-content:space-between;font:600 13px var(--font-body);color:var(--stone)}
+details.section-acc summary::-webkit-details-marker{display:none}
+details.section-acc summary .acc-meta{font:400 12px var(--font-body);color:var(--taupe);font-weight:400}
+details.section-acc summary::after{content:"\\2304";color:var(--taupe);font-size:14px;transition:transform .15s}
+details.section-acc[open] summary::after{transform:rotate(180deg)}
+details.section-acc summary:focus-visible{outline:2px solid var(--fog);outline-offset:-2px}
+.acc-body{padding:0 20px 18px;font-size:12.5px;color:var(--taupe);line-height:1.6}
+.acc-body ul{margin:6px 0 14px;padding-left:18px}
+.section-label{font:600 11px var(--font-body);letter-spacing:.1em;text-transform:uppercase;color:var(--taupe);margin:26px 0 10px}
 """
 
 # ---- Personalized browser-tab icons (Sand + Fog stone/fog palette). Base64 data-URI
@@ -2631,39 +2870,141 @@ LOGIN = """<!doctype html><meta charset=utf-8><title>Sign in</title>%s<style>%s
 <p><input type=password name=pw placeholder="Password"></p>
 <button>Sign in</button></form></div></div>""" % (SHIP_FAVICON, CSS)
 
-def page(body, favicon=None):
+NAV_ITEMS = [
+    ("dashboard", "/", "Dashboard"),
+    ("lookup", "/lookup", "Look up"),
+    ("splits", "/splits", "Split orders"),
+    ("manual", "/manual", "Manual upload"),
+    ("guide", "/guide", "Guide"),
+    ("history", "/history", "Shipment history"),
+    ("diag", "/diag", "Diagnostics"),
+]
+
+def page(body, favicon=None, current=None):
     favicon = favicon or SHIP_FAVICON
     connected = bool(access_token())
     if connected:
         u = (connected_user() or "").replace("<", "").replace(">", "")
         exp = os.environ.get("EXPECTED_ACU_USER", "").strip()
         if exp and u and exp.lower() not in u.lower():
-            badge = ('<span class=pill style="border-color:#b0653a;color:#b0653a">&#9888; Connected as %s &mdash; expected %s</span>'
-                     ' <a class=pill href=/connect>Switch account</a>' % (u, exp))
+            account = ('<span class=dot style="background:var(--rust)"></span> '
+                       '<span style="color:var(--rust)">&#9888; Connected as <b>%s</b> &mdash; expected %s</span>'
+                       ' &middot; <a href=/connect>Switch account</a>' % (u, exp))
         elif not u:
             # Detection failed (or the token predates requesting the openid/profile scope) --
             # warn loudly rather than showing a calm green "Connected" that implies verified.
             # Every write on this service runs as whoever is ACTUALLY logged in regardless of
             # what this banner says, so an unverifiable identity must not look fine.
-            badge = ('<span class=pill style="border-color:#b0653a;color:#b0653a">'
-                     '&#9888; Connected &mdash; user identity unknown, verify manually before any write</span>'
-                     ' <a class=pill href=/connect>Switch account</a>')
+            account = ('<span class=dot style="background:var(--rust)"></span> '
+                       '<span style="color:var(--rust)">&#9888; Connected &mdash; user identity unknown, '
+                       'verify manually before any write</span> &middot; <a href=/connect>Switch account</a>')
         else:
-            badge = ('<span class=pill style="border-color:#5a7d5a">Connected as %s</span>'
-                     ' <a class=pill href=/connect>Switch account</a>' % u)
+            account = ('<span class=dot style="background:var(--moss)"></span> Connected as <b>%s</b>'
+                       ' &middot; <a href=/connect>Switch account</a>' % u)
     else:
-        badge = '<a class=pill href=/connect>Connect to Acumatica</a>'
+        account = '<a href=/connect>Connect to Acumatica</a>'
+    nav = "".join('<a href="%s"%s>%s</a>' % (href, ' class=current' if key == current else '', label)
+                  for key, href, label in NAV_ITEMS)
     return """<!doctype html><meta charset=utf-8><title>POE Shipment Agent</title>%s<style>%s</style>
-<div class=wrap><div class=brand>SAND + FOG</div><h1>POE Shipment Agent</h1>
-<p class=sub>%s &nbsp; <a class=pill href=/>Dashboard</a> <a class=pill href=/lookup>Look up</a> <a class=pill href=/splits>Split orders</a> <a class=pill href=/manual>Manual upload</a> <a class=pill href=/guide>Guide</a> <a class=pill href=/history>Shipment history</a> <a class=pill href=/diag>Diagnostics</a></p>
-%s</div>""" % (favicon, CSS, badge, body)
+<header class=site-head><div class=head-inner>
+<div class=head-top><div class=brand-block><span class=eyebrow>Sand + Fog</span><h1 class=title>POE Shipment Agent</h1></div>
+<div class=account-chip>%s</div></div>
+<nav class=pillnav>%s</nav>
+</div></header>
+<main class=wrap>%s</main>""" % (favicon, CSS, account, nav, body)
+
+def _diag_html(d, sample_po, sample_container, sample_receipt):
+    """Diagnostics page -- diagnostics() always runs a large batch of schema/health probes
+    (identity, rate-limit headers, field-name discovery, receipt-loading coverage checks)
+    on every call, regardless of what was searched for. Previously this whole dict, dozens
+    of fields deep, was dumped as one raw <pre>json.dumps(...)</pre> block -- Parker's
+    words: 'the diagnostics tab has too much data in it.' This surfaces a readable summary
+    for whatever was actually searched, and tucks the schema/raw-JSON bulk into collapsed
+    <details> sections instead of showing it all up front."""
+    def esc(v):
+        s = "" if v is None else str(v)
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    status_strip = ('<div class=status-strip>'
+        '<div class=s-item><span class=status-dot style="background:%s"></span> %s</div>'
+        '<div class=divider></div><div class=s-item>Tenant <b>%s</b></div>'
+        '<div class=divider></div><div class=s-item>Warehouse <b>%s</b></div>'
+        '<div class=divider></div><div class=s-item>API rate limit <b>%s</b></div></div>'
+        % ("var(--moss)" if d.get("connected") else "var(--rust)",
+           "Connected to Acumatica" if d.get("connected") else "Not connected",
+           esc(d.get("tenant")), esc(d.get("warehouse")),
+           "no warnings" if not d.get("rate_limit_headers_found") else
+           f"{len(d['rate_limit_headers_found'])} header(s) found -- see raw data below"))
+
+    form = ('<div class=card><h2>Test a specific container or PO</h2>'
+            '<p class=sub>Look up exactly what Acumatica returns for one thing, without digging through raw exports.</p>'
+            '<form method=get action=/diag><div class=probe-fields>'
+            f'<div class=field><label>PO&nbsp;#</label><input type=text name=po placeholder="e.g. 117256" value="{esc(sample_po or "")}"></div>'
+            f'<div class=field><label>Container</label><input type=text name=container placeholder="e.g. FBIU5261330" value="{esc(sample_container or "")}"></div>'
+            f'<div class=field><label>Receipt</label><input type=text name=receipt placeholder="e.g. 007068" value="{esc(sample_receipt or "")}"></div>'
+            '<button class=fog>Run</button></div></form></div>')
+
+    result = ""
+    if sample_container and d.get("sample_container_receipts") is not None:
+        receipts = d.get("sample_container_receipts") or []
+        masters = d.get("sample_container_resolved_pos") or []
+        chips = "".join(f'<span class=chip>{esc(m)}</span>' for m in masters) or '<span class=sub>none found</span>'
+        rows = "".join(
+            '<tr><td>%s</td><td>%s</td><td>%s</td></tr>' % (
+                esc(r.get("receipt_nbr")), esc(r.get("vendor_ref")),
+                esc(", ".join(c for c in (r.get("containers") or []) if c != sample_container.strip().upper())))
+            for r in receipts)
+        result = ('<div class="card result-card"><div class=result-head><span class=r-icon>&#128230;</span>'
+            f'<div><h2>Container {esc(sample_container)}</h2>'
+            f'<div class=sub style="margin:2px 0 0">Found on {len(receipts)} purchase receipt(s)</div></div></div>'
+            f'<div class=kv-grid><div class=kv><label>Master POs found</label><div class=v>{len(masters)}</div></div>'
+            f'<div class=kv><label>Receipts checked</label><div class=v>{len(receipts)}</div></div>'
+            f'<div class=kv><label>Field used</label><div class=v style="font-size:13px">{esc(d.get("receipt_container_field"))}</div></div></div>'
+            f'<span class=field-label>Resolves to</span><div class=chip-wrap style="margin-bottom:20px">{chips}</div>'
+            '<span class=field-label>Receipts</span><div class=twrap><table class=diag-table>'
+            '<thead><tr><th>Receipt</th><th>Vendor ref</th><th>Other containers on this receipt</th></tr></thead>'
+            f'<tbody>{rows or "<tr><td colspan=3 class=sub>No matching receipts.</td></tr>"}</tbody></table></div></div>')
+    elif sample_po and d.get("po_completeness_probe") is not None:
+        probe = d.get("po_completeness_probe") or {}
+        matches = d.get("open_matches") or []
+        result = ('<div class="card result-card"><div class=result-head><span class=r-icon>&#128196;</span>'
+            f'<div><h2>Master PO {esc(sample_po)}</h2>'
+            f'<div class=sub style="margin:2px 0 0">Resolved to internal PO(s) {esc(", ".join(probe.get("distinct_po_order_nbrs_across_receipts") or []) or "none")}</div></div></div>'
+            f'<div class=kv-grid><div class=kv><label>Open sales orders</label><div class=v>{len(matches)}</div></div>'
+            f'<div class=kv><label>Receipts checked</label><div class=v>{len(probe.get("receipts_checked") or [])}</div></div>'
+            f'<div class=kv><label>PO status</label><div class=v style="font-size:13px">{esc(probe.get("po_status") or "&mdash;")}</div></div></div></div>')
+    elif sample_receipt and d.get("sample_receipt_raw") is not None:
+        raw = d.get("sample_receipt_raw") or {}
+        result = ('<div class="card result-card"><div class=result-head><span class=r-icon>&#128203;</span>'
+            f'<div><h2>Receipt {esc(sample_receipt)}</h2></div></div>'
+            f'<pre class=raw-json>{esc(json.dumps(raw, indent=2))}</pre></div>')
+
+    reference = ('<details class=section-acc><summary>Field reference'
+        '<span class=acc-meta>Sales Order, Shipment, Purchase Receipt columns</span></summary>'
+        '<div class=acc-body>Rarely needed &mdash; useful if a lookup starts behaving oddly and you want to '
+        f'check what a field is actually called in Acumatica.<ul>'
+        f'<li><code>Sales Order</code>: {esc(", ".join(d.get("so_keys") or []) or "unavailable")}</li>'
+        f'<li><code>Shipment</code>: {esc(", ".join(d.get("shipment_keys") or []) or "unavailable")}</li>'
+        f'<li><code>Purchase Receipt</code>: {esc(", ".join(d.get("receipt_standard_keys") or []) or "unavailable")}</li>'
+        '</ul></div></details>')
+
+    raw_json = ('<details class=section-acc><summary>Full raw response'
+        '<span class=acc-meta>everything above, unformatted</span></summary>'
+        f'<div class=acc-body><pre class=raw-json>{esc(json.dumps(d, indent=2))}</pre></div></details>')
+
+    return (status_strip + form + result
+            + '<div class=section-label>Reference &amp; raw data</div>' + reference + raw_json)
 
 def _dashboard_html():
-    """Agent dashboard -- the default landing page. Health/rollup stats up top (the same
-    agent_summary() the daily email digest already computes), then the most recent
-    decisions inline, so a glance here is enough for day-to-day monitoring. The manual
-    PDF-upload tool (the old default landing page) moved to /manual -- still there as a
-    fallback, just no longer the front door now that the agent handles the common case."""
+    """Agent dashboard -- the default landing page. Big KPI tiles up top (shipped/needs
+    review/waiting/no action -- the same agent_summary() the daily email digest already
+    computes), then the most recent decisions inline, so a glance here is enough for
+    day-to-day monitoring. The manual PDF-upload tool (the old default landing page) moved
+    to /manual -- still there as a fallback, just no longer the front door now that the
+    agent handles the common case."""
+    def esc(v):
+        s = "" if v is None else str(v)
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     s = agent_summary(hours=24)
     # Pickup-only by default (2026-07-27, Parker's request): the routine NRT status noise
     # (Scheduled/Picked up/Empty-returned, non-NRT mail, skipped/ambiguous) was cluttering
@@ -2671,9 +3012,8 @@ def _dashboard_html():
     # agent_log_read()'s docstring. Full history remains one click away via /agent/log?all=1.
     recent = agent_log_read(limit=15, pickup_only=True)
 
-    mode_color = {"live": "#5a7d5a", "shadow": "#7d7363", "mixed": "#b0653a", "n/a": "#c9c0ad"}
-    mode_pill = ('<span class=pill style="border-color:%s">%s</span>'
-                 % (mode_color.get(s["mode"], "#c9c0ad"), s["mode"]))
+    mode_class = {"live": "moss", "shadow": "", "mixed": "rust", "n/a": ""}.get(s["mode"], "")
+    mode_pill = '<span class="pill %s">%s</span>' % (mode_class, esc(s["mode"]))
 
     # Same dead-man's-switch signal the daily digest email relies on, surfaced here too so
     # a glance at the dashboard catches a stuck/stopped agent without waiting for 7am.
@@ -2682,44 +3022,77 @@ def _dashboard_html():
         try:
             age_h = (time.time() - time.mktime(time.strptime(s["last_decision_at"], "%Y-%m-%d %H:%M:%S"))) / 3600
             if age_h > 6:
-                warn = ('<p class=sub style="color:#b06a5a">&#9888; Last decision was %.0fh ago &mdash; '
+                warn = ('<p class=sub style="color:var(--rust)">&#9888; Last decision was %.0fh ago &mdash; '
                         'check the agent is still running (Render cron logs).</p>' % age_h)
         except Exception:
             pass
     elif s["decisions"] == 0:
-        warn = '<p class=sub style="color:#b06a5a">&#9888; No decisions logged in the last 24h.</p>'
+        warn = '<p class=sub style="color:var(--rust)">&#9888; No decisions logged in the last 24h.</p>'
 
     # Display-only: agent_summary()'s by_classification keeps the raw enum keys (the
     # digest email/Power-Automate side may match on them) -- map through
-    # _friendly_classification for anything shown on screen, same as everywhere else.
-    by_class = "".join('<span class=pill>%s: %d</span>' % (_friendly_classification(k), v)
-                        for k, v in sorted(s["by_classification"].items()))
+    # _friendly_classification and MERGE by the resulting label (nrt_available_for_pickup
+    # and nrt_late_pickup_confirmation both map to plain "Available for pickup" -- see
+    # CLASSIFICATION_LABELS -- so they should show as one chip, not two identical-looking
+    # ones with different counts).
+    merged_class = {}
+    for k, v in s["by_classification"].items():
+        label = _friendly_classification(k)
+        merged_class[label] = merged_class.get(label, 0) + v
+    swatch = {"Available for pickup": "var(--fog)", "Waiting on containers": "var(--fog)"}
+    class_chips = "".join(
+        '<div class=class-chip><span class=swatch style="background:%s"></span>%s <span class=n>%d</span></div>'
+        % (swatch.get(label, "var(--line-strong)"), esc(label), n)
+        for label, n in sorted(merged_class.items(), key=lambda kv: -kv[1]))
 
     # Cheap count (ledger's own stored status, not a live re-check -- that's what the
     # dedicated /splits page is for) so a glance here shows whether anything's mid-split.
     active_splits = sum(1 for e in (load_json(LEDGER_PATH) or {}).values()
                          if e.get("status") in ("waiting", "partial"))
-    splits_pill = (' &nbsp; <a class=pill style="border-color:#5d7682;color:#5d7682" href=/splits>'
-                    '%d order(s) split across containers</a>' % active_splits) if active_splits else ""
+    splits_chip = ('<a class="split-chip pill fog" href=/splits>%d order(s) split across containers &rarr;</a>'
+                   % active_splits) if active_splits else ""
 
-    stats = ('<div class=card><h1 style="font-size:16px">Agent dashboard &mdash; last 24h</h1>'
-             '<p class=sub>Mode: %s &nbsp; Queue depth: <b>%s</b> &nbsp; Last decision: <b>%s</b>%s</p>'
-             '%s'
-             '<p><b>%s</b> decisions &middot; <b>%s</b> shipments prepared &middot; '
-             '<b>%s</b> flagged for review &middot; <b>%s</b> no action needed</p>'
-             '<p>%s</p>'
-             '<p><a class=pill href=/lookup>Look up a container/PO</a> '
-             '<a class=pill href=/agent/log?view=html>Pickup decisions</a> '
+    kpis = ('<div class=kpi-band>'
+        '<div class="kpi moss"><div class=kpi-top><span class=kpi-label>Shipped</span>'
+        '<span class=kpi-icon>&#10003;</span></div><div class=kpi-num>%d</div>'
+        '<div class=kpi-sub>Ready and waiting in Acumatica for <b>a clerk to confirm</b></div></div>'
+
+        '<div class="kpi rust"><div class=kpi-top><span class=kpi-label>Needs review</span>'
+        '<span class=kpi-icon>&#9888;</span></div><div class=kpi-num>%d</div>'
+        '<div class=kpi-sub>Waiting on <b>someone to take a look</b></div></div>'
+
+        '<div class="kpi fog"><div class=kpi-top><span class=kpi-label>Waiting</span>'
+        '<span class=kpi-icon>&#8987;</span></div><div class=kpi-num>%d</div>'
+        '<div class=kpi-sub>Other containers in these orders haven&#39;t confirmed pickup yet. '
+        '<b>They&#39;ll ship on their own</b> once they do</div></div>'
+
+        '<div class="kpi neutral"><div class=kpi-top><span class=kpi-label>No action needed</span>'
+        '<span class=kpi-icon>&mdash;</span></div><div class=kpi-num>%d</div>'
+        '<div class=kpi-sub>Routine status updates that didn&#39;t call for anything</div></div>'
+        '</div>'
+        % (s["shipped"], s["flagged"], s["waiting"], s["no_action"]))
+
+    glance = ('<div class=glance>'
+        '<div class=g-item><span class=mode-dot style="background:var(--%s)"></span> Mode %s</div>'
+        '<div class=divider></div><div class=g-item>Queue depth <b>%s</b></div>'
+        '<div class=divider></div><div class=g-item>Last decision <b>%s</b></div>%s</div>'
+        % ({"live": "moss", "shadow": "line-strong", "mixed": "rust", "n/a": "line-strong"}.get(s["mode"], "line-strong"),
+           mode_pill, s["queue_depth"], esc(_fmt_ts(s["last_decision_at"]) or "&mdash;"), splits_chip))
+
+    # Only the /agent/log view variants -- everything else here used to duplicate a link
+    # already in the persistent top nav (Look up, Split orders, Shipment history,
+    # Diagnostics, Manual upload), which is exactly the redundant clutter Parker asked to
+    # cut once the shared header existed.
+    quicklinks = ('<p><a class=pill href=/agent/log?view=html>Pickup decisions</a> '
              '<a class=pill href="/agent/log?all=1&view=html">Full decision log</a> '
-             '<a class=pill href="/agent/log?exceptions_only=1&view=html">Exceptions only</a> '
-             '<a class=pill href=/splits>Split orders</a> '
-             '<a class=pill href=/history>Shipment run history</a> '
-             '<a class=pill href=/diag>Diagnostics</a> '
-             '<a class=pill href=/manual>Manual PDF upload (fallback)</a></p></div>'
-             % (mode_pill, s["queue_depth"], _fmt_ts(s["last_decision_at"]) or "&mdash;", splits_pill, warn,
-                s["decisions"], s["shipments_prepared"], s["flagged"], s["no_action"],
-                by_class or "&mdash;"))
-    return stats + _dashboard_recent_html(recent)
+             '<a class=pill href="/agent/log?exceptions_only=1&view=html">Exceptions only</a></p>')
+
+    header = ('<div class=section-head><h1 style="font-size:20px">Agent dashboard</h1></div>'
+              '<p class=section-sub>Last 24 hours.</p>%s' % warn)
+
+    return (header + kpis + glance
+            + ('<div class=class-row>%s</div>' % class_chips if class_chips else '')
+            + quicklinks + _dashboard_recent_html(recent))
 
 def _dashboard_recent_html(rows):
     """Compact recent-activity table for the dashboard -- deliberately lighter than
@@ -2734,27 +3107,27 @@ def _dashboard_recent_html(rows):
         container_raw = m.group(1) if m else None
         resolved = (_find_later_success(container_raw, r.get("ts", ""), hist_rows, _flagged_row_masters(r))
                     if flagged else None)
-        rowstyle = ' style="background:#eaf1e8"' if resolved else (' style="background:#f6ece8"' if flagged else "")
+        sev = "moss" if resolved else _row_severity(r)
         container = esc(container_raw) if container_raw else esc(r.get("subject") or "")
-        status = ('<span class=pill style="border-color:#5a7d5a;color:#5a7d5a">&#10003; Resolved on retry</span>'
+        status = ('<span class="pill moss">&#10003; Resolved on retry</span>'
                    if resolved else _status_pill(r))
         if not flagged:
             exc_cell = "<td></td>"
         elif resolved:
-            exc_cell = '<td style="color:#5a7d5a">Shipped on a later retry -- no action needed now.</td>'
+            exc_cell = '<td style="color:var(--moss)">Shipped on a later retry &mdash; no action needed now.</td>'
         else:
-            exc_cell = f'<td style="color:#b06a5a">{esc(r.get("exception_reason") or "")}</td>'
-        return (f"<tr{rowstyle}><td>{esc(_fmt_ts(r.get('ts')))}</td>"
-                f"<td title=\"{esc(r.get('subject') or '')}\">{container}</td>"
-                f"<td>{esc(_friendly_classification(r.get('classification')))}</td>"
+            exc_cell = f'<td style="color:var(--rust)">{esc(r.get("exception_reason") or "")}</td>'
+        return (f'<tr class="row-{sev}"><td class=t-time>{esc(_fmt_ts(r.get("ts")))}</td>'
+                f'<td class=t-container title="{esc(r.get("subject") or "")}">{container}</td>'
+                f'<td class=t-status>{_classification_cell(r.get("classification"), esc)}</td>'
                 f"<td>{status}</td>"
                 f"{exc_cell}</tr>")
     body = "".join(_row(r) for r in rows)
-    return ('<div class=card><h1 style="font-size:16px">Recent pickup decisions (last %d)</h1>'
-            '<p class=sub>Times are Pacific. Available-for-pickup triggers and exceptions only -- '
+    return ('<div class=section-head><h2>Recent pickup decisions (last %d)</h2></div>'
+            '<p class=section-sub>Times are Pacific. Available-for-pickup triggers and exceptions only &mdash; '
             '<a href="/agent/log?all=1&view=html">see every email, all classifications</a>. %s</p>'
             '<div class=twrap><table><tr><th>Received</th><th>Container</th><th>Email status</th><th>Result</th>'
-            '<th>Exception</th></tr>%s</table></div></div>'
+            '<th>Exception</th></tr>%s</table></div>'
             % (len(rows), CLASSIFICATION_LEGEND, body or
                '<tr><td colspan=5 class=sub>No decisions logged yet.</td></tr>'))
 
@@ -2782,9 +3155,9 @@ function render(d,dry){
  if(d.error){document.getElementById('out').innerHTML='<div class=card>Error: '+d.error+'</div>';return;}
  let h='<div class=card><h1 style="font-size:16px">'+(dry?'Preview':'Result')+' &mdash; ref '+(d.dachser_reference||'?')+'</h1>';
  h+='<p class=sub>'+d.route+' &nbsp; ETA '+(d.eta||'?')+'</p>';
- h+='<p>'+d.containers.map(c=>'<span class=pill'+((d.unresolved_containers||[]).includes(c)?' style="border-color:#b06a5a;color:#b06a5a"':'')+'>'+c+'</span>').join('')+'</p>';
+ h+='<p>'+d.containers.map(c=>'<span class="pill'+((d.unresolved_containers||[]).includes(c)?' rust':'')+'">'+c+'</span>').join('')+'</p>';
  if((d.unresolved_containers||[]).length){
-   h+='<p class=sub style="color:#b06a5a">&#9888; No PO could be found for '+d.unresolved_containers.length+' container(s) ('+d.unresolved_containers.join(', ')+') -- checked both the advice text and PO Receipts. Verify manually (e.g. against the packing list) before assuming this handover is fully covered.</p>';
+   h+='<p class=sub style="color:var(--rust)">&#9888; No PO could be found for '+d.unresolved_containers.length+' container(s) ('+d.unresolved_containers.join(', ')+') -- checked both the advice text and PO Receipts. Verify manually (e.g. against the packing list) before assuming this handover is fully covered.</p>';
  }
  h+='<p class=sub>'+d.po_count+' PO#s found (advice text + PO Receipts) &middot; '+d.orders_matched+' open sales orders matched'+(dry?'':' &middot; '+d.created+' shipments created')+'</p>';
  h+='<table><tr><th></th><th>PO#</th><th>Sales order</th><th>Customer</th><th>Result</th></tr>';
@@ -3004,23 +3377,21 @@ class H(BaseHTTPRequestHandler):
         if not self._authed():
             return self._send(200, LOGIN)
         if u.path == "/":
-            return self._send(200, page(_dashboard_html()))
+            return self._send(200, page(_dashboard_html(), current="dashboard"))
         if u.path == "/manual":
-            return self._send(200, page(MANUAL_UPLOAD))
+            return self._send(200, page(MANUAL_UPLOAD, current="manual"))
         if u.path == "/connect":
             self.send_response(302); self.send_header("Location", build_authorize_url()); self.end_headers(); return
         if u.path == "/diag":
             qs = urllib.parse.parse_qs(u.query)
-            d = diagnostics(qs.get("po", [None])[0], qs.get("container", [None])[0], qs.get("receipt", [None])[0])
-            body = ('<div class=card><h1 style="font-size:16px">Diagnostics</h1>'
-                    '<form method=get action=/diag>'
-                    '<p style="max-width:260px"><input type=text name=po placeholder="test a PO# e.g. 117256"></p>'
-                    '<p style="max-width:260px"><input type=text name=container placeholder="test a container e.g. FBIU5261330"></p>'
-                    '<p style="max-width:260px"><input type=text name=receipt placeholder="dump a receipt e.g. 007068"></p>'
-                    '<button class=fog>Run</button></form><pre>' + json.dumps(d, indent=2) + "</pre></div>")
-            return self._send(200, page(body))
+            sample_po = qs.get("po", [None])[0]
+            sample_container = qs.get("container", [None])[0]
+            sample_receipt = qs.get("receipt", [None])[0]
+            d = diagnostics(sample_po, sample_container, sample_receipt)
+            body = _diag_html(d, sample_po, sample_container, sample_receipt)
+            return self._send(200, page(body, current="diag"))
         if u.path == "/guide":
-            return self._send(200, page(GUIDE))
+            return self._send(200, page(GUIDE, current="guide"))
         if u.path == "/splits":
             qs = urllib.parse.parse_qs(u.query)
             try:
@@ -3036,8 +3407,8 @@ class H(BaseHTTPRequestHandler):
                 out = _splits_html(limit=limit, live=live)
             except Exception as e:
                 out = ('<div class=card><h1 style="font-size:16px">Split orders &mdash; error</h1>'
-                       '<p class=sub style="color:#b06a5a">%s</p></div>' % str(e).replace("<", "&lt;"))
-            return self._send(200, page(out))
+                       '<p class=sub style="color:var(--rust)">%s</p></div>' % str(e).replace("<", "&lt;"))
+            return self._send(200, page(out, current="splits"))
         if u.path == "/lookup":
             qs = urllib.parse.parse_qs(u.query)
             q = (qs.get("q", [None])[0] or "").strip()
@@ -3045,16 +3416,16 @@ class H(BaseHTTPRequestHandler):
                 out = _lookup_html(q or None)
             except Exception as e:
                 out = ('<div class=card><h1 style="font-size:16px">Lookup &mdash; error</h1>'
-                       '<p class=sub style="color:#b06a5a">%s</p></div>' % str(e).replace("<", "&lt;"))
-            return self._send(200, page(out))
+                       '<p class=sub style="color:var(--rust)">%s</p></div>' % str(e).replace("<", "&lt;"))
+            return self._send(200, page(out, current="lookup"))
         if u.path == "/history":
-            _badge = {"ok": "#5a7d5a", "partial": "#b0653a", "failed": "#b06a5a", "no_matches": "#7d7363"}
+            _badge = {"ok": "pill moss", "partial": "pill fog", "failed": "pill rust", "no_matches": "pill"}
             _status_label = {"ok": "Created", "partial": "Partially created", "failed": "Failed",
                               "no_matches": "No matching order"}
             def _hrow(h):
                 status = h.get("status") or ""
                 label = _status_label.get(status, status or "&mdash;")
-                pill = f'<span class=pill style="border-color:{_badge.get(status, "#c9c0ad")}">{label}</span>'
+                pill = f'<span class="{_badge.get(status, "pill")}">{label}</span>'
                 orders = h.get("orders") or []
                 # The Master PO number(s) behind this run, visible directly -- previously only
                 # findable by expanding "N order(s)" below. NOTE: this is the retail Master PO
@@ -3078,7 +3449,7 @@ class H(BaseHTTPRequestHandler):
                 unresolved = h.get("unresolved_containers") or []
                 cont_cell = h.get("containers", "")
                 if unresolved:
-                    cont_cell += f' <span class=pill style="border-color:#b06a5a;color:#b06a5a">&#9888; unresolved: {", ".join(unresolved)}</span>'
+                    cont_cell += f' <span class="pill rust">&#9888; unresolved: {", ".join(unresolved)}</span>'
                 # Which Acumatica identity actually performed this write (not the app-level
                 # "By" caller/source tag) -- flag red if it doesn't match EXPECTED_ACU_USER, so
                 # segregation-of-duties drift shows up per-run in the permanent log, not only
@@ -3086,9 +3457,9 @@ class H(BaseHTTPRequestHandler):
                 acu_user = h.get("acumatica_user") or ""
                 exp = os.environ.get("EXPECTED_ACU_USER", "").strip()
                 if not acu_user:
-                    acu_cell = '<span class=pill style="border-color:#c9c0ad">unknown</span>'
+                    acu_cell = '<span class=pill>unknown</span>'
                 elif exp and exp.lower() not in acu_user.lower():
-                    acu_cell = f'<span class=pill style="border-color:#b06a5a;color:#b06a5a">&#9888; {acu_user}</span>'
+                    acu_cell = f'<span class="pill rust">&#9888; {acu_user}</span>'
                 else:
                     acu_cell = acu_user
                 # Document/Reference only mean anything for a manual PDF upload; an
@@ -3109,13 +3480,13 @@ class H(BaseHTTPRequestHandler):
                         f"<td>{pill}</td><td>{h.get('created','')}/{h.get('orders_matched','')}</td>"
                         f"<td>{cont_cell}</td><td>{po_cell}</td><td>{detail_cell}</td></tr>")
             rows = "".join(_hrow(h) for h in history())
-            body = ('<div class=card><h1 style="font-size:16px">Run history</h1>'
-                    '<p class=sub>Every shipment-creation run, kept permanently on the tool&#39;s disk (not just this session). '
+            body = ('<div class=section-head><h1 style="font-size:20px">Shipment run history</h1></div>'
+                    '<p class=section-sub>Every shipment-creation run, kept permanently on the tool&#39;s disk (not just this session). '
                     'Times are Pacific. Expand the last column for per-order/shipment detail. &#8220;Acumatica user&#8221; is who was '
                     'actually connected when the write ran (set <code>EXPECTED_ACU_USER</code> to flag any run under a different account).</p>'
                     '<div class=twrap><table><tr><th>Received</th><th>Triggered by</th><th>Acumatica user</th><th>Source</th><th>Status</th>'
-                    '<th>Created/Matched</th><th>Containers</th><th>Master PO(s)</th><th>Orders</th></tr>' + rows + '</table></div></div>')
-            return self._send(200, page(body))
+                    '<th>Created/Matched</th><th>Containers</th><th>Master PO(s)</th><th>Orders</th></tr>' + rows + '</table></div>')
+            return self._send(200, page(body, current="history"))
         return self._send(404, page("<div class=card>Not found</div>"))
 
     def do_POST(self):
