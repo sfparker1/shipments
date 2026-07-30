@@ -1097,8 +1097,23 @@ def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None, p
             if st != 202:
                 break
         else:
-            res.update(created=False, verified=False,
-                       error="Acumatica did not finish processing within 15s (still 202) -- check manually")
+            # Before giving up as "unclear, check manually": is a shipment actually there
+            # despite the slow/unresponsive poll? Real case, 2026-07-29 (SZLU9831203): this
+            # branch always reported ambiguous even when a shipment plausibly existed,
+            # forcing a manual Acumatica check every single time a poll ran long --
+            # _latest_shipment_for_order() is the SAME proven check used for the normal
+            # success path two lines below; it was just never tried here.
+            ship = _latest_shipment_for_order(order_type, order_nbr, retries=1, delay=0)
+            if ship:
+                res.update(created=True, verified=True, shipment_nbr=ship.get("shipment_nbr"),
+                           note="Acumatica's action didn't finish polling within 15s, but a "
+                                "shipment was confirmed to exist on a direct check.")
+                res.update(set_shipment_date_and_container(ship.get("id"), ship.get("shipment_nbr"),
+                                                             date, container_ref, attempt_put=False))
+            else:
+                res.update(created=False, verified=False,
+                           error="Acumatica did not finish processing within 15s (still 202), and no "
+                                 "shipment was found on a direct check -- check manually.")
             return res
 
     res["created"] = st in (200, 204)
@@ -1863,14 +1878,30 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
         # was genuinely Open in Acumatica but the cached snapshot pre-dated that.
         load_open_orders(force=True)
         matched = find_sales_orders_batch(all_pos)
+    unmatched = [po for po in all_pos if not matched.get(po)]
+    # Same distinction as process_manual() (see find_fulfilled_sales_orders()'s docstring
+    # for the original incident, and process_manual()'s comment for why this also has to
+    # feed the overall run status, not just the per-PO note text).
+    fulfilled = find_fulfilled_sales_orders(unmatched) if unmatched else {}
+    already_fulfilled_pos = [po for po in unmatched if fulfilled.get(po)]
+    genuinely_missing_pos = [po for po in unmatched if not fulfilled.get(po)]
     rows = []; log_orders = []; to_create = 0; created = 0
     for po in all_pos:
         matches = matched.get(po, [])
         if not matches:
-            rows.append({"po": po, "confidence": "flag", "note": "no open sales order", "orders": []})
+            fulfilled_orders = fulfilled.get(po) or []
+            if fulfilled_orders:
+                statuses = sorted({o["status"] for o in fulfilled_orders if o.get("status")})
+                note = (f"already fulfilled -- {len(fulfilled_orders)} sales order(s) found with "
+                        f"status {', '.join(statuses)}; no action needed")
+                rows.append({"po": po, "confidence": "ok", "note": note, "orders": [],
+                             "already_fulfilled": True})
+            else:
+                note = "no open sales order"
+                rows.append({"po": po, "confidence": "flag", "note": note, "orders": []})
             if not dry_run:
                 log_orders.append({"po": po, "order": None, "shipment_nbr": None,
-                                    "created": False, "reason": "no open sales order"})
+                                    "created": False, "reason": note})
             continue
         for m in matches:
             to_create += 1
@@ -1890,10 +1921,15 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
                "orders_matched": to_create, "created": created, "dry_run": dry_run, "rows": rows}
     if not dry_run:
         if to_create == 0:
-            status = "no_matches"
-        elif created == to_create:
+            if not already_fulfilled_pos:
+                status = "no_matches"
+            elif not genuinely_missing_pos:
+                status = "already_fulfilled"
+            else:
+                status = "partial"
+        elif created == to_create and not genuinely_missing_pos:
             status = "ok"
-        elif created > 0:
+        elif created > 0 or already_fulfilled_pos:
             status = "partial"
         else:
             status = "failed"
@@ -2066,6 +2102,16 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
     # See find_fulfilled_sales_orders()'s docstring for the real incident this fixes
     # (and why Cancelled/Voided deliberately don't count).
     fulfilled = find_fulfilled_sales_orders(unmatched) if unmatched else {}
+    # Real case, 2026-07-30 (378307 + siblings 118040/118072/141972): the per-PO already-
+    # fulfilled fix above never propagated into the RUN's overall status. All 4 masters
+    # got resolved together (one shared consolidated receipt group), but 3 were already
+    # shipped and confirmed by a person days earlier (no open Sales Order left -- correctly
+    # "already fulfilled"), while 378307 genuinely had no Sales Order yet at that moment.
+    # to_create stayed 0 for BOTH reasons alike, so the run logged "no_matches" -- sounding
+    # like nothing happened, when 3 of 4 were actually fine and only one was genuinely
+    # pending. Tracked separately here so the run status below can tell them apart.
+    already_fulfilled_pos = [po for po in unmatched if fulfilled.get(po)]
+    genuinely_missing_pos = [po for po in unmatched if not fulfilled.get(po)]
     rows = []; log_orders = []; to_create = 0; created = 0
     po_all_created = {}  # po/master token -> did every matched order for it end up created?
     for po in all_pos:
@@ -2143,10 +2189,15 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         summary["completeness_detail"] = completeness_detail
     if not dry_run:
         if to_create == 0:
-            status = "no_matches"
-        elif created == to_create:
+            if not already_fulfilled_pos:
+                status = "no_matches"           # nothing found for anyone -- genuinely needs a look
+            elif not genuinely_missing_pos:
+                status = "already_fulfilled"    # everyone in this event was already done -- no concern
+            else:
+                status = "partial"              # a real mix: some already fine, one+ still genuinely missing
+        elif created == to_create and not genuinely_missing_pos:
             status = "ok"
-        elif created > 0:
+        elif created > 0 or already_fulfilled_pos:
             status = "partial"
         else:
             status = "failed"
@@ -3474,9 +3525,10 @@ class H(BaseHTTPRequestHandler):
                        '<p class=sub style="color:var(--rust)">%s</p></div>' % str(e).replace("<", "&lt;"))
             return self._send(200, page(out, current="lookup"))
         if u.path == "/history":
-            _badge = {"ok": "pill moss", "partial": "pill fog", "failed": "pill rust", "no_matches": "pill"}
+            _badge = {"ok": "pill moss", "partial": "pill fog", "failed": "pill rust",
+                      "no_matches": "pill", "already_fulfilled": "pill moss"}
             _status_label = {"ok": "Created", "partial": "Partially created", "failed": "Failed",
-                              "no_matches": "No matching order"}
+                              "no_matches": "No matching order", "already_fulfilled": "Already fulfilled"}
             def _hrow(h):
                 status = h.get("status") or ""
                 label = _status_label.get(status, status or "&mdash;")
