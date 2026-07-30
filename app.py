@@ -907,13 +907,23 @@ def load_all_orders(force=False):
         _ALL_ORDERS["ts"] = now
     return rows
 
+FULFILLED_SO_STATUSES = {"Completed", "Closed"}  # genuinely fulfilled, not just non-open
+
 def find_fulfilled_sales_orders(pos):
-    """For masters with zero OPEN matches: is there a NON-open order (Completed/Closed/
-    Cancelled) instead? Distinguishes 'already fulfilled before this automation ran' (no
-    action needed, not a real problem) from a genuine gap (no sales order exists at all,
-    which DOES need a human). Only meaningfully called on that rare fallback path, not
-    the normal hot path."""
-    orders = [o for o in load_all_orders() if o["status"] != "Open"]
+    """For masters with zero OPEN matches: is there a genuinely-fulfilled order (Completed/
+    Closed) instead? Distinguishes 'already fulfilled before this automation ran' (no action
+    needed, not a real problem) from a genuine gap (no sales order exists at all, which DOES
+    need a human). Only meaningfully called on that rare fallback path, not the normal hot
+    path.
+
+    Deliberately an ALLOW-list (Completed/Closed only), not "anything non-Open" -- real bug
+    caught 2026-07-29 before it shipped: the first version treated Cancelled/Voided orders
+    the same as genuinely fulfilled ones. A cancelled order means the SALE was abandoned,
+    not that goods shipped -- calling that "no action needed" could mask a real problem
+    (goods physically arrived with no valid order left to ship them against). Anything not
+    in this allow-list (Cancelled, Voided, Credit Hold, Back Order, Pending Approval, ...)
+    correctly falls through to "genuinely needs review" instead."""
+    orders = [o for o in load_all_orders() if o["status"] in FULFILLED_SO_STATUSES]
     results = {p: [] for p in pos}
     for o in orders:
         co = o["cust_order"]
@@ -1834,6 +1844,23 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                     "reason": "out_of_scope_3pl",
                     "note": "container's PO Receipt is 3PL-bound (MMX/4006/AMAZON/HG); revenue is "
                             "recognized at the 3PL, not at port pickup -- skipped, no action needed"}
+        if scope == "unresolved":
+            # container_scope()'s own docstring already promises this needs human review --
+            # this call site just never implemented that contract. Real bug found 2026-07-29:
+            # with resolved=[] the per-master loop below runs zero times, so this fell through
+            # to the generic waiting_on_containers=True/"po_incomplete" response -- the SAME
+            # classification as a normal in-progress order, with no exception raised. Worse,
+            # ledger_record() ALSO never fires for an empty `resolved`, so no ledger entry
+            # exists to ever pick this up again via /ledger/recheck -- a container with no
+            # matching receipt (or a receipt with no recognizable retail PO#) could sit
+            # silently invisible forever, with zero human visibility, unless another NRT
+            # email happens to arrive later.
+            return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
+                    "reason": "unresolved_container",
+                    "note": "no Acumatica receipt was found for this container, or its receipt's "
+                            "VendorRef has no recognizable retail PO# -- a clerk should check "
+                            "whether the packing list has been processed yet, or whether the "
+                            "receipt's VendorRef is missing/malformed"}
         # NRT path completeness gate (Phase 2 / Tier 2 -- see majestic-swimming-melody.md):
         # does the underlying Purchase Order behind this container actually show everything
         # received yet? Runs on EVERY in-scope pickup event, not just ones that already look
@@ -1933,10 +1960,11 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         load_open_orders(force=True)
         matched = find_sales_orders_batch(all_pos)
     unmatched = [po for po in all_pos if not matched.get(po)]
-    # Before flagging "no open sales order" as needing review: is there a non-open
-    # (Completed/Closed/Cancelled) order instead, meaning this was already fulfilled --
+    # Before flagging "no open sales order" as needing review: is there a genuinely-
+    # fulfilled (Completed/Closed) order instead, meaning this was already fulfilled --
     # likely manually, before this automation existed -- rather than genuinely missing?
-    # See find_fulfilled_sales_orders()'s docstring for the real incident this fixes.
+    # See find_fulfilled_sales_orders()'s docstring for the real incident this fixes
+    # (and why Cancelled/Voided deliberately don't count).
     fulfilled = find_fulfilled_sales_orders(unmatched) if unmatched else {}
     rows = []; log_orders = []; to_create = 0; created = 0
     po_all_created = {}  # po/master token -> did every matched order for it end up created?
