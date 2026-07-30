@@ -2662,35 +2662,6 @@ CSS = """
   --font-mono:"Cascadia Code","SF Mono",ui-monospace,Consolas,"Courier New",monospace;
   --shadow-card: 0 1px 2px rgba(56,53,47,.04), 0 1px 8px rgba(56,53,47,.03);
 }
-@media (prefers-color-scheme: dark){
-  :root{
-    --sand:#1c1a17; --paper:#252220; --stone:#ece7dd; --taupe:#b6ab97;
-    --line:#3c372f; --line-strong:#4a4438;
-    --fog:#8bacb8; --fog-bg:#20282a; --fog-bg-strong:#28353a;
-    --moss:#8fb383; --moss-bg:#1f2a1e; --moss-bg-strong:#26351f;
-    --rust:#e0956c; --rust-bg:#2c2119; --rust-bg-strong:#3a291d;
-    --neutral-bg:#252220;
-    --shadow-card: 0 1px 2px rgba(0,0,0,.25), 0 1px 10px rgba(0,0,0,.2);
-  }
-}
-:root[data-theme="dark"]{
-  --sand:#1c1a17; --paper:#252220; --stone:#ece7dd; --taupe:#b6ab97;
-  --line:#3c372f; --line-strong:#4a4438;
-  --fog:#8bacb8; --fog-bg:#20282a; --fog-bg-strong:#28353a;
-  --moss:#8fb383; --moss-bg:#1f2a1e; --moss-bg-strong:#26351f;
-  --rust:#e0956c; --rust-bg:#2c2119; --rust-bg-strong:#3a291d;
-  --neutral-bg:#252220;
-  --shadow-card: 0 1px 2px rgba(0,0,0,.25), 0 1px 10px rgba(0,0,0,.2);
-}
-:root[data-theme="light"]{
-  --sand:#efece3; --paper:#fbf9f5; --stone:#38352f; --taupe:#7d7363;
-  --line:#ddd5c4; --line-strong:#c9c0ad;
-  --fog:#5d7682; --fog-bg:#e9f0f1; --fog-bg-strong:#dbe8ea;
-  --moss:#5a7d5a; --moss-bg:#eaf1e7; --moss-bg-strong:#d9e8d3;
-  --rust:#b0653a; --rust-bg:#f9ece3; --rust-bg-strong:#f3dbc9;
-  --neutral-bg:#f1efe9;
-  --shadow-card: 0 1px 2px rgba(56,53,47,.04), 0 1px 8px rgba(56,53,47,.03);
-}
 *{box-sizing:border-box}
 body{margin:0;background:var(--sand);color:var(--stone);font-family:var(--font-body);-webkit-font-smoothing:antialiased}
 .wrap{max-width:1180px;margin:0 auto;padding:28px}
