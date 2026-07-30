@@ -192,13 +192,23 @@ def ledger_record(master_token, container, pickup_date):
     save_json(LEDGER_PATH, data)
     return entry
 
-def ledger_set_status(master_token, status, note=None):
+def ledger_set_status(master_token, status, note=None, reset_first_seen=False):
+    """reset_first_seen (default False, preserves the normal SLA-clock behavior): pass True
+    only when a master is genuinely starting a NEW waiting period, not continuing an old
+    one -- e.g. the stale-ledger-verification case in process_manual, where a master
+    previously marked 'shipped' turns out to have no live shipment anymore (deleted after
+    being found erroneous) and is reset to 'waiting'. Without this, ledger_check_sla()
+    would measure from the ORIGINAL first_seen date -- possibly months ago -- and could
+    immediately flag a master that just re-entered 'waiting' today as stuck for months,
+    a false alarm (not a missed one, but still wrong)."""
     data = load_json(LEDGER_PATH) or {}
     if master_token not in data:
         return None
     data[master_token]["status"] = status
     if note:
         data[master_token]["note"] = note
+    if reset_first_seen:
+        data[master_token]["first_seen"] = time.strftime("%Y-%m-%d")
     save_json(LEDGER_PATH, data)
     return data[master_token]
 
@@ -476,37 +486,56 @@ RECEIPTS_TTL = 600  # 10 min, same as the open-orders cache
 RECEIPT_LOOKBACK_DAYS = int(cfg("RECEIPT_LOOKBACK_DAYS", "180"))
 
 def _fetch_all_pages(path, page_size=500, max_pages=10):
-    """GET with $top/$skip paging, capped at max_pages as a safety limit."""
+    """GET with $top/$skip paging, capped at max_pages as a safety limit. Returns
+    (rows, ok) -- ok=False means the loop broke early because of an API error/bad
+    response, NOT because it legitimately ran out of data. Callers must not treat an
+    empty result as "this really is everything" when ok is False -- see
+    load_recent_receipts()'s cache-skip logic, added after finding the same "cached a
+    transient failure as a confirmed empty result" bug class in
+    discover_receipt_container_field()."""
     rows = []
+    ok = True
     sep = "&" if "?" in path else "?"
     for page in range(max_pages):
         q = f"{path}{sep}$top={page_size}&$skip={page * page_size}"
         st, data = api("GET", q)
         if st != 200 or not isinstance(data, list):
+            ok = False
             break
         rows.extend(data)
         if len(data) < page_size:
             break
-    return rows
+    return rows, ok
 
 def discover_receipt_container_field():
     """Find the container-number custom/UDF field on PurchaseReceipt -- the
-    PO-receipts tool writes this same field (mirrors its own discovery logic)."""
+    PO-receipts tool writes this same field (mirrors its own discovery logic).
+
+    FIXED 2026-07-29 (real bug caught in audit, not yet observed live): `checked` used to
+    be set to True BEFORE the schema API call ran, unconditionally -- so a single
+    transient failure (timeout, 5xx, rate-limit) on whichever call happened to be the
+    first one after a deploy/restart would permanently cache "field not found" for the
+    rest of that process's life. Every downstream caller (load_recent_receipts, and
+    everything built on it -- process_manual, process_file, /diag, /splits, /lookup) would
+    silently stop resolving ANY container until the next restart, with no error message
+    pointing to why. Now only caches "not found" once a real 200 response actually said
+    so -- a transient failure just retries on the next call instead."""
     if _RCPT_CONTAINER_FIELD["checked"]:
         return _RCPT_CONTAINER_FIELD["field"], _RCPT_CONTAINER_FIELD["view"]
-    _RCPT_CONTAINER_FIELD["checked"] = True  # only ever hit the schema endpoint once per process
     env_f = cfg("RECEIPT_CONTAINER_FIELD")
     if env_f:
-        _RCPT_CONTAINER_FIELD.update(field=env_f, view=cfg("RECEIPT_CONTAINER_VIEW", "Document"))
+        _RCPT_CONTAINER_FIELD.update(field=env_f, view=cfg("RECEIPT_CONTAINER_VIEW", "Document"), checked=True)
         return _RCPT_CONTAINER_FIELD["field"], _RCPT_CONTAINER_FIELD["view"]
     st, data = api("GET", f"{ENTITY}/PurchaseReceipt/$adHocSchema")
-    if st == 200 and isinstance(data, dict):
-        for view, fields in (data.get("custom") or {}).items():
-            for fname, meta in fields.items():
-                label = ((meta or {}).get("displayName") or "") + " " + fname
-                if re.search(r"contain|ctnr|cont(\.|\s)*no", label, re.I) and not re.search(r"\beta\b|arriv|estimat", label, re.I):
-                    _RCPT_CONTAINER_FIELD.update(field=fname, view=view)
-                    return fname, view
+    if st != 200 or not isinstance(data, dict):
+        return None, None  # transient failure -- NOT cached, retry next call
+    _RCPT_CONTAINER_FIELD["checked"] = True  # a real answer came back -- safe to cache now, found or not
+    for view, fields in (data.get("custom") or {}).items():
+        for fname, meta in fields.items():
+            label = ((meta or {}).get("displayName") or "") + " " + fname
+            if re.search(r"contain|ctnr|cont(\.|\s)*no", label, re.I) and not re.search(r"\beta\b|arriv|estimat", label, re.I):
+                _RCPT_CONTAINER_FIELD.update(field=fname, view=view)
+                return fname, view
     return None, None
 
 def load_recent_receipts(force=False):
@@ -535,7 +564,7 @@ def load_recent_receipts(force=False):
     # paging stops naturally when a short page arrives; max_pages is just a runaway guard. Rows
     # are header-only now, so deep paging is cheap. (Was max_pages=6 -> capped at 3000 -> missed
     # everything recent.)
-    data = _fetch_all_pages(path, page_size=500, max_pages=40)
+    data, fetch_ok = _fetch_all_pages(path, page_size=500, max_pages=40)
     rows = []
     for r in data:
         cont = ((r.get("custom") or {}).get(view, {}).get(field) or {}).get("value")
@@ -548,7 +577,14 @@ def load_recent_receipts(force=False):
         rows.append({"containers": conts, "container_raw": cont.strip(),
                      "receipt_nbr": (r.get("ReceiptNbr") or {}).get("value"),
                      "vendor_ref": (r.get("VendorRef") or {}).get("value") or ""})
-    _RECEIPTS_CACHE.update(rows=rows, ts=now, raw_total=len(data))
+    # Same bug class as discover_receipt_container_field(): don't cache a suspicious
+    # empty result caused by an API failure as though it were a confirmed "zero receipts"
+    # answer -- that would make every container look unresolved for the full 10-minute
+    # TTL. A genuinely empty page-1 response (fetch_ok=True) is still cached normally; a
+    # partial-but-nonempty result from a later page failing mid-pagination is also cached
+    # (better than nothing, and it'll refresh again after the TTL either way).
+    if fetch_ok or rows:
+        _RECEIPTS_CACHE.update(rows=rows, ts=now, raw_total=len(data))
     return rows
 
 def containers_to_pos(containers):
@@ -1748,9 +1784,15 @@ def _lookup_html(query=None):
                        '<p>Check the container number or Master PO, or it may not have come through the agent yet.</p></div></div>')
 
     parts = [form]
+    # FIXED 2026-07-29 (found while checking a different fix): esc()-wrapping the WHOLE
+    # "join(...) or fallback" expression re-escapes the literal &mdash; entity into visible
+    # "&mdash;" text on screen instead of rendering an em dash -- only the real joined
+    # value needs escaping, never the pre-built fallback entity.
+    master_tokens_display = esc(", ".join(info["master_tokens"])) if info["master_tokens"] else "&mdash;"
+    containers_display = esc(", ".join(info["containers_involved"])) if info["containers_involved"] else "&mdash;"
     parts.append('<div class=card><h2>Summary</h2>'
-                 f'<p class=sub>Master PO(s): <b>{esc(", ".join(info["master_tokens"]) or "&mdash;")}</b> '
-                 f'&nbsp; Container(s): <b>{esc(", ".join(info["containers_involved"]) or "&mdash;")}</b></p></div>')
+                 f'<p class=sub>Master PO(s): <b>{master_tokens_display}</b> '
+                 f'&nbsp; Container(s): <b>{containers_display}</b></p></div>')
 
     master_cards = []
     for tok in info["master_tokens"]:
@@ -1950,8 +1992,11 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                 # The ledger was stale -- no live shipment actually exists anymore (e.g. it
                 # was deleted after being found erroneous). Reset so this master gets
                 # re-evaluated normally instead of being permanently stuck flagging a
-                # false anomaly on every future pickup event.
-                ledger_set_status(token, "waiting")
+                # false anomaly on every future pickup event. reset_first_seen=True: this
+                # is a genuinely NEW waiting period, not a continuation -- without it,
+                # ledger_check_sla() would measure from whenever this master first
+                # appeared, possibly months ago, and could immediately flag it as stuck.
+                ledger_set_status(token, "waiting", reset_first_seen=True)
             ledger_record(token, container, pickup_date)
         po_refs = resolve_pos_by_master(container)
         for token in resolved:
@@ -2381,9 +2426,23 @@ def _split_order_card(tok, entry, esc, live=False):
     status_label = "Partially shipped" if entry.get("status") == "partial" else "Waiting"
     pill_class = "pill fog"
     if not live:
+        # Real confusion, 2026-07-29: this card used to list ONLY the containers already
+        # confirmed (entry["containers"]) -- with dates on every row, it reads as "all of
+        # these are done, so why is this still waiting?" The actual reason is usually a
+        # SIBLING container Acumatica's own receipts say belongs to this master, which
+        # hasn't sent its own Available-for-pickup confirmation yet -- invisible here
+        # unless it's shown explicitly. expected_containers_for_master() and
+        # containers_confirmed_available() are both purely local (load_recent_receipts()
+        # is already cached, confirmed_pickup_containers() is a local log read) -- adding
+        # them here costs zero additional Acumatica calls, so the "zero API calls" promise
+        # for the cached view still holds.
+        _, missing, _ = containers_confirmed_available(tok)
         cont_rows = "".join(
             f"<tr><td class=mc>{esc(c)}</td><td class=md>{esc(d)}</td></tr>"
             for c, d in sorted(entry.get("containers", {}).items(), key=lambda kv: kv[1]))
+        cont_rows += "".join(
+            f'<tr><td class=mc>{esc(c)}</td><td class=md style="color:var(--rust)">not confirmed yet</td></tr>'
+            for c in missing)
         checked = entry.get("last_checked")
         checked_note = (f"Purchase order status as of last check ({esc(_fmt_ts(checked))}) -- "
                         f'<a href="/splits?live=1">refresh live</a> for current status.') if checked else \
@@ -2394,9 +2453,13 @@ def _split_order_card(tok, entry, esc, live=False):
             f'<table class=mini-table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table>'
             f'<div class=as-of>{checked_note}</div></div>')
     info = split_order_status(tok, entry)
+    _, live_missing, _ = containers_confirmed_available(tok)
     cont_rows = "".join(
         f"<tr><td class=mc>{esc(c)}</td><td class=md>{esc(d)}</td></tr>"
         for c, d in sorted(info["containers"].items(), key=lambda kv: kv[1]))
+    cont_rows += "".join(
+        f'<tr><td class=mc>{esc(c)}</td><td class=md style="color:var(--rust)">not confirmed yet</td></tr>'
+        for c in live_missing)
     po_rows = "".join(
         f"<tr><td class=mc>{esc(p['po'])}</td><td class=md>{'&#10003; Received in full' if p['complete'] else '&#9678; ' + esc(p['status'])}</td></tr>"
         for p in info["purchase_orders"]) or "<tr><td colspan=2 class=sub>Could not resolve a Purchase Order</td></tr>"
@@ -2771,6 +2834,7 @@ tbody tr.row-neutral::before{background:var(--line-strong)} tbody tr.row-fog::be
 .master-card-head .m-id,.group-card-head h3{font:600 15px var(--font-mono);color:var(--stone);margin:0}
 .mini-table{width:100%;border-collapse:collapse;font-size:12.5px}
 .mini-table th{padding:6px 0;border-bottom:1px solid var(--line);font-size:10.5px}
+.mini-table th:last-child{text-align:right}
 .mini-table td{padding:6px 0;border-bottom:1px solid var(--line)}
 .mini-table tr:last-child td{border-bottom:none}
 .mini-table .mc{font-family:var(--font-mono);color:var(--stone)}
@@ -2943,7 +3007,8 @@ def _diag_html(d, sample_po, sample_container, sample_receipt):
             f'<div class=sub style="margin:2px 0 0">Resolved to internal PO(s) {esc(", ".join(probe.get("distinct_po_order_nbrs_across_receipts") or []) or "none")}</div></div></div>'
             f'<div class=kv-grid><div class=kv><label>Open sales orders</label><div class=v>{len(matches)}</div></div>'
             f'<div class=kv><label>Receipts checked</label><div class=v>{len(probe.get("receipts_checked") or [])}</div></div>'
-            f'<div class=kv><label>PO status</label><div class=v style="font-size:13px">{esc(probe.get("po_status") or "&mdash;")}</div></div></div></div>')
+            f'<div class=kv><label>PO status</label><div class=v style="font-size:13px">'
+            f'{esc(probe.get("po_status")) if probe.get("po_status") else "&mdash;"}</div></div></div></div>')
     elif sample_receipt and d.get("sample_receipt_raw") is not None:
         raw = d.get("sample_receipt_raw") or {}
         result = ('<div class="card result-card"><div class=result-head><span class=r-icon>&#128203;</span>'
@@ -3000,6 +3065,23 @@ def _dashboard_html():
     elif s["decisions"] == 0:
         warn = '<p class=sub style="color:var(--rust)">&#9888; No decisions logged in the last 24h.</p>'
 
+    # ledger_check_sla()'s result was already computed inside agent_summary() (used by the
+    # Power Automate digest email) but never shown here -- real gap found 2026-07-29: a
+    # master stuck "waiting"/"partial" past LEDGER_SLA_DAYS had no way to reach Parker
+    # except through that external, unverified email template. Now shown directly.
+    stale = s.get("ledger_stale") or []
+    stale_html = ""
+    if stale:
+        stale_rows = "".join(
+            f'<div class=member-row><span class=m-po>'
+            f'<a href="/lookup?q={urllib.parse.quote(e["master"])}">{esc(e["master"])}</a></span>'
+            f'<span class=m-containers>{esc(", ".join(e.get("containers") or []))}</span>'
+            f'<span class="pill rust">{e["days_waiting"]}d stuck</span></div>'
+            for e in stale)
+        stale_html = ('<div class=group-card style="border-left:4px solid var(--rust)">'
+            f'<div class=group-card-head><h3>&#9888; {len(stale)} master PO(s) stuck past '
+            f'{LEDGER_SLA_DAYS} days</h3></div>{stale_rows}</div>')
+
     # Display-only: agent_summary()'s by_classification keeps the raw enum keys (the
     # digest email/Power-Automate side may match on them) -- map through
     # _friendly_classification and MERGE by the resulting label (nrt_available_for_pickup
@@ -3048,7 +3130,9 @@ def _dashboard_html():
         '<div class=divider></div><div class=g-item>Queue depth <b>%s</b></div>'
         '<div class=divider></div><div class=g-item>Last decision <b>%s</b></div>%s</div>'
         % ({"live": "moss", "shadow": "line-strong", "mixed": "rust", "n/a": "line-strong"}.get(s["mode"], "line-strong"),
-           mode_pill, s["queue_depth"], esc(_fmt_ts(s["last_decision_at"]) or "&mdash;"), splits_chip))
+           mode_pill, s["queue_depth"],
+           esc(_fmt_ts(s["last_decision_at"])) if s["last_decision_at"] else "&mdash;",
+           splits_chip))
 
     # Only the /agent/log view variants -- everything else here used to duplicate a link
     # already in the persistent top nav (Look up, Split orders, Shipment history,
@@ -3061,7 +3145,7 @@ def _dashboard_html():
     header = ('<div class=section-head><h1 style="font-size:20px">Agent dashboard</h1></div>'
               '<p class=section-sub>Last 24 hours.</p>%s' % warn)
 
-    return (header + kpis + glance
+    return (header + kpis + glance + stale_html
             + ('<div class=class-row>%s</div>' % class_chips if class_chips else '')
             + quicklinks + _dashboard_recent_html(recent))
 
