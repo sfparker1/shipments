@@ -1233,7 +1233,13 @@ def container_ship_history(container):
     if not container:
         return {"shipped": False}
     for h in history(limit=0):
-        if container in (h.get("containers") or "") and h.get("status") == "ok" and h.get("created"):
+        # Exact token match against the ", "-joined list (see process_manual()'s
+        # container_ref), not a bare substring check -- `container in "..."` would also
+        # match if this container's ref happened to be a literal substring of a sibling
+        # container's ref in the same run (e.g. a shorter/malformed ref folded into a
+        # longer valid one), producing a false "already shipped" positive.
+        run_containers = {c.strip() for c in (h.get("containers") or "").split(",") if c.strip()}
+        if container in run_containers and h.get("status") == "ok" and h.get("created"):
             return {"shipped": True, "ts": h.get("ts"),
                     "master_pos": sorted({o.get("po") for o in (h.get("orders") or []) if o.get("po")})}
     return {"shipped": False}
@@ -3333,7 +3339,7 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/status":
             qs = urllib.parse.parse_qs(u.query)
             want = os.environ.get("STATUS_TOKEN", "")
-            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             # Accept either a valid token (automated sync) or a logged-in session (browser).
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
@@ -3380,7 +3386,7 @@ class H(BaseHTTPRequestHandler):
             # a shipment (writes stay POST-only, above).
             qs = urllib.parse.parse_qs(u.query)
             want = AUTOSHIP_TOKEN
-            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             container = qs.get("container", [""])[0].strip()
@@ -3401,7 +3407,7 @@ class H(BaseHTTPRequestHandler):
             # status noise hidden, exceptions always still shown; ?all=1 for everything.
             qs = urllib.parse.parse_qs(u.query)
             want = AGENT_TOKEN
-            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             msg_id = qs.get("message_id", [""])[0].strip() or None
@@ -3424,7 +3430,7 @@ class H(BaseHTTPRequestHandler):
             # for the real 2026-07-23 incident this closes). Read-only, no Acumatica calls.
             qs = urllib.parse.parse_qs(u.query)
             want = AGENT_TOKEN
-            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             container = (qs.get("container", [""])[0] or "").strip().upper()
@@ -3434,7 +3440,7 @@ class H(BaseHTTPRequestHandler):
             # this and emails/Teams-messages Parker). AGENT_TOKEN-authed. ?hours=N window.
             qs = urllib.parse.parse_qs(u.query)
             want = AGENT_TOKEN
-            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             try:
@@ -3446,7 +3452,7 @@ class H(BaseHTTPRequestHandler):
             # The mailbox-agent cron job pulls the queue of pushed emails here.
             qs = urllib.parse.parse_qs(u.query)
             want = AGENT_TOKEN
-            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             return self._send(200, json.dumps(ingest_list()), "application/json")
@@ -3455,7 +3461,7 @@ class H(BaseHTTPRequestHandler):
             # po_shipdates.json; pass reset=1 on the first chunk to clear stale entries.
             qs = urllib.parse.parse_qs(u.query)
             want = os.environ.get("STATUS_TOKEN", "")
-            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             cur = {} if qs.get("reset", ["0"])[0] == "1" else (load_json(SHIPDATES_PATH) or {})
@@ -3469,7 +3475,7 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/setcontainerdates":
             qs = urllib.parse.parse_qs(u.query)
             want = os.environ.get("STATUS_TOKEN", "")
-            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             cur = {} if qs.get("reset", ["0"])[0] == "1" else (load_json(CONTAINERDATES_PATH) or {})
