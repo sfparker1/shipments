@@ -17,7 +17,7 @@ internal PO# -> that PO's VendorRef (where the retail PO text lives) -> match
 against Sales Orders. Optional env overrides: RECEIPT_CONTAINER_FIELD /
 RECEIPT_CONTAINER_VIEW (skip auto-discovery), RECEIPT_LOOKBACK_DAYS (default 180).
 """
-import os, re, json, time, base64, hashlib, hmac, secrets, datetime, threading
+import os, re, json, time, base64, hashlib, hmac, secrets, datetime, threading, csv, io
 import urllib.parse, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
@@ -1238,6 +1238,45 @@ def history(limit=200):
     except Exception: pass
     out = list(reversed(out))
     return out[:limit] if limit else out
+
+# Columns for the CSV/Excel export -- one row per shipment outcome, covering successes
+# AND flagged/exceptions (see export_history_rows()). Fixed order/set so the export has a
+# stable shape run to run, regardless of which optional fields a given row happens to have.
+EXPORT_COLUMNS = ["ts", "status", "source", "container", "master_po", "order", "customer",
+                   "shipment_nbr", "created", "ship_date", "email_received_at",
+                   "acumatica_user", "reason", "note"]
+
+def export_history_rows(limit=0):
+    """Flatten history() into one row per shipment/order OUTCOME for the CSV/Excel export
+    -- covers successes (created/already_fulfilled/partial/failed/no_matches, one row per
+    matched order, from the `orders` list) AND flagged/exception outcomes (out_of_scope/
+    unresolved/anomaly/waiting), which only exist as RUN-level fields with no per-order
+    breakdown -- those get one summary row for the whole event instead. Requires the
+    logging-gap fix (every process_manual() outcome now reaches log_run(), not just ones
+    that get to the creation loop) to actually be complete; before that fix, recheck-
+    triggered waiting/exception outcomes were invisible to this export entirely.
+    Local file read only, no live Acumatica calls."""
+    rows = []
+    for run in history(limit=limit):
+        base = {"ts": run.get("ts"), "status": run.get("status"),
+                "source": run.get("document") or run.get("user") or "",
+                "container": run.get("containers"), "acumatica_user": run.get("acumatica_user"),
+                "ship_date": run.get("ship_date"), "email_received_at": run.get("email_received_at")}
+        orders = run.get("orders") or []
+        if orders:
+            for o in orders:
+                rows.append({**base, "master_po": o.get("po"), "order": o.get("order"),
+                             "customer": o.get("customer"), "shipment_nbr": o.get("shipment_nbr"),
+                             "created": bool(o.get("created")), "reason": o.get("reason"), "note": None})
+        else:
+            note = run.get("note")
+            anomalies = run.get("anomalies")
+            if anomalies:
+                anomaly_text = "; ".join(a.get("note", "") for a in anomalies if a.get("note"))
+                note = f"{note} -- {anomaly_text}" if note else anomaly_text
+            rows.append({**base, "master_po": None, "order": None, "customer": None,
+                         "shipment_nbr": None, "created": False, "reason": None, "note": note})
+    return rows
 
 def _flagged_row_masters(r):
     """Every master/PO token an already-flagged agent_log row's OWN stored tool_result
@@ -3761,11 +3800,37 @@ class H(BaseHTTPRequestHandler):
                 out = ('<div class=card><h1 style="font-size:16px">Lookup &mdash; error</h1>'
                        '<p class=sub style="color:var(--rust)">%s</p></div>' % str(e).replace("<", "&lt;"))
             return self._send(200, page(out, current="lookup"))
+        if u.path == "/history/export.csv":
+            # Session-authed (browser download button), same as every other dashboard
+            # page -- not token-gated like the automated endpoints, since this is a human
+            # clicking a link, not a scheduled flow. Full history (limit=0), no cap --
+            # this is a report, not a preview.
+            rows = export_history_rows(limit=0)
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=EXPORT_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(r)
+            # utf-8-sig (BOM) so Excel opens the file as UTF-8 directly instead of
+            # guessing the system codepage and mangling any non-ASCII customer/vendor text.
+            data = buf.getvalue().encode("utf-8-sig")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition",
+                              'attachment; filename="shipments_export_%s.csv"' % time.strftime("%Y%m%d"))
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if u.path == "/history":
             _badge = {"ok": "pill moss", "partial": "pill fog", "failed": "pill rust",
-                      "no_matches": "pill", "already_fulfilled": "pill moss"}
+                      "no_matches": "pill", "already_fulfilled": "pill moss",
+                      "out_of_scope": "pill", "unresolved": "pill rust",
+                      "anomaly": "pill rust", "waiting": "pill fog"}
             _status_label = {"ok": "Created", "partial": "Partially created", "failed": "Failed",
-                              "no_matches": "No matching order", "already_fulfilled": "Already fulfilled"}
+                              "no_matches": "No matching order", "already_fulfilled": "Already fulfilled",
+                              "out_of_scope": "Out of scope (3PL)", "unresolved": "Unresolved container",
+                              "anomaly": "Anomaly (already shipped)", "waiting": "Waiting on containers"}
             def _hrow(h):
                 status = h.get("status") or ""
                 label = _status_label.get(status, status or "&mdash;")
@@ -3827,7 +3892,8 @@ class H(BaseHTTPRequestHandler):
                         f"<td>{pill}</td><td>{h.get('created','')}/{h.get('orders_matched','')}</td>"
                         f"<td>{cont_cell}</td><td>{po_cell}</td><td>{detail_cell}</td></tr>")
             rows = "".join(_hrow(h) for h in history())
-            body = ('<div class=section-head><h1 style="font-size:20px">Shipment run history</h1></div>'
+            body = ('<div class=section-head><h1 style="font-size:20px">Shipment run history</h1>'
+                    '<a href="/history/export.csv" style="font-size:13px">&#8659; Export CSV</a></div>'
                     '<p class=section-sub>Every shipment-creation run, kept permanently on the tool&#39;s disk (not just this session). '
                     'Times are Pacific. Expand the last column for per-order/shipment detail. &#8220;Acumatica user&#8221; is who was '
                     'actually connected when the write ran (set <code>EXPECTED_ACU_USER</code> to flag any run under a different account).</p>'
