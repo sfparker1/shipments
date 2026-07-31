@@ -76,6 +76,7 @@ FCR_TOKEN = cfg("FCR_TOKEN", "") or AUTOSHIP_TOKEN  # token for /parsefcr (read-
 MAERSK_TOKEN = cfg("MAERSK_TOKEN", "") or FCR_TOKEN  # token for /checkmaersk and the watch-list endpoints (no Acumatica writes -- /autoship is the only endpoint that creates real records)
 AGENT_TOKEN = cfg("AGENT_TOKEN", "") or MAERSK_TOKEN  # token the mailbox-agent uses for /agent/log and /ingest/list|delete; falls back to MAERSK_TOKEN if not set separately
 INGEST_TOKEN = cfg("INGEST_TOKEN", "") or AGENT_TOKEN  # token Power Automate uses to POST /ingest; falls back to AGENT_TOKEN if not set separately
+SHIPMENT_WEBHOOK_URL = cfg("SHIPMENT_WEBHOOK_URL", "")  # Power Automate "When an HTTP request is received" trigger URL -- see notify_shipment_created()
 REDIRECT_URI = CFG["public_url"] + "/callback"
 COOKIE_SECRET = (CFG["app_password"] or "dev").encode() + b"::ship"
 SESSIONS = {}
@@ -1205,6 +1206,27 @@ def log_run(entry):
         with open(RUNS_PATH, "a") as f: f.write(json.dumps(entry) + "\n")
     except Exception: pass
 
+def notify_shipment_created(event):
+    """Fire a real-time notification the moment shipments are actually created (created>0
+    only -- waiting/anomaly/no-op outcomes don't fire this, they're covered by the daily
+    digest and the CSV export instead). POSTs to a Power Automate 'When an HTTP request is
+    received' trigger URL (SHIPMENT_WEBHOOK_URL) -- that flow formats and sends the actual
+    email/Teams message under Parker's own O365 login, same philosophy as the existing
+    daily digest (this app never touches email credentials directly).
+
+    Best-effort, fire-and-forget: a notification failure must NEVER affect the real
+    shipment-creation result the caller already has in hand -- caught and swallowed here,
+    logged to stdout only (visible in Render logs if it's ever needed for debugging)."""
+    if not SHIPMENT_WEBHOOK_URL:
+        return
+    try:
+        req = urllib.request.Request(
+            SHIPMENT_WEBHOOK_URL, data=json.dumps(event).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        urllib.request.urlopen(req, timeout=15)
+    except Exception as e:
+        print(f"[notify_shipment_created] webhook call failed (non-fatal): {e}")
+
 def history(limit=200):
     """Every non-dry-run process runs through here permanently (ship_runs.jsonl
     on the persistent disk) -- nothing is ever deleted from the file itself.
@@ -1996,6 +2018,7 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
                 row["result"] = res
                 if res.get("created"): created += 1
                 log_orders.append({"po": po, "order": f"{m['order_type']} {m['order_nbr']}".strip(),
+                                    "customer": m.get("customer"),
                                     "shipment_nbr": res.get("shipment_nbr"), "created": res.get("created"),
                                     "ship_date": res.get("ship_date"), "reason": res.get("reason") or res.get("error")})
             rows.append(row)
@@ -2025,6 +2048,13 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
                  "containers": container_ref, "unresolved_containers": unresolved_containers,
                  "out_of_scope_containers": out_of_scope_containers,
                  "ship_date": ship_date, "orders": log_orders})
+        if created:
+            notify_shipment_created({
+                "container": container_ref, "source": "manual-pdf-upload",
+                "acumatica_user": connected_user(), "ship_date": ship_date,
+                "created_count": created, "orders": [o for o in log_orders if o.get("created")],
+                "reference": parsed["dachser_reference"],
+            })
     return summary
 
 # ---------------- automated trigger (no PDF): NRT email / Maersk+FCR watch-list ----------------
@@ -2338,6 +2368,7 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                 else:
                     po_ok = False
                 log_orders.append({"po": po, "order": f"{m['order_type']} {m['order_nbr']}".strip(),
+                                    "customer": m.get("customer"),
                                     "shipment_nbr": res.get("shipment_nbr"), "created": res.get("created"),
                                     "ship_date": res.get("ship_date"), "reason": res.get("reason") or res.get("error")})
             rows.append(row)
@@ -2390,6 +2421,14 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                  "email_received_at": email_received_at,
                  "still_waiting_masters": still_waiting or None, "anomalies": anomalies or None,
                  "orders": log_orders})
+        if created:
+            notify_shipment_created({
+                "container": container, "source": source or "unknown",
+                "acumatica_user": connected_user(), "email_received_at": email_received_at,
+                "ship_date": ship_date, "created_count": created,
+                "orders": [o for o in log_orders if o.get("created")],
+                "still_waiting_masters": still_waiting or None, "anomalies": anomalies or None,
+            })
     return summary
 
 # ---------------- FCR (Forwarder's Cargo Receipt) parser -- Maersk/origin-title path ----------------
@@ -3817,10 +3856,12 @@ class H(BaseHTTPRequestHandler):
             pos = body.get("pos")
             source = (body.get("source") or "unknown").strip()
             dry = bool(body.get("dry_run"))
+            email_received_at = (body.get("email_received_at") or "").strip() or None
             if not container:
                 return self._send(400, json.dumps({"error": "container is required"}), "application/json")
             try:
-                out = process_manual(container, ship_date, pos=pos, source=source, dry_run=dry)
+                out = process_manual(container, ship_date, pos=pos, source=source, dry_run=dry,
+                                      email_received_at=email_received_at)
                 return self._send(200, json.dumps(out), "application/json")
             except Exception as e:
                 return self._send(200, json.dumps({"error": str(e)}), "application/json")
