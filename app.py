@@ -2220,10 +2220,17 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                 note = ("underlying Purchase Order isn't fully received yet -- waiting for "
                          "the remaining container(s) before shipping this order; no action needed")
                 reason = "po_incomplete"
-            return {"container": container, "waiting_on_containers": True, "created": 0,
-                    "orders_matched": 0, "reason": reason, "note": note,
-                    "completeness_detail": completeness_detail,
-                    "container_gaps": container_gaps or None}
+            out = {"container": container, "waiting_on_containers": True, "created": 0,
+                   "orders_matched": 0, "reason": reason, "note": note,
+                   "completeness_detail": completeness_detail,
+                   "container_gaps": container_gaps or None}
+            if anomalies:
+                # Don't silently drop the anomalies this event already found just because
+                # every SURVIVING (non-anomalous) resolved master also isn't ready yet --
+                # both facts are real and independent, a human reviewing this result should
+                # see both.
+                out["anomalies"] = anomalies
+            return out
         all_pos = ready
         unresolved = not original_resolved
         still_waiting = sorted(set(resolved) - set(ready))
