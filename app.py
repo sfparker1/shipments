@@ -2061,6 +2061,7 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
     still_waiting = []
     container_gaps = {}
     completeness_detail = []
+    anomalies = []  # only ever populated on the container-resolution (NRT) path below
     if pos:
         all_pos = list(dict.fromkeys(p.strip() for p in pos if p and p.strip()))
         unresolved = False
@@ -2100,7 +2101,9 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         # all. FAILS CLOSED: any resolution/lookup problem is treated as "not complete."
         # Ledger updated FIRST, unconditionally, before any shipment decision.
         pickup_date = ship_date or datetime.date.today().isoformat()
-        for token in resolved:
+        original_resolved = resolved
+        anomalous_tokens = set()
+        for token in original_resolved:
             entry = ledger_entry(token)
             if entry and entry.get("status") == "shipped":
                 # Don't blindly trust the local ledger's "shipped" flag -- verify against
@@ -2122,11 +2125,26 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                     _latest_shipment_for_order(m["order_type"], m["order_nbr"], retries=1, delay=0)
                     for m in find_any_sales_orders_batch([token]).get(token, []))
                 if still_shipped:
-                    return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
-                            "reason": "pickup_after_already_shipped",
-                            "note": f"master {token} was already marked shipped, but a new pickup "
-                                    "event just arrived for it -- a clerk should investigate",
-                            "ledger_entry": entry}
+                    # FIXED 2026-07-31 (real bug, caught live via /ledger/recheck): this used
+                    # to `return` the WHOLE function here -- for a shared trigger container
+                    # resolving to many unrelated masters (the common case, see the PER-MASTER
+                    # comment below), that aborted checking every OTHER token in `resolved`
+                    # too, not just this one. A container resolving to even ONE already-
+                    # shipped-and-verified sibling silently blocked every genuinely-ready
+                    # sibling from ever being (re)evaluated in the SAME event -- confirmed
+                    # live: masters 362040/041/044/045/328810 never actually got re-checked
+                    # by /ledger/recheck because container DRYU9475020 also resolves to
+                    # already-shipped sibling 361421, which always got hit first in iteration
+                    # order. Now excludes only THIS token from further processing and lets
+                    # every sibling proceed independently -- same principle as the
+                    # completeness gate below, which Parker already confirmed is correct.
+                    anomalies.append({"master": token,
+                                       "note": f"master {token} was already marked shipped, but a "
+                                               "new pickup event just arrived for it -- a clerk "
+                                               "should investigate",
+                                       "ledger_entry": entry})
+                    anomalous_tokens.add(token)
+                    continue
                 # The ledger was stale -- no live shipment actually exists anymore (e.g. it
                 # was deleted after being found erroneous). Reset so this master gets
                 # re-evaluated normally instead of being permanently stuck flagging a
@@ -2136,6 +2154,12 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                 # appeared, possibly months ago, and could immediately flag it as stuck.
                 ledger_set_status(token, "waiting", reset_first_seen=True)
             ledger_record(token, container, pickup_date)
+        resolved = [t for t in original_resolved if t not in anomalous_tokens]
+        if not resolved:
+            # Every resolved master for this container was an anomaly -- genuinely nothing
+            # else to do this event.
+            return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
+                    "reason": "pickup_after_already_shipped", "anomalies": anomalies}
         po_refs = resolve_pos_by_master(container)
         for token in resolved:
             ledger_stamp_checked(token)
@@ -2201,7 +2225,7 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                     "completeness_detail": completeness_detail,
                     "container_gaps": container_gaps or None}
         all_pos = ready
-        unresolved = not resolved
+        unresolved = not original_resolved
         still_waiting = sorted(set(resolved) - set(ready))
 
     matched = find_sales_orders_batch(all_pos)
@@ -2304,6 +2328,12 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         summary["still_waiting_masters"] = still_waiting
         summary["container_gaps"] = container_gaps or None
         summary["completeness_detail"] = completeness_detail
+    if anomalies:
+        # A sibling sharing this same trigger container was already marked shipped and
+        # genuinely still is -- excluded from processing (see the stale-ledger check
+        # above), surfaced here rather than aborting the whole event for every OTHER
+        # sibling too.
+        summary["anomalies"] = anomalies
     if not dry_run:
         if to_create == 0:
             if not already_fulfilled_pos:

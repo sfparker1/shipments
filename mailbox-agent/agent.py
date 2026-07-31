@@ -171,7 +171,15 @@ TOOLS = [
                        "neither created, already_fulfilled, nor matched to any open OR fulfilled order at "
                        "all (genuinely no sales order exists, possibly Cancelled/Voided/on hold) -- these "
                        "DO need a human, call finish with exception=true "
-                       "and explain which specific master(s).",
+                       "and explain which specific master(s); (6) a top-level `anomalies` list (non-empty) "
+                       "-- one or more OTHER masters sharing this SAME container were already marked "
+                       "shipped and genuinely still are (this container's pickup email arrived again after "
+                       "shipping -- a duplicate/resend). This can appear ALONGSIDE real created rows for "
+                       "other siblings in the same result -- it does NOT mean the whole call failed, just "
+                       "that the specific master(s) named in `anomalies` need a human to look at. Call "
+                       "finish with exception=true naming those master(s), using whatever classification "
+                       "fits the rest of the result otherwise (e.g. still nrt_available_for_pickup if other "
+                       "masters genuinely created).",
         "input_schema": {
             "type": "object",
             "properties": {
