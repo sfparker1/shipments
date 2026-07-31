@@ -972,14 +972,24 @@ def load_all_orders(force=False):
         _ALL_ORDERS["ts"] = now
     return rows
 
-FULFILLED_SO_STATUSES = {"Completed", "Closed"}  # genuinely fulfilled, not just non-open
+FULFILLED_SO_STATUSES = {"Completed", "Closed", "Shipping"}  # already has a shipment; not just non-open
+# "Shipping" confirmed real, 2026-07-31 (masters 362040/041/044/045/328810): Acumatica flips a
+# Sales Order's own status to "Shipping" the moment ANY shipment is created against it -- well
+# before that shipment is confirmed/invoiced (Completed/Closed). Without it here, an order in
+# this perfectly normal in-progress state matched NEITHER the open-orders search (order is no
+# longer "Open") NOR the old two-value fulfilled check -- read as "no open sales order," a false
+# exception for an order that's actually fine, and kept the ledger stuck on "partial" forever
+# (every /ledger/recheck re-hit the same false negative). Still deliberately NOT "anything
+# non-Open" -- Cancelled/Voided/Hold etc. remain correctly excluded, see this function's
+# docstring below.
 
 def find_fulfilled_sales_orders(pos):
-    """For masters with zero OPEN matches: is there a genuinely-fulfilled order (Completed/
-    Closed) instead? Distinguishes 'already fulfilled before this automation ran' (no action
-    needed, not a real problem) from a genuine gap (no sales order exists at all, which DOES
-    need a human). Only meaningfully called on that rare fallback path, not the normal hot
-    path.
+    """For masters with zero OPEN matches: is there an order instead that already has a
+    shipment against it -- Completed/Closed (fully invoiced), or Shipping (a shipment exists
+    but isn't confirmed/invoiced yet -- see FULFILLED_SO_STATUSES)? Distinguishes 'already
+    handled before/outside this automation' (no action needed, not a real problem) from a
+    genuine gap (no sales order exists at all, which DOES need a human). Only meaningfully
+    called on that rare fallback path, not the normal hot path.
 
     Deliberately an ALLOW-list (Completed/Closed only), not "anything non-Open" -- real bug
     caught 2026-07-29 before it shipped: the first version treated Cancelled/Voided orders
@@ -2176,9 +2186,12 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
             fulfilled_orders = fulfilled.get(po) or []
             if fulfilled_orders:
                 statuses = sorted({o["status"] for o in fulfilled_orders if o.get("status")})
+                # Not always "before this automation ran" -- a Shipping-status order (see
+                # FULFILLED_SO_STATUSES) commonly got its shipment from THIS SAME automation,
+                # just not yet confirmed/invoiced. Kept status-agnostic so the note stays true
+                # either way.
                 note = (f"already fulfilled -- {len(fulfilled_orders)} sales order(s) found with "
-                        f"status {', '.join(statuses)}; likely completed before this automation "
-                        "ran, no action needed")
+                        f"status {', '.join(statuses)}; no action needed")
                 rows.append({"po": po, "confidence": "ok", "note": note, "orders": [],
                              "already_fulfilled": True})
             else:
