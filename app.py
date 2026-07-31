@@ -1009,6 +1009,27 @@ def find_fulfilled_sales_orders(pos):
                 results[p].append(o)
     return results
 
+def find_any_sales_orders_batch(pos):
+    """Same DC-anchored match as find_sales_orders_batch(), but over EVERY order regardless
+    of status -- for the one place that genuinely needs "does an order for this master exist
+    at all, in any state" rather than "is it open" or "is it done": the stale-ledger
+    verification in process_manual() (does a real shipment still exist for a master the
+    ledger claims is already 'shipped'?). Using the open-only search there missed a Shipping-
+    or Completed/Closed-status order (see FULFILLED_SO_STATUSES's docstring for the real
+    Shipping-status incident) -- the master WAS genuinely still shipped, but the narrower
+    open-only search found nothing, wrongly read as "ledger stale," and bounced the master
+    back to 'waiting' for no reason every time that check ran."""
+    orders = load_all_orders()
+    results = {p: [] for p in pos}
+    for o in orders:
+        co = o["cust_order"]
+        if not co:
+            continue
+        for p in pos:
+            if _co_matches_master(co, p):
+                results[p].append(o)
+    return results
+
 # ---------------- shipment creation (validate via /diag first) ----------------
 def _latest_shipment_for_order(order_type, order_nbr, retries=3, delay=1.0):
     """Find the most recent real Shipment for an order, right after CreateShipment's
@@ -2007,7 +2028,8 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
     return summary
 
 # ---------------- automated trigger (no PDF): NRT email / Maersk+FCR watch-list ----------------
-def process_manual(container, ship_date, pos=None, user=None, source=None, dry_run=False):
+def process_manual(container, ship_date, pos=None, user=None, source=None, dry_run=False,
+                    force_receipts=True):
     """Programmatic twin of process_file() for automated triggers that never see a
     handover PDF. Two calling shapes:
       - container only (NRT path: the pickup email has no PO info) -> resolve PO#s the
@@ -2021,6 +2043,14 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
     in Acumatica) + log_run() to the same permanent audit log. `source` is a free-text tag
     (e.g. "nrt" / "maersk-fcr") recorded in the run history so History shows where each
     automated run came from.
+
+    force_receipts (default True): force a fresh load_recent_receipts() pull before the
+    completeness gate runs, so a stale cache can't understate a master's expected-container
+    set (see the call site below). Default True is right for a single live-trigger call.
+    Pass False when the CALLER already forced a refresh immediately before looping over
+    many masters in one batch (see /ledger/recheck) -- forcing again per-master there would
+    multiply into dozens of redundant full receipt refetches against Acumatica's 100
+    req/min cap for zero added correctness, since the shared cache is already fresh.
     """
     if not dry_run and not ship_date:
         return {"error": "Shipment date is required."}
@@ -2082,9 +2112,15 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                 # back to fully Open/unshipped. One bounded live check per matched order,
                 # only on this already-rare path (a master marked shipped getting ANOTHER
                 # pickup event) -- reuses the same proven idempotency lookup used elsewhere.
+                # find_any_sales_orders_batch (not find_sales_orders_batch/open-only): a
+                # genuinely still-shipped master's orders are commonly Shipping/Completed/
+                # Closed by now, not Open -- the open-only search found nothing for exactly
+                # that case, misread it as "ledger stale," and reset a correctly-shipped
+                # master back to waiting for no reason (real case, masters 362040/041/044/
+                # 045, 2026-07-31 -- see FULFILLED_SO_STATUSES's docstring).
                 still_shipped = any(
                     _latest_shipment_for_order(m["order_type"], m["order_nbr"], retries=1, delay=0)
-                    for m in find_sales_orders_batch([token]).get(token, []))
+                    for m in find_any_sales_orders_batch([token]).get(token, []))
                 if still_shipped:
                     return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
                             "reason": "pickup_after_already_shipped",
@@ -2103,6 +2139,18 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         po_refs = resolve_pos_by_master(container)
         for token in resolved:
             ledger_stamp_checked(token)
+        # Force a fresh receipts pull before deciding completeness (unless the caller says
+        # it already did -- see force_receipts param) -- containers_confirmed_available()
+        # (below) derives "every container this PO depends on" from
+        # expected_containers_for_master(), which reads load_recent_receipts()'s cache (up
+        # to RECEIPTS_TTL/10min stale). A sibling container's packing list landing in
+        # Acumatica in that window wouldn't be visible yet, understating the expected set --
+        # which makes completeness look satisfied when a real sibling is still unaccounted
+        # for. This is the one direction that matters: a STALE cache can only make the gate
+        # too PERMISSIVE (fewer expected containers to satisfy), never too strict, so the fix
+        # is a one-time forced refresh right before the gate runs, not after.
+        if force_receipts:
+            load_recent_receipts(force=True)
         # SECOND, INDEPENDENT gate (2026-07-24, real incident): the PO-receiving check
         # above is a warehouse-side fact (has Acumatica recorded all the qty as received);
         # it is NOT the same as "has every container this PO depends on been individually
@@ -2403,10 +2451,10 @@ def check_maersk_container(container, port_of_loading, timeout_ms=20000):
 
 # ---------------- diagnostics ----------------
 def _stage(r):
-    """Derive the next-action stage from a pipeline record.
-    The order is still Open (so_pipeline only sees open orders); it leaves the
-    Open list once its invoice is released, so 'Done' is handled upstream as an
-    empty pipeline. Shipment 'Status' is Open until Confirmed/Completed."""
+    """Derive the next-action stage from a pipeline record. so_pipeline() now matches
+    orders in any status (see its docstring), so this can see an order anywhere in its
+    life -- from before a shipment exists through invoice release. Shipment 'Status' is
+    Open until Confirmed/Completed."""
     if not r.get("shipment"): return "Create shipment"
     sst = (r.get("shipment_status") or "").lower()
     if "confirm" not in sst and "complet" not in sst:  # still Open / not confirmed
@@ -2451,11 +2499,20 @@ def _order_pipeline(m, po=None):
 
 def so_pipeline(po):
     """For a PO#, return each matched sales order's shipment/invoice pipeline stage.
-    Avoids substringof (500s on this tenant): matches the PO against the cached
-    OPEN-order list client-side, then reads each order's shipments via GET-by-key.
-    An order stays Open until fully invoiced, so a picked-up PO with no open match
-    is already fully processed ('Done')."""
-    return [_order_pipeline(m, po) for m in find_sales_orders_batch([po]).get(po, [])]
+    Avoids substringof (500s on this tenant): matches the PO against the cached order
+    list client-side, then reads each order's shipments via GET-by-key.
+
+    Uses find_any_sales_orders_batch (ALL statuses), not the open-only search. FIXED
+    2026-07-31: the order leaves "Open" the moment ANY shipment is created against it
+    (Acumatica flips it to "Shipping" -- see FULFILLED_SO_STATUSES's docstring), well
+    before it's confirmed or invoiced. The old open-only match silently showed nothing for
+    that order the instant a shipment existed, which read on /splits as "already fully
+    processed" -- when it was really just sitting at "shipment created, needs
+    confirmation," exactly the kind of thing a clerk should still see. A genuinely done
+    order (invoice released) still correctly shows nothing further to do -- _stage() below
+    already handles that case via Confirmed/invoice-released, this only widens which
+    orders get INTO the pipeline check at all."""
+    return [_order_pipeline(m, po) for m in find_any_sales_orders_batch([po]).get(po, [])]
 
 def split_order_status(master_token, entry):
     """Live status for one in-progress split order (a container_ledger.json entry): its
@@ -3715,6 +3772,14 @@ class H(BaseHTTPRequestHandler):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             ledger = load_json(LEDGER_PATH) or {}
             results = []
+            # One forced receipts refresh for the WHOLE batch, not per master -- the cache is
+            # shared, so this single refresh is what process_manual's own completeness gate
+            # relies on for every master below (force_receipts=False on each call skips a
+            # redundant re-force). See process_manual's docstring for why this matters here
+            # specifically: looping 20-30+ masters, each doing its own full paginated receipts
+            # refetch, would multiply straight into Acumatica's 100 req/min cap for zero added
+            # correctness once the shared cache is already fresh.
+            load_recent_receipts(force=True)
             # Acumatica's license caps this at 100 web-service API requests/minute
             # (confirmed via the License Monitoring Console). process_manual costs a
             # few calls per master (receipt/PO resolution, completeness, possibly a
@@ -3733,7 +3798,8 @@ class H(BaseHTTPRequestHandler):
                 first = False
                 latest = ledger_latest_date(token)
                 try:
-                    out = process_manual(containers[-1], latest, source="ledger-recheck", dry_run=False)
+                    out = process_manual(containers[-1], latest, source="ledger-recheck",
+                                          dry_run=False, force_receipts=False)
                 except Exception as e:
                     out = {"error": str(e)}
                 results.append({"master": token, "container_used": containers[-1], "result": out})
