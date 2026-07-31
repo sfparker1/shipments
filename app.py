@@ -1206,6 +1206,72 @@ def log_run(entry):
         with open(RUNS_PATH, "a") as f: f.write(json.dumps(entry) + "\n")
     except Exception: pass
 
+def _render_shipment_email_html(event):
+    """Pre-built, email-safe HTML for the shipment-created notification -- sent as-is in
+    the webhook payload (`email_body_html`) so the Power Automate flow just drops ONE
+    dynamic-content token into the email body, instead of building/styling a table itself.
+    Deliberately NOT the dashboard's own CSS (custom properties, flexbox) -- email clients
+    (especially Outlook desktop's Word rendering engine) need inline styles and table-based
+    layout, no external/embedded stylesheet reliance. Colors match the dashboard's design
+    tokens by value (sand/paper/stone/taupe/moss/rust) so this still reads as the same
+    product, not a mismatched bolt-on."""
+    def esc(v):
+        s = "" if v is None else str(v)
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    orders = event.get("orders") or []
+    rows_html = "".join(
+        f'<tr>'
+        f'<td style="padding:8px 10px;border-bottom:1px solid #ddd5c4;font-size:13px">{esc(o.get("po"))}</td>'
+        f'<td style="padding:8px 10px;border-bottom:1px solid #ddd5c4;font-size:13px">{esc(o.get("order"))}</td>'
+        f'<td style="padding:8px 10px;border-bottom:1px solid #ddd5c4;font-size:13px">{esc(o.get("customer"))}</td>'
+        f'<td style="padding:8px 10px;border-bottom:1px solid #ddd5c4;font-size:13px;font-weight:600">{esc(o.get("shipment_nbr"))}</td>'
+        f'</tr>'
+        for o in orders)
+    table_html = (
+        '<table style="width:100%;border-collapse:collapse;font-family:Segoe UI,Arial,sans-serif">'
+        '<tr style="background:#efece3;text-align:left">'
+        '<th style="padding:8px 10px;font-size:12px;color:#7d7363;text-transform:uppercase;letter-spacing:.03em">Master PO</th>'
+        '<th style="padding:8px 10px;font-size:12px;color:#7d7363;text-transform:uppercase;letter-spacing:.03em">Order</th>'
+        '<th style="padding:8px 10px;font-size:12px;color:#7d7363;text-transform:uppercase;letter-spacing:.03em">Customer</th>'
+        '<th style="padding:8px 10px;font-size:12px;color:#7d7363;text-transform:uppercase;letter-spacing:.03em">Shipment #</th>'
+        f'</tr>{rows_html}</table>') if orders else ""
+    meta_rows = "".join(
+        f'<tr><td style="padding:2px 0;color:#7d7363;font-size:13px;width:150px;vertical-align:top">{label}</td>'
+        f'<td style="padding:2px 0;color:#38352f;font-size:13px">{esc(value) if value else "&mdash;"}</td></tr>'
+        for label, value in [
+            ("Container", event.get("container")),
+            ("Ship date", event.get("ship_date")),
+            ("Email received", event.get("email_received_at")),
+            ("Source", event.get("source")),
+            ("Acumatica user", event.get("acumatica_user")),
+        ])
+    still_waiting = event.get("still_waiting_masters")
+    waiting_html = (
+        f'<div style="margin-top:14px;padding:10px 14px;background:#e9f0f1;color:#5d7682;'
+        f'border-radius:8px;font-size:13px">Still waiting on: {esc(", ".join(still_waiting))}</div>'
+    ) if still_waiting else ""
+    anomalies = event.get("anomalies")
+    anomalies_html = (
+        '<div style="margin-top:10px;padding:10px 14px;background:#f9ece3;color:#b0653a;'
+        'border-radius:8px;font-size:13px">&#9888; Needs review:<br>' +
+        "<br>".join(esc(a.get("note")) for a in anomalies) + '</div>'
+    ) if anomalies else ""
+    created_count = event.get("created_count") or 0
+    plural = "" if created_count == 1 else "s"
+    return (
+        '<div style="font-family:Segoe UI,Arial,sans-serif;max-width:640px;margin:0 auto;'
+        'background:#fbf9f5;border:1px solid #ddd5c4;border-radius:12px;overflow:hidden">'
+        f'<div style="background:#5a7d5a;color:#fbf9f5;padding:16px 20px;font-size:16px;font-weight:600">'
+        f'&#10003; {created_count} shipment{plural} created</div>'
+        f'<div style="padding:16px 20px">'
+        f'<table style="width:100%;margin-bottom:16px">{meta_rows}</table>'
+        f'{table_html}{waiting_html}{anomalies_html}'
+        f'</div>'
+        f'<div style="padding:12px 20px;border-top:1px solid #ddd5c4;font-size:11px;color:#7d7363">'
+        f'Full history: {esc(CFG.get("public_url"))}/history</div>'
+        '</div>'
+    )
+
 def notify_shipment_created(event):
     """Fire a real-time notification the moment shipments are actually created (created>0
     only -- waiting/anomaly/no-op outcomes don't fire this, they're covered by the daily
@@ -1214,14 +1280,24 @@ def notify_shipment_created(event):
     email/Teams message under Parker's own O365 login, same philosophy as the existing
     daily digest (this app never touches email credentials directly).
 
+    Includes a pre-rendered `email_body_html` field (see _render_shipment_email_html) so
+    the Power Automate flow's email body is just ONE dynamic-content token, not a hand-
+    built table/expression -- avoids the exact fragility already hit once building the
+    daily-digest flow (a complex expression typed directly into the Body broke rendering;
+    see the Notification Flow Guide's 'Power Automate lessons learned'). The raw structured
+    fields (container, orders, etc.) stay in the payload too, for a Teams adaptive card or
+    any other consumer that wants the data instead of pre-built HTML.
+
     Best-effort, fire-and-forget: a notification failure must NEVER affect the real
     shipment-creation result the caller already has in hand -- caught and swallowed here,
     logged to stdout only (visible in Render logs if it's ever needed for debugging)."""
     if not SHIPMENT_WEBHOOK_URL:
         return
     try:
+        payload = dict(event)
+        payload["email_body_html"] = _render_shipment_email_html(event)
         req = urllib.request.Request(
-            SHIPMENT_WEBHOOK_URL, data=json.dumps(event).encode(),
+            SHIPMENT_WEBHOOK_URL, data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"}, method="POST")
         urllib.request.urlopen(req, timeout=15)
     except Exception as e:
