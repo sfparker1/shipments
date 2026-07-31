@@ -296,7 +296,13 @@ def run_tool(name, args, item, decision):
         if SHADOW_MODE:
             decision["shadow_intercepted"] = True
             return {"shadow_mode": True, "note": "would have created shipment on Hold; nothing sent"}, False
-        body = {"container": args.get("container"), "ship_date": args.get("ship_date"), "source": "nrt-agent"}
+        # email_received_at comes straight from the queued item's own metadata (ground
+        # truth from the email itself), not something the LLM has to transcribe -- avoids
+        # any risk of the model mangling a precise timestamp when copying it into a tool
+        # call. Purely informational on the receiving end (the shipment-created
+        # notification), never used for any gating/date-math decision.
+        body = {"container": args.get("container"), "ship_date": args.get("ship_date"),
+                "source": "nrt-agent", "email_received_at": item.get("received_date")}
         st, data = _http("POST", "/autoship", AUTOSHIP_TOKEN, body=body)
         decision["tool_result"] = {"status": st, "data": data}
         return (data if st == 200 else {"error": f"autoship HTTP {st}", "detail": data}), True

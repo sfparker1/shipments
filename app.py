@@ -17,7 +17,7 @@ internal PO# -> that PO's VendorRef (where the retail PO text lives) -> match
 against Sales Orders. Optional env overrides: RECEIPT_CONTAINER_FIELD /
 RECEIPT_CONTAINER_VIEW (skip auto-discovery), RECEIPT_LOOKBACK_DAYS (default 180).
 """
-import os, re, json, time, base64, hashlib, hmac, secrets, datetime, threading
+import os, re, json, time, base64, hashlib, hmac, secrets, datetime, threading, csv, io
 import urllib.parse, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
@@ -76,6 +76,7 @@ FCR_TOKEN = cfg("FCR_TOKEN", "") or AUTOSHIP_TOKEN  # token for /parsefcr (read-
 MAERSK_TOKEN = cfg("MAERSK_TOKEN", "") or FCR_TOKEN  # token for /checkmaersk and the watch-list endpoints (no Acumatica writes -- /autoship is the only endpoint that creates real records)
 AGENT_TOKEN = cfg("AGENT_TOKEN", "") or MAERSK_TOKEN  # token the mailbox-agent uses for /agent/log and /ingest/list|delete; falls back to MAERSK_TOKEN if not set separately
 INGEST_TOKEN = cfg("INGEST_TOKEN", "") or AGENT_TOKEN  # token Power Automate uses to POST /ingest; falls back to AGENT_TOKEN if not set separately
+SHIPMENT_WEBHOOK_URL = cfg("SHIPMENT_WEBHOOK_URL", "")  # Power Automate "When an HTTP request is received" trigger URL -- see notify_shipment_created()
 REDIRECT_URI = CFG["public_url"] + "/callback"
 COOKIE_SECRET = (CFG["app_password"] or "dev").encode() + b"::ship"
 SESSIONS = {}
@@ -1205,6 +1206,194 @@ def log_run(entry):
         with open(RUNS_PATH, "a") as f: f.write(json.dumps(entry) + "\n")
     except Exception: pass
 
+def _render_shipment_email_html(event):
+    """Pre-built, email-safe HTML for the shipment-created notification -- sent as-is in
+    the webhook payload (`email_body_html`) so the Power Automate flow just drops ONE
+    dynamic-content token into the email body, instead of building/styling a table itself.
+    Deliberately NOT the dashboard's own CSS (custom properties, flexbox) -- email clients
+    (especially Outlook desktop's Word rendering engine) need inline styles and table-based
+    layout, no external/embedded stylesheet reliance. Colors match the dashboard's design
+    tokens by value (sand/paper/stone/taupe/moss/rust) so this still reads as the same
+    product, not a mismatched bolt-on."""
+    def esc(v):
+        s = "" if v is None else str(v)
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    orders = event.get("orders") or []
+    rows_html = "".join(
+        f'<tr>'
+        f'<td style="padding:8px 10px;border-bottom:1px solid #ddd5c4;font-size:13px">{esc(o.get("po"))}</td>'
+        f'<td style="padding:8px 10px;border-bottom:1px solid #ddd5c4;font-size:13px">{esc(o.get("order"))}</td>'
+        f'<td style="padding:8px 10px;border-bottom:1px solid #ddd5c4;font-size:13px">{esc(o.get("customer"))}</td>'
+        f'<td style="padding:8px 10px;border-bottom:1px solid #ddd5c4;font-size:13px;font-weight:600">{esc(o.get("shipment_nbr"))}</td>'
+        f'</tr>'
+        for o in orders)
+    table_html = (
+        '<table style="width:100%;border-collapse:collapse;font-family:Segoe UI,Arial,sans-serif">'
+        '<tr style="background:#efece3;text-align:left">'
+        '<th style="padding:8px 10px;font-size:12px;color:#7d7363;text-transform:uppercase;letter-spacing:.03em">Master PO</th>'
+        '<th style="padding:8px 10px;font-size:12px;color:#7d7363;text-transform:uppercase;letter-spacing:.03em">Order</th>'
+        '<th style="padding:8px 10px;font-size:12px;color:#7d7363;text-transform:uppercase;letter-spacing:.03em">Customer</th>'
+        '<th style="padding:8px 10px;font-size:12px;color:#7d7363;text-transform:uppercase;letter-spacing:.03em">Shipment #</th>'
+        f'</tr>{rows_html}</table>') if orders else ""
+    meta_rows = "".join(
+        f'<tr><td style="padding:2px 0;color:#7d7363;font-size:13px;width:150px;vertical-align:top">{label}</td>'
+        f'<td style="padding:2px 0;color:#38352f;font-size:13px">{esc(value) if value else "&mdash;"}</td></tr>'
+        for label, value in [
+            ("Container", event.get("container")),
+            ("Ship date", event.get("ship_date")),
+            ("Email received", event.get("email_received_at")),
+            ("Source", event.get("source")),
+            ("Acumatica user", event.get("acumatica_user")),
+        ])
+    still_waiting = event.get("still_waiting_masters")
+    waiting_html = (
+        f'<div style="margin-top:14px;padding:10px 14px;background:#e9f0f1;color:#5d7682;'
+        f'border-radius:8px;font-size:13px">Still waiting on: {esc(", ".join(still_waiting))}</div>'
+    ) if still_waiting else ""
+    anomalies = event.get("anomalies")
+    anomalies_html = (
+        '<div style="margin-top:10px;padding:10px 14px;background:#f9ece3;color:#b0653a;'
+        'border-radius:8px;font-size:13px">&#9888; Needs review:<br>' +
+        "<br>".join(esc(a.get("note")) for a in anomalies) + '</div>'
+    ) if anomalies else ""
+    created_count = event.get("created_count") or 0
+    plural = "" if created_count == 1 else "s"
+    return (
+        '<div style="font-family:Segoe UI,Arial,sans-serif;max-width:640px;margin:0 auto;'
+        'background:#fbf9f5;border:1px solid #ddd5c4;border-radius:12px;overflow:hidden">'
+        f'<div style="background:#5a7d5a;color:#fbf9f5;padding:16px 20px;font-size:16px;font-weight:600">'
+        f'&#10003; {created_count} shipment{plural} created</div>'
+        f'<div style="padding:16px 20px">'
+        f'<table style="width:100%;margin-bottom:16px">{meta_rows}</table>'
+        f'{table_html}{waiting_html}{anomalies_html}'
+        f'</div>'
+        f'<div style="padding:12px 20px;border-top:1px solid #ddd5c4;font-size:11px;color:#7d7363">'
+        f'Full history: {esc(CFG.get("public_url"))}/history</div>'
+        '</div>'
+    )
+
+def notify_shipment_created(event):
+    """Fire a real-time notification the moment shipments are actually created (created>0
+    only -- waiting/anomaly/no-op outcomes don't fire this, they're covered by the daily
+    digest and the CSV export instead). POSTs to a Power Automate 'When an HTTP request is
+    received' trigger URL (SHIPMENT_WEBHOOK_URL) -- that flow formats and sends the actual
+    email/Teams message under Parker's own O365 login, same philosophy as the existing
+    daily digest (this app never touches email credentials directly).
+
+    Includes a pre-rendered `email_body_html` field (see _render_shipment_email_html) so
+    the Power Automate flow's email body is just ONE dynamic-content token, not a hand-
+    built table/expression -- avoids the exact fragility already hit once building the
+    daily-digest flow (a complex expression typed directly into the Body broke rendering;
+    see the Notification Flow Guide's 'Power Automate lessons learned'). The raw structured
+    fields (container, orders, etc.) stay in the payload too, for a Teams adaptive card or
+    any other consumer that wants the data instead of pre-built HTML.
+
+    Best-effort, fire-and-forget: a notification failure must NEVER affect the real
+    shipment-creation result the caller already has in hand -- caught and swallowed here,
+    logged to stdout only (visible in Render logs if it's ever needed for debugging)."""
+    if not SHIPMENT_WEBHOOK_URL:
+        return
+    try:
+        payload = dict(event)
+        payload["email_body_html"] = _render_shipment_email_html(event)
+        req = urllib.request.Request(
+            SHIPMENT_WEBHOOK_URL, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        urllib.request.urlopen(req, timeout=15)
+    except Exception as e:
+        print(f"[notify_shipment_created] webhook call failed (non-fatal): {e}")
+
+# ---------------- shipment-creation audit certificate (file attachment) ----------------
+# Confirmed live-proven pattern, ported from the packing-list-acumatica sibling app (same
+# Acumatica tenant): PUT {ENTITY}/{Entity}/{key}/files/{filename} with the raw file bytes,
+# Content-Type: application/octet-stream. That app keys PurchaseReceipt as
+# "PurchaseReceipt/Receipt/{receiptNbr}/files/..." (Receipt is a fixed Type discriminator
+# PurchaseReceipt needs); Shipment doesn't need one -- this app already keys Shipment by
+# number alone everywhere else (_latest_shipment_for_order, set_shipment_date_and_container),
+# so the analogous call is Shipment/{shipmentNbr}/files/{filename}.
+def attach_file(entity_path, filename, content):
+    """Attach a file to an Acumatica record via the contract API's files endpoint.
+    entity_path is the entity + key, e.g. "Shipment/018808" -- caller-supplied so this stays
+    reusable beyond just Shipment if ever needed. Returns (ok, detail)."""
+    tk = access_token()
+    if not tk:
+        return False, "not connected"
+    # Same base_url + ENTITY prefix convention as api() (ENTITY already = "/entity/Default/{version}").
+    url = CFG["base_url"] + f"{ENTITY}/{entity_path}/files/{urllib.parse.quote(filename)}"
+    req = urllib.request.Request(url, data=content, method="PUT",
+        headers={"Authorization": "Bearer " + tk,
+                 "Content-Type": "application/octet-stream", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return (resp.status in (200, 204)), "attached"
+    except urllib.error.HTTPError as e:
+        return False, f"attach HTTP {e.code}"
+    except Exception as e:
+        return False, str(e)[:80]
+
+def _pdf_cert(title, lines):
+    """Minimal dependency-free single-page PDF (Courier, monospace for alignment). Direct
+    port of the same technique already proven in the packing-list-acumatica sibling app's
+    PO Receipt reconciliation certificate -- no new dependency, stdlib only."""
+    def esc(s):
+        return str(s).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    content = "BT\n/F2 15 Tf 1 0 0 1 54 760 Tm (%s) Tj\n" % esc(title)
+    y = 730
+    for (t, size, bold) in lines:
+        content += "/%s %d Tf 1 0 0 1 54 %d Tm (%s) Tj\n" % ("F2" if bold else "F1", size, y, esc(t))
+        y -= int(size * 1.7)
+    content += "ET"
+    cb = content.encode("latin-1", "replace")
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n" % len(cb) + cb + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier-Bold >>",
+    ]
+    out = b"%PDF-1.4\n"
+    offsets = []
+    for i, o in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += ("%d 0 obj\n" % i).encode() + o + b"\nendobj\n"
+    xref = len(out)
+    out += ("xref\n0 %d\n" % (len(objs) + 1)).encode() + b"0000000000 65535 f \n"
+    for off in offsets:
+        out += ("%010d 00000 n \n" % off).encode()
+    out += ("trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF"
+            % (len(objs) + 1, xref)).encode()
+    return out
+
+def attach_shipment_certificate(shipment_nbr, po, order, customer, container, ship_date,
+                                 email_received_at, source, po_status=None):
+    """Best-effort, fire-and-forget (same standard as notify_shipment_created): attach a
+    one-page 'Shipment Creation Certificate' PDF directly onto the Shipment record, so an
+    auditor opening the Shipment in Acumatica sees the justification right there -- no need
+    to cross-reference this app's separate logs. A failure here must never affect the real
+    shipment-creation result already in hand."""
+    if not shipment_nbr:
+        return
+    try:
+        lines = [
+            (f"Shipment: {shipment_nbr}     Master PO: {po or '-'}", 11, True),
+            (f"Order: {order or '-'}     Customer: {customer or '-'}", 10, False),
+            (f"Container: {container or '-'}", 10, False),
+            (f"Ship date: {ship_date or '-'}", 10, False),
+            (f"NRT status-email received: {email_received_at or '(not recorded)'}", 10, False),
+            (f"Trigger source: {source or 'unknown'}", 10, False),
+        ]
+        if po_status:
+            lines.append((f"Purchase Order status at creation: {po_status}", 10, False))
+        lines.append(("", 6, False))
+        lines.append((f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}", 9, False))
+        pdf = _pdf_cert("Shipment Creation Certificate", lines)
+        ok, detail = attach_file(f"Shipment/{shipment_nbr}", f"Creation-Certificate-{shipment_nbr}.pdf", pdf)
+        if not ok:
+            print(f"[attach_shipment_certificate] failed for {shipment_nbr} (non-fatal): {detail}")
+    except Exception as e:
+        print(f"[attach_shipment_certificate] failed for {shipment_nbr} (non-fatal): {e}")
+
 def history(limit=200):
     """Every non-dry-run process runs through here permanently (ship_runs.jsonl
     on the persistent disk) -- nothing is ever deleted from the file itself.
@@ -1216,6 +1405,45 @@ def history(limit=200):
     except Exception: pass
     out = list(reversed(out))
     return out[:limit] if limit else out
+
+# Columns for the CSV/Excel export -- one row per shipment outcome, covering successes
+# AND flagged/exceptions (see export_history_rows()). Fixed order/set so the export has a
+# stable shape run to run, regardless of which optional fields a given row happens to have.
+EXPORT_COLUMNS = ["ts", "status", "source", "container", "master_po", "order", "customer",
+                   "shipment_nbr", "created", "ship_date", "email_received_at",
+                   "acumatica_user", "reason", "note"]
+
+def export_history_rows(limit=0):
+    """Flatten history() into one row per shipment/order OUTCOME for the CSV/Excel export
+    -- covers successes (created/already_fulfilled/partial/failed/no_matches, one row per
+    matched order, from the `orders` list) AND flagged/exception outcomes (out_of_scope/
+    unresolved/anomaly/waiting), which only exist as RUN-level fields with no per-order
+    breakdown -- those get one summary row for the whole event instead. Requires the
+    logging-gap fix (every process_manual() outcome now reaches log_run(), not just ones
+    that get to the creation loop) to actually be complete; before that fix, recheck-
+    triggered waiting/exception outcomes were invisible to this export entirely.
+    Local file read only, no live Acumatica calls."""
+    rows = []
+    for run in history(limit=limit):
+        base = {"ts": run.get("ts"), "status": run.get("status"),
+                "source": run.get("document") or run.get("user") or "",
+                "container": run.get("containers"), "acumatica_user": run.get("acumatica_user"),
+                "ship_date": run.get("ship_date"), "email_received_at": run.get("email_received_at")}
+        orders = run.get("orders") or []
+        if orders:
+            for o in orders:
+                rows.append({**base, "master_po": o.get("po"), "order": o.get("order"),
+                             "customer": o.get("customer"), "shipment_nbr": o.get("shipment_nbr"),
+                             "created": bool(o.get("created")), "reason": o.get("reason"), "note": None})
+        else:
+            note = run.get("note")
+            anomalies = run.get("anomalies")
+            if anomalies:
+                anomaly_text = "; ".join(a.get("note", "") for a in anomalies if a.get("note"))
+                note = f"{note} -- {anomaly_text}" if note else anomaly_text
+            rows.append({**base, "master_po": None, "order": None, "customer": None,
+                         "shipment_nbr": None, "created": False, "reason": None, "note": note})
+    return rows
 
 def _flagged_row_masters(r):
     """Every master/PO token an already-flagged agent_log row's OWN stored tool_result
@@ -1994,8 +2222,14 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
             if not dry_run:
                 res = create_shipment(m["order_type"], m["order_nbr"], container_ref, ship_date, po=po)
                 row["result"] = res
-                if res.get("created"): created += 1
+                if res.get("created"):
+                    created += 1
+                    attach_shipment_certificate(
+                        res.get("shipment_nbr"), po, f"{m['order_type']} {m['order_nbr']}".strip(),
+                        m.get("customer"), container_ref, res.get("ship_date") or ship_date,
+                        None, "manual-pdf-upload")
                 log_orders.append({"po": po, "order": f"{m['order_type']} {m['order_nbr']}".strip(),
+                                    "customer": m.get("customer"),
                                     "shipment_nbr": res.get("shipment_nbr"), "created": res.get("created"),
                                     "ship_date": res.get("ship_date"), "reason": res.get("reason") or res.get("error")})
             rows.append(row)
@@ -2025,11 +2259,18 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
                  "containers": container_ref, "unresolved_containers": unresolved_containers,
                  "out_of_scope_containers": out_of_scope_containers,
                  "ship_date": ship_date, "orders": log_orders})
+        if created:
+            notify_shipment_created({
+                "container": container_ref, "source": "manual-pdf-upload",
+                "acumatica_user": connected_user(), "ship_date": ship_date,
+                "created_count": created, "orders": [o for o in log_orders if o.get("created")],
+                "reference": parsed["dachser_reference"],
+            })
     return summary
 
 # ---------------- automated trigger (no PDF): NRT email / Maersk+FCR watch-list ----------------
 def process_manual(container, ship_date, pos=None, user=None, source=None, dry_run=False,
-                    force_receipts=True):
+                    force_receipts=True, email_received_at=None):
     """Programmatic twin of process_file() for automated triggers that never see a
     handover PDF. Two calling shapes:
       - container only (NRT path: the pickup email has no PO info) -> resolve PO#s the
@@ -2051,12 +2292,36 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
     many masters in one batch (see /ledger/recheck) -- forcing again per-master there would
     multiply into dozens of redundant full receipt refetches against Acumatica's 100
     req/min cap for zero added correctness, since the shared cache is already fresh.
+
+    email_received_at (optional): the triggering NRT email's own received timestamp
+    (YYYY-MM-DD HH:MM:SS or similar), distinct from ship_date (a bare date). Recorded on
+    the permanent log entry and included in the shipment-created notification -- purely
+    informational, never used for any gating/date-math decision.
     """
     if not dry_run and not ship_date:
         return {"error": "Shipment date is required."}
     container = (container or "").strip().upper()
     if not container:
         return {"error": "container is required."}
+
+    # FIXED 2026-07-31: every one of these early-return outcomes used to skip log_run()
+    # entirely -- fine for the mailbox-agent's own NRT-triggered calls (its OWN separate
+    # agent_log.jsonl still captures the decision), but /ledger/recheck calls process_manual()
+    # directly, bypassing the agent loop -- an out_of_scope/unresolved/anomaly/waiting outcome
+    # from THAT path was never durably recorded anywhere, visible only in that one HTTP
+    # response. Now every outcome gets a permanent row, so ship_runs.jsonl is a complete
+    # record regardless of trigger source -- needed for the CSV export and the shipment-
+    # created notification to have anything real to work from.
+    def _log_early(status, extra=None):
+        if dry_run:
+            return
+        entry = {"reference": None, "document": source or "unknown", "user": user,
+                 "acumatica_user": connected_user(), "status": status, "orders_matched": 0,
+                 "created": 0, "containers": container, "ship_date": ship_date,
+                 "email_received_at": email_received_at, "orders": []}
+        if extra:
+            entry.update(extra)
+        log_run(entry)
 
     still_waiting = []
     container_gaps = {}
@@ -2070,6 +2335,7 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         # Out of scope: 3PL-bound units are recognized at the 3PL, not at port pickup.
         # Skip quietly (not a review exception) so 3PL containers don't spam the digest.
         if scope == "out_of_scope":
+            _log_early("out_of_scope")
             return {"container": container, "out_of_scope": True, "created": 0, "orders_matched": 0,
                     "reason": "out_of_scope_3pl",
                     "note": "container's PO Receipt is 3PL-bound (MMX/4006/AMAZON/HG); revenue is "
@@ -2085,6 +2351,7 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
             # matching receipt (or a receipt with no recognizable retail PO#) could sit
             # silently invisible forever, with zero human visibility, unless another NRT
             # email happens to arrive later.
+            _log_early("unresolved")
             return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
                     "reason": "unresolved_container",
                     "note": "no Acumatica receipt was found for this container, or its receipt's "
@@ -2158,6 +2425,7 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         if not resolved:
             # Every resolved master for this container was an anomaly -- genuinely nothing
             # else to do this event.
+            _log_early("anomaly", {"anomalies": anomalies})
             return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
                     "reason": "pickup_after_already_shipped", "anomalies": anomalies}
         po_refs = resolve_pos_by_master(container)
@@ -2230,6 +2498,7 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                 # both facts are real and independent, a human reviewing this result should
                 # see both.
                 out["anomalies"] = anomalies
+            _log_early("waiting", {"note": note, "unresolved_containers": []})
             return out
         all_pos = ready
         unresolved = not original_resolved
@@ -2293,23 +2562,32 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                 # duplicate/resent NRT email) naturally resume/no-op without depending on
                 # whether Acumatica's CreateShipment itself would reject or duplicate a
                 # re-call (confirmed unresolved either way, see the Phase-2 plan).
+                # Ship at the LATEST recorded pickup date for this master (spans however many
+                # separate NRT events it took), not just this one event's own date -- falls
+                # back to the passed-in ship_date for the pos-given (Maersk/FCR) path, which
+                # isn't ledger-tracked. Computed unconditionally (not just in the fresh-create
+                # branch below) since the certificate needs a real date either way, including
+                # on the idempotency-shortcut path.
+                effective_date = ledger_latest_date(po) or ship_date
                 existing = _latest_shipment_for_order(m["order_type"], m["order_nbr"], retries=1, delay=0)
                 if existing:
                     res = {"order": f"{m['order_type']} {m['order_nbr']}", "created": True,
                            "shipment_nbr": existing.get("shipment_nbr"), "already_existed": True}
                 else:
-                    # Ship at the LATEST recorded pickup date for this master (spans however
-                    # many separate NRT events it took), not just this one event's own date --
-                    # falls back to the passed-in ship_date for the pos-given (Maersk/FCR) path,
-                    # which isn't ledger-tracked.
-                    effective_date = ledger_latest_date(po) or ship_date
                     res = create_shipment(m["order_type"], m["order_nbr"], container, effective_date, po=po)
                 row["result"] = res
                 if res.get("created"):
                     created += 1
+                    po_status = next((d.get("po_status") for d in completeness_detail
+                                       if d.get("master") == po), None)
+                    attach_shipment_certificate(
+                        res.get("shipment_nbr"), po, f"{m['order_type']} {m['order_nbr']}".strip(),
+                        m.get("customer"), container, res.get("ship_date") or effective_date,
+                        email_received_at, source, po_status)
                 else:
                     po_ok = False
                 log_orders.append({"po": po, "order": f"{m['order_type']} {m['order_nbr']}".strip(),
+                                    "customer": m.get("customer"),
                                     "shipment_nbr": res.get("shipment_nbr"), "created": res.get("created"),
                                     "ship_date": res.get("ship_date"), "reason": res.get("reason") or res.get("error")})
             rows.append(row)
@@ -2359,7 +2637,17 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                  "user": user or f"auto:{source or 'unknown'}", "acumatica_user": connected_user(),
                  "status": status, "orders_matched": to_create, "created": created, "containers": container,
                  "unresolved_containers": unresolved_containers, "ship_date": ship_date,
+                 "email_received_at": email_received_at,
+                 "still_waiting_masters": still_waiting or None, "anomalies": anomalies or None,
                  "orders": log_orders})
+        if created:
+            notify_shipment_created({
+                "container": container, "source": source or "unknown",
+                "acumatica_user": connected_user(), "email_received_at": email_received_at,
+                "ship_date": ship_date, "created_count": created,
+                "orders": [o for o in log_orders if o.get("created")],
+                "still_waiting_masters": still_waiting or None, "anomalies": anomalies or None,
+            })
     return summary
 
 # ---------------- FCR (Forwarder's Cargo Receipt) parser -- Maersk/origin-title path ----------------
@@ -3692,11 +3980,37 @@ class H(BaseHTTPRequestHandler):
                 out = ('<div class=card><h1 style="font-size:16px">Lookup &mdash; error</h1>'
                        '<p class=sub style="color:var(--rust)">%s</p></div>' % str(e).replace("<", "&lt;"))
             return self._send(200, page(out, current="lookup"))
+        if u.path == "/history/export.csv":
+            # Session-authed (browser download button), same as every other dashboard
+            # page -- not token-gated like the automated endpoints, since this is a human
+            # clicking a link, not a scheduled flow. Full history (limit=0), no cap --
+            # this is a report, not a preview.
+            rows = export_history_rows(limit=0)
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=EXPORT_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(r)
+            # utf-8-sig (BOM) so Excel opens the file as UTF-8 directly instead of
+            # guessing the system codepage and mangling any non-ASCII customer/vendor text.
+            data = buf.getvalue().encode("utf-8-sig")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition",
+                              'attachment; filename="shipments_export_%s.csv"' % time.strftime("%Y%m%d"))
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if u.path == "/history":
             _badge = {"ok": "pill moss", "partial": "pill fog", "failed": "pill rust",
-                      "no_matches": "pill", "already_fulfilled": "pill moss"}
+                      "no_matches": "pill", "already_fulfilled": "pill moss",
+                      "out_of_scope": "pill", "unresolved": "pill rust",
+                      "anomaly": "pill rust", "waiting": "pill fog"}
             _status_label = {"ok": "Created", "partial": "Partially created", "failed": "Failed",
-                              "no_matches": "No matching order", "already_fulfilled": "Already fulfilled"}
+                              "no_matches": "No matching order", "already_fulfilled": "Already fulfilled",
+                              "out_of_scope": "Out of scope (3PL)", "unresolved": "Unresolved container",
+                              "anomaly": "Anomaly (already shipped)", "waiting": "Waiting on containers"}
             def _hrow(h):
                 status = h.get("status") or ""
                 label = _status_label.get(status, status or "&mdash;")
@@ -3758,7 +4072,8 @@ class H(BaseHTTPRequestHandler):
                         f"<td>{pill}</td><td>{h.get('created','')}/{h.get('orders_matched','')}</td>"
                         f"<td>{cont_cell}</td><td>{po_cell}</td><td>{detail_cell}</td></tr>")
             rows = "".join(_hrow(h) for h in history())
-            body = ('<div class=section-head><h1 style="font-size:20px">Shipment run history</h1></div>'
+            body = ('<div class=section-head><h1 style="font-size:20px">Shipment run history</h1>'
+                    '<a href="/history/export.csv" style="font-size:13px">&#8659; Export CSV</a></div>'
                     '<p class=section-sub>Every shipment-creation run, kept permanently on the tool&#39;s disk (not just this session). '
                     'Times are Pacific. Expand the last column for per-order/shipment detail. &#8220;Acumatica user&#8221; is who was '
                     'actually connected when the write ran (set <code>EXPECTED_ACU_USER</code> to flag any run under a different account).</p>'
@@ -3787,10 +4102,12 @@ class H(BaseHTTPRequestHandler):
             pos = body.get("pos")
             source = (body.get("source") or "unknown").strip()
             dry = bool(body.get("dry_run"))
+            email_received_at = (body.get("email_received_at") or "").strip() or None
             if not container:
                 return self._send(400, json.dumps({"error": "container is required"}), "application/json")
             try:
-                out = process_manual(container, ship_date, pos=pos, source=source, dry_run=dry)
+                out = process_manual(container, ship_date, pos=pos, source=source, dry_run=dry,
+                                      email_received_at=email_received_at)
                 return self._send(200, json.dumps(out), "application/json")
             except Exception as e:
                 return self._send(200, json.dumps({"error": str(e)}), "application/json")
