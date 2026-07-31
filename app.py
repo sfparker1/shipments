@@ -17,7 +17,7 @@ internal PO# -> that PO's VendorRef (where the retail PO text lives) -> match
 against Sales Orders. Optional env overrides: RECEIPT_CONTAINER_FIELD /
 RECEIPT_CONTAINER_VIEW (skip auto-discovery), RECEIPT_LOOKBACK_DAYS (default 180).
 """
-import os, re, json, time, base64, hashlib, hmac, secrets, datetime
+import os, re, json, time, base64, hashlib, hmac, secrets, datetime, threading
 import urllib.parse, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
@@ -111,6 +111,22 @@ def load_json(path):
         with open(path) as f: return json.load(f)
     except Exception: return None
 
+# ThreadingHTTPServer means two requests can genuinely run this process's code at the same
+# instant. save_json()/load_json() themselves are just single-file I/O -- the actual risk is
+# a caller doing load -> mutate one key -> save: if two threads both load the old state before
+# either saves, whichever saves last silently wins, dropping the other thread's update. A
+# single RLock (reentrant so a locked function calling another locked function can't
+# self-deadlock) around each such read-modify-write critical section closes that. Does NOT
+# cover WATCHLIST_PATH (Maersk/FCR is out of scope for now) or TOKEN_PATH (see _TOKEN_LOCK
+# below instead -- deliberately a SEPARATE lock, not this one).
+_JSON_LOCK = threading.RLock()
+
+# access_token()'s refresh path makes a real network call to Acumatica's OAuth endpoint
+# (_token_request, up to a 60s timeout) while holding this lock. Kept separate from
+# _JSON_LOCK on purpose: if it shared that lock, one slow token refresh would stall every
+# unrelated ledger/ingest/shipdates write for the whole duration of the network call.
+_TOKEN_LOCK = threading.RLock()
+
 # ---------------- Maersk watch-list (state store for the local checker script) ----------------
 # Render can't reliably reach maersk.com itself (Akamai blocks the cloud/datacenter IP range
 # it deploys from -- confirmed live: browser launches fine, page load times out). So the
@@ -184,13 +200,14 @@ def ledger_record(master_token, container, pickup_date):
     shipment-creation loop below it fails partway through."""
     if not master_token or not container:
         return None
-    data = load_json(LEDGER_PATH) or {}
-    entry = data.setdefault(master_token, {"containers": {}, "status": "waiting",
-                                            "first_seen": pickup_date, "last_updated": pickup_date})
-    entry["containers"][container] = pickup_date
-    entry["last_updated"] = pickup_date
-    save_json(LEDGER_PATH, data)
-    return entry
+    with _JSON_LOCK:
+        data = load_json(LEDGER_PATH) or {}
+        entry = data.setdefault(master_token, {"containers": {}, "status": "waiting",
+                                                "first_seen": pickup_date, "last_updated": pickup_date})
+        entry["containers"][container] = pickup_date
+        entry["last_updated"] = pickup_date
+        save_json(LEDGER_PATH, data)
+        return entry
 
 def ledger_set_status(master_token, status, note=None, reset_first_seen=False):
     """reset_first_seen (default False, preserves the normal SLA-clock behavior): pass True
@@ -201,16 +218,17 @@ def ledger_set_status(master_token, status, note=None, reset_first_seen=False):
     would measure from the ORIGINAL first_seen date -- possibly months ago -- and could
     immediately flag a master that just re-entered 'waiting' today as stuck for months,
     a false alarm (not a missed one, but still wrong)."""
-    data = load_json(LEDGER_PATH) or {}
-    if master_token not in data:
-        return None
-    data[master_token]["status"] = status
-    if note:
-        data[master_token]["note"] = note
-    if reset_first_seen:
-        data[master_token]["first_seen"] = time.strftime("%Y-%m-%d")
-    save_json(LEDGER_PATH, data)
-    return data[master_token]
+    with _JSON_LOCK:
+        data = load_json(LEDGER_PATH) or {}
+        if master_token not in data:
+            return None
+        data[master_token]["status"] = status
+        if note:
+            data[master_token]["note"] = note
+        if reset_first_seen:
+            data[master_token]["first_seen"] = time.strftime("%Y-%m-%d")
+        save_json(LEDGER_PATH, data)
+        return data[master_token]
 
 def ledger_latest_date(master_token):
     """Latest confirmed pickup date across every container this master's OWN receipts say
@@ -232,10 +250,11 @@ def ledger_stamp_checked(master_token):
     distinct from last_updated (which tracks container pickup dates, not live-check time).
     Lets /splits show a cached, zero-API-call view by default with an honest 'as of' time,
     rather than needing a live call just to know how stale the cache is."""
-    data = load_json(LEDGER_PATH) or {}
-    if master_token in data:
-        data[master_token]["last_checked"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        save_json(LEDGER_PATH, data)
+    with _JSON_LOCK:
+        data = load_json(LEDGER_PATH) or {}
+        if master_token in data:
+            data[master_token]["last_checked"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            save_json(LEDGER_PATH, data)
 
 def ledger_entry(master_token):
     return (load_json(LEDGER_PATH) or {}).get(master_token)
@@ -352,12 +371,22 @@ def refresh_token(tok):
     save_json(TOKEN_PATH, new); return new
 
 def access_token():
-    tok = load_json(TOKEN_PATH)
-    if not tok: return None
-    if time.time() - tok.get("obtained", 0) > tok.get("expires_in", 3600) - 120:
-        try: tok = refresh_token(tok)
-        except Exception: return None
-    return tok.get("access_token")
+    # Locked end-to-end so two near-simultaneous requests with an expired token can't both
+    # decide to refresh at once. Without this, both would load the same (still old, both see
+    # it as expired) token and each call refresh_token() with the SAME refresh_token value --
+    # many OAuth providers rotate/invalidate a refresh_token on use, so the second call could
+    # fail outright (that request then gets "not connected"), and even if the provider allows
+    # reuse, whichever save_json() finishes last wins, silently discarding the other's result.
+    # Re-loading fresh AFTER acquiring the lock (not reusing whatever was loaded before it)
+    # means a thread that had to wait sees the OTHER thread's already-completed refresh and
+    # skips redoing it.
+    with _TOKEN_LOCK:
+        tok = load_json(TOKEN_PATH)
+        if not tok: return None
+        if time.time() - tok.get("obtained", 0) > tok.get("expires_in", 3600) - 120:
+            try: tok = refresh_token(tok)
+            except Exception: return None
+        return tok.get("access_token")
 
 def api(method, path, body=None, token=None):
     token = token or access_token()
@@ -943,14 +972,24 @@ def load_all_orders(force=False):
         _ALL_ORDERS["ts"] = now
     return rows
 
-FULFILLED_SO_STATUSES = {"Completed", "Closed"}  # genuinely fulfilled, not just non-open
+FULFILLED_SO_STATUSES = {"Completed", "Closed", "Shipping"}  # already has a shipment; not just non-open
+# "Shipping" confirmed real, 2026-07-31 (masters 362040/041/044/045/328810): Acumatica flips a
+# Sales Order's own status to "Shipping" the moment ANY shipment is created against it -- well
+# before that shipment is confirmed/invoiced (Completed/Closed). Without it here, an order in
+# this perfectly normal in-progress state matched NEITHER the open-orders search (order is no
+# longer "Open") NOR the old two-value fulfilled check -- read as "no open sales order," a false
+# exception for an order that's actually fine, and kept the ledger stuck on "partial" forever
+# (every /ledger/recheck re-hit the same false negative). Still deliberately NOT "anything
+# non-Open" -- Cancelled/Voided/Hold etc. remain correctly excluded, see this function's
+# docstring below.
 
 def find_fulfilled_sales_orders(pos):
-    """For masters with zero OPEN matches: is there a genuinely-fulfilled order (Completed/
-    Closed) instead? Distinguishes 'already fulfilled before this automation ran' (no action
-    needed, not a real problem) from a genuine gap (no sales order exists at all, which DOES
-    need a human). Only meaningfully called on that rare fallback path, not the normal hot
-    path.
+    """For masters with zero OPEN matches: is there an order instead that already has a
+    shipment against it -- Completed/Closed (fully invoiced), or Shipping (a shipment exists
+    but isn't confirmed/invoiced yet -- see FULFILLED_SO_STATUSES)? Distinguishes 'already
+    handled before/outside this automation' (no action needed, not a real problem) from a
+    genuine gap (no sales order exists at all, which DOES need a human). Only meaningfully
+    called on that rare fallback path, not the normal hot path.
 
     Deliberately an ALLOW-list (Completed/Closed only), not "anything non-Open" -- real bug
     caught 2026-07-29 before it shipped: the first version treated Cancelled/Voided orders
@@ -960,6 +999,27 @@ def find_fulfilled_sales_orders(pos):
     in this allow-list (Cancelled, Voided, Credit Hold, Back Order, Pending Approval, ...)
     correctly falls through to "genuinely needs review" instead."""
     orders = [o for o in load_all_orders() if o["status"] in FULFILLED_SO_STATUSES]
+    results = {p: [] for p in pos}
+    for o in orders:
+        co = o["cust_order"]
+        if not co:
+            continue
+        for p in pos:
+            if _co_matches_master(co, p):
+                results[p].append(o)
+    return results
+
+def find_any_sales_orders_batch(pos):
+    """Same DC-anchored match as find_sales_orders_batch(), but over EVERY order regardless
+    of status -- for the one place that genuinely needs "does an order for this master exist
+    at all, in any state" rather than "is it open" or "is it done": the stale-ledger
+    verification in process_manual() (does a real shipment still exist for a master the
+    ledger claims is already 'shipped'?). Using the open-only search there missed a Shipping-
+    or Completed/Closed-status order (see FULFILLED_SO_STATUSES's docstring for the real
+    Shipping-status incident) -- the master WAS genuinely still shipped, but the narrower
+    open-only search found nothing, wrongly read as "ledger stale," and bounced the master
+    back to 'waiting' for no reason every time that check ran."""
+    orders = load_all_orders()
     results = {p: [] for p in pos}
     for o in orders:
         co = o["cust_order"]
@@ -1198,7 +1258,11 @@ def _find_later_success(container, after_ts, hist_rows, master_tokens=None):
             continue
         h_orders = h.get("orders") or []
         h_masters = {o.get("po") for o in h_orders if o.get("po")}
-        by_container = container in (h.get("containers") or "")
+        # Exact token match, not a bare substring check -- see container_ship_history()'s
+        # comment for why `container in "..."` risks a false match against a sibling
+        # container ref in the same run.
+        h_containers = {c.strip() for c in (h.get("containers") or "").split(",") if c.strip()}
+        by_container = container in h_containers
         by_master = bool(master_tokens) and bool(master_tokens & h_masters)
         if not (by_container or by_master):
             continue
@@ -1233,7 +1297,13 @@ def container_ship_history(container):
     if not container:
         return {"shipped": False}
     for h in history(limit=0):
-        if container in (h.get("containers") or "") and h.get("status") == "ok" and h.get("created"):
+        # Exact token match against the ", "-joined list (see process_manual()'s
+        # container_ref), not a bare substring check -- `container in "..."` would also
+        # match if this container's ref happened to be a literal substring of a sibling
+        # container's ref in the same run (e.g. a shorter/malformed ref folded into a
+        # longer valid one), producing a false "already shipped" positive.
+        run_containers = {c.strip() for c in (h.get("containers") or "").split(",") if c.strip()}
+        if container in run_containers and h.get("status") == "ok" and h.get("created"):
             return {"shipped": True, "ts": h.get("ts"),
                     "master_pos": sorted({o.get("po") for o in (h.get("orders") or []) if o.get("po")})}
     return {"shipped": False}
@@ -1406,22 +1476,26 @@ def agent_summary(hours=24):
 # just wait in the queue. Dedup is by the email's internetMessageId so a Power Automate
 # retry can't enqueue the same message twice while it's still waiting.
 def ingest_enqueue(payload):
-    os.makedirs(INGEST_DIR, exist_ok=True)
-    msg_id = (payload.get("message_id") or "").strip()
-    if msg_id:
-        for fn in os.listdir(INGEST_DIR):
-            if not fn.endswith(".json"):
-                continue
-            existing = load_json(os.path.join(INGEST_DIR, fn)) or {}
-            if existing.get("message_id") == msg_id:
-                return existing.get("id"), True  # already queued -> idempotent no-op
-    item_id = base64.urlsafe_b64encode(hashlib.sha256(
-        (msg_id or repr(payload.get("subject"))).encode()).digest()).decode().rstrip("=")[:20]
-    item = dict(payload)
-    item["id"] = item_id
-    item["enqueued_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    save_json(os.path.join(INGEST_DIR, item_id + ".json"), item)
-    return item_id, False
+    # Locked end-to-end (the dedup scan AND the write): two Power Automate retries landing
+    # on separate threads at the same instant could otherwise both pass the "not found yet"
+    # scan before either had written its file, enqueuing the same email twice.
+    with _JSON_LOCK:
+        os.makedirs(INGEST_DIR, exist_ok=True)
+        msg_id = (payload.get("message_id") or "").strip()
+        if msg_id:
+            for fn in os.listdir(INGEST_DIR):
+                if not fn.endswith(".json"):
+                    continue
+                existing = load_json(os.path.join(INGEST_DIR, fn)) or {}
+                if existing.get("message_id") == msg_id:
+                    return existing.get("id"), True  # already queued -> idempotent no-op
+        item_id = base64.urlsafe_b64encode(hashlib.sha256(
+            (msg_id or repr(payload.get("subject"))).encode()).digest()).decode().rstrip("=")[:20]
+        item = dict(payload)
+        item["id"] = item_id
+        item["enqueued_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        save_json(os.path.join(INGEST_DIR, item_id + ".json"), item)
+        return item_id, False
 
 def ingest_list():
     out = []
@@ -1867,8 +1941,19 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
     for c in containers:
         for p in receipt_pos_by_container.get(c, []):
             if p not in all_pos: all_pos.append(p)
-    unresolved_containers = [c for c in containers
-                              if not receipt_pos_by_container.get(c) and not text_pos_by_container.get(c)]
+    no_po_containers = [c for c in containers
+                        if not receipt_pos_by_container.get(c) and not text_pos_by_container.get(c)]
+    # Split by WHY no PO was found -- container_scope() (same check process_manual() already
+    # uses) tells 3PL-bound units (revenue recognized at the 3PL, not at port; expected,
+    # nothing to review) apart from a genuine gap (no receipt yet, or a receipt with no
+    # recognizable order token -- needs a human look). Previously both cases were lumped
+    # into one red "unresolved" flag on this page and in /history, which read as "something's
+    # wrong" for a container that's actually working exactly as designed.
+    out_of_scope_containers = []
+    unresolved_containers = []
+    for c in no_po_containers:
+        scope, _ = container_scope(c)
+        (out_of_scope_containers if scope == "out_of_scope" else unresolved_containers).append(c)
 
     matched = find_sales_orders_batch(all_pos)
     if all_pos and not any(matched.get(p) for p in all_pos):
@@ -1918,6 +2003,7 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
                "route": f'{parsed["pol"]} -> {parsed["pod"]}', "eta": parsed["eta"],
                "containers": containers, "po_count": len(all_pos),
                "unresolved_containers": unresolved_containers,
+               "out_of_scope_containers": out_of_scope_containers,
                "orders_matched": to_create, "created": created, "dry_run": dry_run, "rows": rows}
     if not dry_run:
         if to_create == 0:
@@ -1937,11 +2023,13 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
                  "user": user, "acumatica_user": connected_user(), "status": status,
                  "orders_matched": to_create, "created": created,
                  "containers": container_ref, "unresolved_containers": unresolved_containers,
+                 "out_of_scope_containers": out_of_scope_containers,
                  "ship_date": ship_date, "orders": log_orders})
     return summary
 
 # ---------------- automated trigger (no PDF): NRT email / Maersk+FCR watch-list ----------------
-def process_manual(container, ship_date, pos=None, user=None, source=None, dry_run=False):
+def process_manual(container, ship_date, pos=None, user=None, source=None, dry_run=False,
+                    force_receipts=True):
     """Programmatic twin of process_file() for automated triggers that never see a
     handover PDF. Two calling shapes:
       - container only (NRT path: the pickup email has no PO info) -> resolve PO#s the
@@ -1955,6 +2043,14 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
     in Acumatica) + log_run() to the same permanent audit log. `source` is a free-text tag
     (e.g. "nrt" / "maersk-fcr") recorded in the run history so History shows where each
     automated run came from.
+
+    force_receipts (default True): force a fresh load_recent_receipts() pull before the
+    completeness gate runs, so a stale cache can't understate a master's expected-container
+    set (see the call site below). Default True is right for a single live-trigger call.
+    Pass False when the CALLER already forced a refresh immediately before looping over
+    many masters in one batch (see /ledger/recheck) -- forcing again per-master there would
+    multiply into dozens of redundant full receipt refetches against Acumatica's 100
+    req/min cap for zero added correctness, since the shared cache is already fresh.
     """
     if not dry_run and not ship_date:
         return {"error": "Shipment date is required."}
@@ -2016,9 +2112,15 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                 # back to fully Open/unshipped. One bounded live check per matched order,
                 # only on this already-rare path (a master marked shipped getting ANOTHER
                 # pickup event) -- reuses the same proven idempotency lookup used elsewhere.
+                # find_any_sales_orders_batch (not find_sales_orders_batch/open-only): a
+                # genuinely still-shipped master's orders are commonly Shipping/Completed/
+                # Closed by now, not Open -- the open-only search found nothing for exactly
+                # that case, misread it as "ledger stale," and reset a correctly-shipped
+                # master back to waiting for no reason (real case, masters 362040/041/044/
+                # 045, 2026-07-31 -- see FULFILLED_SO_STATUSES's docstring).
                 still_shipped = any(
                     _latest_shipment_for_order(m["order_type"], m["order_nbr"], retries=1, delay=0)
-                    for m in find_sales_orders_batch([token]).get(token, []))
+                    for m in find_any_sales_orders_batch([token]).get(token, []))
                 if still_shipped:
                     return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
                             "reason": "pickup_after_already_shipped",
@@ -2037,6 +2139,18 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         po_refs = resolve_pos_by_master(container)
         for token in resolved:
             ledger_stamp_checked(token)
+        # Force a fresh receipts pull before deciding completeness (unless the caller says
+        # it already did -- see force_receipts param) -- containers_confirmed_available()
+        # (below) derives "every container this PO depends on" from
+        # expected_containers_for_master(), which reads load_recent_receipts()'s cache (up
+        # to RECEIPTS_TTL/10min stale). A sibling container's packing list landing in
+        # Acumatica in that window wouldn't be visible yet, understating the expected set --
+        # which makes completeness look satisfied when a real sibling is still unaccounted
+        # for. This is the one direction that matters: a STALE cache can only make the gate
+        # too PERMISSIVE (fewer expected containers to satisfy), never too strict, so the fix
+        # is a one-time forced refresh right before the gate runs, not after.
+        if force_receipts:
+            load_recent_receipts(force=True)
         # SECOND, INDEPENDENT gate (2026-07-24, real incident): the PO-receiving check
         # above is a warehouse-side fact (has Acumatica recorded all the qty as received);
         # it is NOT the same as "has every container this PO depends on been individually
@@ -2120,9 +2234,12 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
             fulfilled_orders = fulfilled.get(po) or []
             if fulfilled_orders:
                 statuses = sorted({o["status"] for o in fulfilled_orders if o.get("status")})
+                # Not always "before this automation ran" -- a Shipping-status order (see
+                # FULFILLED_SO_STATUSES) commonly got its shipment from THIS SAME automation,
+                # just not yet confirmed/invoiced. Kept status-agnostic so the note stays true
+                # either way.
                 note = (f"already fulfilled -- {len(fulfilled_orders)} sales order(s) found with "
-                        f"status {', '.join(statuses)}; likely completed before this automation "
-                        "ran, no action needed")
+                        f"status {', '.join(statuses)}; no action needed")
                 rows.append({"po": po, "confidence": "ok", "note": note, "orders": [],
                              "already_fulfilled": True})
             else:
@@ -2334,10 +2451,10 @@ def check_maersk_container(container, port_of_loading, timeout_ms=20000):
 
 # ---------------- diagnostics ----------------
 def _stage(r):
-    """Derive the next-action stage from a pipeline record.
-    The order is still Open (so_pipeline only sees open orders); it leaves the
-    Open list once its invoice is released, so 'Done' is handled upstream as an
-    empty pipeline. Shipment 'Status' is Open until Confirmed/Completed."""
+    """Derive the next-action stage from a pipeline record. so_pipeline() now matches
+    orders in any status (see its docstring), so this can see an order anywhere in its
+    life -- from before a shipment exists through invoice release. Shipment 'Status' is
+    Open until Confirmed/Completed."""
     if not r.get("shipment"): return "Create shipment"
     sst = (r.get("shipment_status") or "").lower()
     if "confirm" not in sst and "complet" not in sst:  # still Open / not confirmed
@@ -2382,11 +2499,20 @@ def _order_pipeline(m, po=None):
 
 def so_pipeline(po):
     """For a PO#, return each matched sales order's shipment/invoice pipeline stage.
-    Avoids substringof (500s on this tenant): matches the PO against the cached
-    OPEN-order list client-side, then reads each order's shipments via GET-by-key.
-    An order stays Open until fully invoiced, so a picked-up PO with no open match
-    is already fully processed ('Done')."""
-    return [_order_pipeline(m, po) for m in find_sales_orders_batch([po]).get(po, [])]
+    Avoids substringof (500s on this tenant): matches the PO against the cached order
+    list client-side, then reads each order's shipments via GET-by-key.
+
+    Uses find_any_sales_orders_batch (ALL statuses), not the open-only search. FIXED
+    2026-07-31: the order leaves "Open" the moment ANY shipment is created against it
+    (Acumatica flips it to "Shipping" -- see FULFILLED_SO_STATUSES's docstring), well
+    before it's confirmed or invoiced. The old open-only match silently showed nothing for
+    that order the instant a shipment existed, which read on /splits as "already fully
+    processed" -- when it was really just sitting at "shipment created, needs
+    confirmation," exactly the kind of thing a clerk should still see. A genuinely done
+    order (invoice released) still correctly shows nothing further to do -- _stage() below
+    already handles that case via Confirmed/invoice-released, this only widens which
+    orders get INTO the pipeline check at all."""
+    return [_order_pipeline(m, po) for m in find_any_sales_orders_batch([po]).get(po, [])]
 
 def split_order_status(master_token, entry):
     """Live status for one in-progress split order (a container_ledger.json entry): its
@@ -3265,6 +3391,9 @@ function render(d,dry){
  if((d.unresolved_containers||[]).length){
    h+='<p class=sub style="color:var(--rust)">&#9888; No PO could be found for '+d.unresolved_containers.length+' container(s) ('+d.unresolved_containers.join(', ')+') -- checked both the advice text and PO Receipts. Verify manually (e.g. against the packing list) before assuming this handover is fully covered.</p>';
  }
+ if((d.out_of_scope_containers||[]).length){
+   h+='<p class=sub>'+d.out_of_scope_containers.length+' container(s) ('+d.out_of_scope_containers.join(', ')+') are 3PL-bound -- revenue recognizes at the 3PL, not at port pickup, so no shipment is expected here. Not an error.</p>';
+ }
  h+='<p class=sub>'+d.po_count+' PO#s found (advice text + PO Receipts) &middot; '+d.orders_matched+' open sales orders matched'+(dry?'':' &middot; '+d.created+' shipments created')+'</p>';
  h+='<table><tr><th></th><th>PO#</th><th>Sales order</th><th>Customer</th><th>Result</th></tr>';
  for(const row of d.rows){
@@ -3333,7 +3462,7 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/status":
             qs = urllib.parse.parse_qs(u.query)
             want = os.environ.get("STATUS_TOKEN", "")
-            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             # Accept either a valid token (automated sync) or a logged-in session (browser).
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
@@ -3380,7 +3509,7 @@ class H(BaseHTTPRequestHandler):
             # a shipment (writes stay POST-only, above).
             qs = urllib.parse.parse_qs(u.query)
             want = AUTOSHIP_TOKEN
-            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             container = qs.get("container", [""])[0].strip()
@@ -3401,7 +3530,7 @@ class H(BaseHTTPRequestHandler):
             # status noise hidden, exceptions always still shown; ?all=1 for everything.
             qs = urllib.parse.parse_qs(u.query)
             want = AGENT_TOKEN
-            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             msg_id = qs.get("message_id", [""])[0].strip() or None
@@ -3424,7 +3553,7 @@ class H(BaseHTTPRequestHandler):
             # for the real 2026-07-23 incident this closes). Read-only, no Acumatica calls.
             qs = urllib.parse.parse_qs(u.query)
             want = AGENT_TOKEN
-            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             container = (qs.get("container", [""])[0] or "").strip().upper()
@@ -3434,7 +3563,7 @@ class H(BaseHTTPRequestHandler):
             # this and emails/Teams-messages Parker). AGENT_TOKEN-authed. ?hours=N window.
             qs = urllib.parse.parse_qs(u.query)
             want = AGENT_TOKEN
-            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             try:
@@ -3446,7 +3575,7 @@ class H(BaseHTTPRequestHandler):
             # The mailbox-agent cron job pulls the queue of pushed emails here.
             qs = urllib.parse.parse_qs(u.query)
             want = AGENT_TOKEN
-            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             return self._send(200, json.dumps(ingest_list()), "application/json")
@@ -3455,30 +3584,32 @@ class H(BaseHTTPRequestHandler):
             # po_shipdates.json; pass reset=1 on the first chunk to clear stale entries.
             qs = urllib.parse.parse_qs(u.query)
             want = os.environ.get("STATUS_TOKEN", "")
-            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
-            cur = {} if qs.get("reset", ["0"])[0] == "1" else (load_json(SHIPDATES_PATH) or {})
-            n = 0
-            for pr in qs.get("pairs", [""])[0].split(","):
-                if ":" in pr:
-                    k, v = pr.split(":", 1); k = k.strip(); v = v.strip()
-                    if k and v: cur[k] = v; n += 1
-            save_json(SHIPDATES_PATH, cur)
+            with _JSON_LOCK:
+                cur = {} if qs.get("reset", ["0"])[0] == "1" else (load_json(SHIPDATES_PATH) or {})
+                n = 0
+                for pr in qs.get("pairs", [""])[0].split(","):
+                    if ":" in pr:
+                        k, v = pr.split(":", 1); k = k.strip(); v = v.strip()
+                        if k and v: cur[k] = v; n += 1
+                save_json(SHIPDATES_PATH, cur)
             return self._send(200, json.dumps({"stored": n, "total": len(cur)}), "application/json")
         if u.path == "/setcontainerdates":
             qs = urllib.parse.parse_qs(u.query)
             want = os.environ.get("STATUS_TOKEN", "")
-            token_ok = bool(want) and qs.get("token", [""])[0] == want
+            token_ok = bool(want) and hmac.compare_digest(qs.get("token", [""])[0].encode(), want.encode())
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
-            cur = {} if qs.get("reset", ["0"])[0] == "1" else (load_json(CONTAINERDATES_PATH) or {})
-            n = 0
-            for pr in qs.get("pairs", [""])[0].split(","):
-                if ":" in pr:
-                    k, v = pr.split(":", 1); k = k.strip(); v = v.strip()
-                    if k and v: cur[k] = v; n += 1
-            save_json(CONTAINERDATES_PATH, cur)
+            with _JSON_LOCK:
+                cur = {} if qs.get("reset", ["0"])[0] == "1" else (load_json(CONTAINERDATES_PATH) or {})
+                n = 0
+                for pr in qs.get("pairs", [""])[0].split(","):
+                    if ":" in pr:
+                        k, v = pr.split(":", 1); k = k.strip(); v = v.strip()
+                        if k and v: cur[k] = v; n += 1
+                save_json(CONTAINERDATES_PATH, cur)
             return self._send(200, json.dumps({"stored": n, "total": len(cur)}), "application/json")
         if not self._authed():
             return self._send(200, LOGIN)
@@ -3554,9 +3685,12 @@ class H(BaseHTTPRequestHandler):
                 else:
                     detail_cell = "&mdash;"
                 unresolved = h.get("unresolved_containers") or []
+                out_of_scope = h.get("out_of_scope_containers") or []
                 cont_cell = h.get("containers", "")
                 if unresolved:
                     cont_cell += f' <span class="pill rust">&#9888; unresolved: {", ".join(unresolved)}</span>'
+                if out_of_scope:
+                    cont_cell += f' <span class="pill">3PL, no shipment expected: {", ".join(out_of_scope)}</span>'
                 # Which Acumatica identity actually performed this write (not the app-level
                 # "By" caller/source tag) -- flag red if it doesn't match EXPECTED_ACU_USER, so
                 # segregation-of-duties drift shows up per-run in the permanent log, not only
@@ -3638,6 +3772,14 @@ class H(BaseHTTPRequestHandler):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             ledger = load_json(LEDGER_PATH) or {}
             results = []
+            # One forced receipts refresh for the WHOLE batch, not per master -- the cache is
+            # shared, so this single refresh is what process_manual's own completeness gate
+            # relies on for every master below (force_receipts=False on each call skips a
+            # redundant re-force). See process_manual's docstring for why this matters here
+            # specifically: looping 20-30+ masters, each doing its own full paginated receipts
+            # refetch, would multiply straight into Acumatica's 100 req/min cap for zero added
+            # correctness once the shared cache is already fresh.
+            load_recent_receipts(force=True)
             # Acumatica's license caps this at 100 web-service API requests/minute
             # (confirmed via the License Monitoring Console). process_manual costs a
             # few calls per master (receipt/PO resolution, completeness, possibly a
@@ -3656,7 +3798,8 @@ class H(BaseHTTPRequestHandler):
                 first = False
                 latest = ledger_latest_date(token)
                 try:
-                    out = process_manual(containers[-1], latest, source="ledger-recheck", dry_run=False)
+                    out = process_manual(containers[-1], latest, source="ledger-recheck",
+                                          dry_run=False, force_receipts=False)
                 except Exception as e:
                     out = {"error": str(e)}
                 results.append({"master": token, "container_used": containers[-1], "result": out})
