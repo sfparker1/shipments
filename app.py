@@ -2029,7 +2029,7 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
 
 # ---------------- automated trigger (no PDF): NRT email / Maersk+FCR watch-list ----------------
 def process_manual(container, ship_date, pos=None, user=None, source=None, dry_run=False,
-                    force_receipts=True):
+                    force_receipts=True, email_received_at=None):
     """Programmatic twin of process_file() for automated triggers that never see a
     handover PDF. Two calling shapes:
       - container only (NRT path: the pickup email has no PO info) -> resolve PO#s the
@@ -2051,12 +2051,36 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
     many masters in one batch (see /ledger/recheck) -- forcing again per-master there would
     multiply into dozens of redundant full receipt refetches against Acumatica's 100
     req/min cap for zero added correctness, since the shared cache is already fresh.
+
+    email_received_at (optional): the triggering NRT email's own received timestamp
+    (YYYY-MM-DD HH:MM:SS or similar), distinct from ship_date (a bare date). Recorded on
+    the permanent log entry and included in the shipment-created notification -- purely
+    informational, never used for any gating/date-math decision.
     """
     if not dry_run and not ship_date:
         return {"error": "Shipment date is required."}
     container = (container or "").strip().upper()
     if not container:
         return {"error": "container is required."}
+
+    # FIXED 2026-07-31: every one of these early-return outcomes used to skip log_run()
+    # entirely -- fine for the mailbox-agent's own NRT-triggered calls (its OWN separate
+    # agent_log.jsonl still captures the decision), but /ledger/recheck calls process_manual()
+    # directly, bypassing the agent loop -- an out_of_scope/unresolved/anomaly/waiting outcome
+    # from THAT path was never durably recorded anywhere, visible only in that one HTTP
+    # response. Now every outcome gets a permanent row, so ship_runs.jsonl is a complete
+    # record regardless of trigger source -- needed for the CSV export and the shipment-
+    # created notification to have anything real to work from.
+    def _log_early(status, extra=None):
+        if dry_run:
+            return
+        entry = {"reference": None, "document": source or "unknown", "user": user,
+                 "acumatica_user": connected_user(), "status": status, "orders_matched": 0,
+                 "created": 0, "containers": container, "ship_date": ship_date,
+                 "email_received_at": email_received_at, "orders": []}
+        if extra:
+            entry.update(extra)
+        log_run(entry)
 
     still_waiting = []
     container_gaps = {}
@@ -2070,6 +2094,7 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         # Out of scope: 3PL-bound units are recognized at the 3PL, not at port pickup.
         # Skip quietly (not a review exception) so 3PL containers don't spam the digest.
         if scope == "out_of_scope":
+            _log_early("out_of_scope")
             return {"container": container, "out_of_scope": True, "created": 0, "orders_matched": 0,
                     "reason": "out_of_scope_3pl",
                     "note": "container's PO Receipt is 3PL-bound (MMX/4006/AMAZON/HG); revenue is "
@@ -2085,6 +2110,7 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
             # matching receipt (or a receipt with no recognizable retail PO#) could sit
             # silently invisible forever, with zero human visibility, unless another NRT
             # email happens to arrive later.
+            _log_early("unresolved")
             return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
                     "reason": "unresolved_container",
                     "note": "no Acumatica receipt was found for this container, or its receipt's "
@@ -2158,6 +2184,7 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         if not resolved:
             # Every resolved master for this container was an anomaly -- genuinely nothing
             # else to do this event.
+            _log_early("anomaly", {"anomalies": anomalies})
             return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
                     "reason": "pickup_after_already_shipped", "anomalies": anomalies}
         po_refs = resolve_pos_by_master(container)
@@ -2230,6 +2257,7 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                 # both facts are real and independent, a human reviewing this result should
                 # see both.
                 out["anomalies"] = anomalies
+            _log_early("waiting", {"note": note, "unresolved_containers": []})
             return out
         all_pos = ready
         unresolved = not original_resolved
@@ -2359,6 +2387,8 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                  "user": user or f"auto:{source or 'unknown'}", "acumatica_user": connected_user(),
                  "status": status, "orders_matched": to_create, "created": created, "containers": container,
                  "unresolved_containers": unresolved_containers, "ship_date": ship_date,
+                 "email_received_at": email_received_at,
+                 "still_waiting_masters": still_waiting or None, "anomalies": anomalies or None,
                  "orders": log_orders})
     return summary
 
