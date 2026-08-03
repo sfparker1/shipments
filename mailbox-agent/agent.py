@@ -42,7 +42,7 @@ Config (env vars):
     MODEL                default "claude-opus-4-8"
     MAX_ITEMS_PER_RUN    safety cap on items processed per run (default 50)
 """
-import os, re, json, base64, html, time, datetime
+import os, re, json, base64, html, time
 import urllib.request, urllib.error, urllib.parse
 
 import anthropic
@@ -382,8 +382,6 @@ def process_item(client, item):
     flag = " [EXCEPTION]" if decision.get("exception_flag") else ""
     print(f"  {decision.get('classification')} / {decision.get('action_taken')}{flag}: {msg_id}")
 
-RECHECK_HOUR_UTC = int(os.environ.get("RECHECK_HOUR_UTC", "15"))  # ~8am Pacific (PDT)
-
 def ledger_recheck():
     """Re-check every 'waiting'/'partial' master (Phase 2 / Tier 2 completeness ledger) for
     whether its Purchase Order has since become fully received. Needed, not optional --
@@ -391,18 +389,22 @@ def ledger_recheck():
     in Acumatica has no future event to re-trigger it and would sit stuck forever. Piggybacks
     on this cron's existing schedule/token rather than a separate service (no new secrets).
 
-    RUNS ONCE A DAY, not every cron cycle: this endpoint calls process_manual (and its live
-    Acumatica resolution chain) for EVERY active master. Running it every 3-hour cycle scales
-    with however many masters are currently split -- confirmed real: 28+ active masters meant
-    60-100+ extra Acumatica calls every single cycle, on top of normal email processing, purely
-    to re-check something that only changes as fast as a clerk processes packing lists (days,
-    not hours). This cron job has no persistent disk between runs, so the gate is wall-clock
-    time-of-day (matches one of this cron's own fire hours), not a saved "last ran" timestamp.
-    Same write stakes as create_shipment -- skipped entirely in shadow mode, not intercepted
-    like the LLM's tool calls, since this is a direct endpoint call outside the agent loop."""
-    if datetime.datetime.now(datetime.timezone.utc).hour != RECHECK_HOUR_UTC:
-        print(f"  [ledger recheck] skipped -- only runs at hour {RECHECK_HOUR_UTC} UTC")
-        return
+    RUNS ON EVERY CRON CYCLE (every 3 hours) as of 2026-08-03 -- previously gated to once/day
+    (hour == RECHECK_HOUR_UTC) to bound Acumatica call volume, since /ledger/recheck used to
+    call process_manual once per WAITING MASTER, and a shared container reprocessed once per
+    master sharing it. That once-daily gate had a real cost: a container's own NRT trigger
+    doesn't count toward its own confirmation within the same process_manual call (see
+    containers_confirmed_available()'s docstring in app.py) -- self-corrects on the NEXT
+    check, but with a once-daily gate that meant real, ready-to-ship orders could sit
+    "Waiting" for up to ~24 hours (confirmed real: MRKU5545922 and GCXU5545290, both 2026-08-
+    02/03). Two things made hourly-cadence checking safe to turn back on: /ledger/recheck now
+    dedupes by container instead of by master (one process_manual call per shared container,
+    not per master sharing it), and the underlying ordering bug is now fixed at the source --
+    this cadence increase is belt-and-suspenders for whatever's left (the ORIGINAL motivating
+    case: a receipt posting after its container's NRT email already fired), not a workaround
+    for the ordering bug itself. Same write stakes as create_shipment -- skipped entirely in
+    shadow mode, not intercepted like the LLM's tool calls, since this is a direct endpoint
+    call outside the agent loop."""
     if SHADOW_MODE:
         print("  [ledger recheck] skipped -- SHADOW_MODE on")
         return
