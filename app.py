@@ -828,7 +828,7 @@ def confirmed_pickup_containers():
             out[c] = d
     return out
 
-def containers_confirmed_available(master_token):
+def containers_confirmed_available(master_token, current_container=None):
     """Has EVERY container Acumatica's receipts say belongs to this master ALSO been
     individually confirmed 'Available for Pickup' (or later) by its own NRT email --
     not just "the Purchase Order shows fully received in Acumatica"?
@@ -858,9 +858,22 @@ def containers_confirmed_available(master_token):
     correctly expected FBIU5266985 but could never see it confirmed. Deriving from the
     permanent log instead means a real confirmation is never lost to Acumatica receipt
     timing, and needs no manual backfill -- see confirmed_pickup_containers()'s docstring.
+
+    current_container (FIXED 2026-08-03, real incidents: MRKU5545922 and GCXU5545290):
+    the container whose NRT trigger is being processed THIS call must count as confirmed
+    even though its own agent_log.jsonl entry doesn't exist yet -- log_run() only writes
+    that entry at the END of process_manual(), well after this completeness check runs.
+    Without this, a container's OWN first-ever trigger always saw itself as unconfirmed
+    (confirmed_pickup_containers() can only see PAST entries), so any master whose only
+    remaining gap was this exact confirmation stayed incorrectly "waiting" until some LATER
+    event re-evaluated it -- a sibling's own trigger, or the recheck job, whichever came
+    first. Both real cases resolved themselves on the next recheck, but cost up to a day's
+    delay on orders that were actually ready to ship the whole time.
     Returns (all_confirmed, missing_containers, expected_containers)."""
     expected = expected_containers_for_master(master_token)
     confirmed = expected & set(confirmed_pickup_containers().keys())
+    if current_container:
+        confirmed = confirmed | (expected & {current_container.strip().upper()})
     missing = expected - confirmed
     return (not missing), sorted(missing), sorted(expected)
 
@@ -1056,9 +1069,20 @@ def _latest_shipment_for_order(order_type, order_nbr, retries=3, delay=1.0):
             time.sleep(delay)
     return None
 
-def _failure_reason(order_type, order_nbr):
+def _failure_reason(order_type, order_nbr, raw_error=None):
     """When CreateShipment fails, look at the order to give a human reason
-    instead of Acumatica's generic 'Operation failed' stack trace."""
+    instead of Acumatica's generic 'Operation failed' stack trace.
+
+    raw_error (FIXED 2026-08-03, real incident: 17+ orders across masters 036239/039837/
+    039839/041000 all failed with Acumatica's own "does not contain any items planned for
+    shipment on '<date>'" error, while every check below -- Hold, CreditHold, existing
+    shipment, Status -- came back clean, so this function fell all the way through to its
+    generic fallback and reported "backordered or no stock," which actively misled the
+    investigation into checking inventory that was never the problem. The real cause: the
+    order's own Scheduled Shipment date was later than the requested ship_date, so Acumatica
+    correctly refused to plan anything for the earlier date. Checked here, after the specific
+    ground-truth checks above (which read the order's actual current state) but before the
+    generic fallback, so a real Hold/CreditHold/Status finding still wins if present."""
     try:
         st, d = api("GET", f"{ENTITY}/SalesOrder/{order_type}/{order_nbr}?$expand=Shipments")
     except Exception:
@@ -1074,6 +1098,10 @@ def _failure_reason(order_type, order_nbr):
     stt = g("Status")
     if stt and stt != "Open":
         return f"Order status is '{stt}' — not shippable"
+    if raw_error and "does not contain any items planned for shipment" in str(raw_error):
+        return ("Order's Scheduled Shipment date is later than the requested ship date -- "
+                "Acumatica won't plan a shipment before an order's own scheduled date. "
+                "Check/update the Scheduled Shipment field on this Sales Order.")
     return "Nothing available to ship (backordered or no stock in the ship-from warehouse)"
 
 
@@ -1128,6 +1156,46 @@ def set_shipment_date_and_container(shipment_id, ship_nbr, date=None, container_
         out["ship_date_actual"] = actual
     return out
 
+def _sync_scheduled_shipment_date(order_type, order_nbr, target_date):
+    """Acumatica's CreateShipment refuses to plan anything for a date EARLIER than the
+    Sales Order's own Requested On field (SOOrder.RequestDate on the DAC; confirmed via
+    live Inspect Element on 2026-08-03 -- Data Class SOOrder, Data Field RequestDate). The
+    literal error is "does not contain any items planned for shipment on '<date>'", which
+    has nothing to do with stock -- see _failure_reason()'s docstring. Confirmed real,
+    2026-08-03: 17+ orders across masters 036239/039837/039839/041000/041016/041017 all
+    failed this way. RequestedOn gets set to an original lead-time estimate at order
+    creation; when the container arrives faster than that estimate, the order is genuinely
+    ready before its own pre-set schedule catches up.
+
+    UNVERIFIED against this tenant: the JSON field name used below (RequestedOn) is
+    Acumatica's standard default-endpoint name for this DAC field, but this tenant's PUT
+    behavior has surprised this codebase before (see set_shipment_date_and_container's
+    docstring -- Shipment required an internal id, not its natural key, and every
+    key-format guess failed a different way). Test this against one real stuck order
+    before trusting it at scale.
+
+    Fail-soft by design: any failure here (wrong field name, permission, network) is
+    swallowed and logged in the return dict, never raised -- create_shipment() proceeds to
+    attempt CreateShipment regardless, so worst case is the same already-handled failure,
+    not a new one."""
+    try:
+        st, d = api("GET", f"{ENTITY}/SalesOrder/{order_type}/{order_nbr}?$select=RequestedOn")
+        if st != 200 or not isinstance(d, dict):
+            return {"requested_on_sync": f"GET failed (status {st})"}
+        current = ((d.get("RequestedOn") or {}).get("value") or "")[:10]
+        if not current or not target_date or current <= target_date:
+            return None  # already fine, or nothing usable to compare -- leave it alone
+        pst, presp = api("PUT", f"{ENTITY}/SalesOrder",
+                          {"OrderType": {"value": order_type}, "OrderNbr": {"value": order_nbr},
+                           "RequestedOn": {"value": target_date}})
+        out = {"requested_on_was": current, "requested_on_target": target_date,
+               "requested_on_synced": pst in (200, 204)}
+        if pst not in (200, 204):
+            out["requested_on_put_error"] = presp if isinstance(presp, str) else json.dumps(presp)[:300]
+        return out
+    except Exception as e:
+        return {"requested_on_sync_error": str(e)}
+
 def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None, po=None):
     # ship_date is required by the caller (process_file hard-stops before this
     # point if it's missing) -- no more silent fallback to a synced date or to
@@ -1137,12 +1205,15 @@ def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None, p
     # this parameter. Kept here in case it helps in some configs, but the real mechanism is
     # the corrective PUT + verification read further down, right after the shipment exists.
     date = ship_date
+    sync_result = _sync_scheduled_shipment_date(order_type, order_nbr, date) if date else None
     params = {}
     if date: params["ShipmentDate"] = {"value": date}
     if CFG["warehouse"]: params["WarehouseID"] = {"value": CFG["warehouse"]}
     body = {"entity": {"OrderType": {"value": order_type}, "OrderNbr": {"value": order_nbr}}, "parameters": params}
     st, resp, headers = api_with_headers("POST", f"{ENTITY}/SalesOrder/CreateShipment", body)
     res = {"order": f"{order_type} {order_nbr}", "invoke_status": st, "ship_date": date}
+    if sync_result:
+        res["scheduled_shipment_sync"] = sync_result
 
     # CreateShipment is a LONG-RUNNING action: 202 + Location means "accepted, still
     # processing", not "done". Poll Location until it stops returning 202 -- otherwise a
@@ -1195,7 +1266,7 @@ def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None, p
             res["error"] = "action completed but no resulting shipment was found for this order"
     else:
         res["error"] = resp if isinstance(resp, str) else json.dumps(resp)[:500]
-        res["reason"] = _failure_reason(order_type, order_nbr)
+        res["reason"] = _failure_reason(order_type, order_nbr, raw_error=res["error"])
     return res
 
 # ---------------- run log ----------------
@@ -2470,7 +2541,7 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
             else:
                 po_ok, po_detail = po_completeness(*ref)
             completeness_detail.append(dict(po_detail, master=token, complete=po_ok))
-            all_confirmed, missing, expected = containers_confirmed_available(token)
+            all_confirmed, missing, expected = containers_confirmed_available(token, current_container=container)
             if not all_confirmed:
                 container_gaps[token] = {"missing_containers": missing, "expected_containers": expected}
             if po_ok and all_confirmed:
@@ -4140,23 +4211,39 @@ class H(BaseHTTPRequestHandler):
             # shipment create) -- looping tight over 20-30+ active masters with no
             # pacing could burst past that cap in well under a minute. Paced well
             # below the limit, not right up against it.
-            first = True
+            # Dedupe by CONTAINER, not master (FIXED 2026-08-03, real incident: GCXU5545290).
+            # process_manual(container) resolves and re-checks EVERY master tied to that
+            # container in one call -- so looping per-master (the old approach below) called
+            # process_manual on the SAME shared container once per master sharing it. The
+            # first call correctly shipped everyone; every call after it saw those same
+            # masters as "already shipped" (because they were, seconds earlier, in this same
+            # run) and raised a false "pickup_after_already_shipped" anomaly needing clerk
+            # review. Real case: one shared container generated 6 false anomaly flags this
+            # way even though every underlying shipment was correct. Collect the unique set
+            # of containers first; process each exactly once.
+            container_to_sample_master = {}
             for token, entry in ledger.items():
                 if entry.get("status") not in ("waiting", "partial"):
                     continue
                 containers = list(entry.get("containers", {}).keys())
                 if not containers:
                     continue
+                container_to_sample_master.setdefault(containers[-1], token)
+            first = True
+            for container, sample_master in container_to_sample_master.items():
                 if not first:
                     time.sleep(2.5)
                 first = False
-                latest = ledger_latest_date(token)
+                # A reasonable fallback ship_date only -- process_manual recomputes the
+                # correct per-master date internally via ledger_latest_date(po) regardless
+                # (see line ~2599), so this doesn't need to be exact per master.
+                latest = ledger_latest_date(sample_master)
                 try:
-                    out = process_manual(containers[-1], latest, source="ledger-recheck",
+                    out = process_manual(container, latest, source="ledger-recheck",
                                           dry_run=False, force_receipts=False)
                 except Exception as e:
                     out = {"error": str(e)}
-                results.append({"master": token, "container_used": containers[-1], "result": out})
+                results.append({"container": container, "result": out})
             return self._send(200, json.dumps({"checked": len(results), "results": results}), "application/json")
         if u.path == "/fixshipdate":
             # Correct ShipmentDate on an ALREADY-CREATED shipment without re-running
