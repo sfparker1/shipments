@@ -1592,11 +1592,32 @@ def container_ship_history(container):
     while the CURRENT status has moved backward, that's flagged as an exception. Checks
     the permanent history file, not just the current batch, so it also catches the
     correction arriving in a LATER cron cycle, not only the same one. Local file read
-    only, no live Acumatica calls."""
+    only, no live Acumatica calls.
+
+    FIXED 2026-08-03, real incident: master 642058's own 5 containers (SZLU9148202,
+    KKFU6781146, SEGU9247979, TTNU8872610, TCLU1353206) arrived as 5 separate real NRT
+    events over ~2 days -- only the LAST one to arrive actually completed the master's
+    confirmed-container set and triggered creation, so only THAT container's literal
+    string ended up in a successful run's own "containers" field (which is just the single
+    container parameter that happened to trigger process_manual, not every container
+    involved). The other 4 -- equally real, equally part of the same already-shipped
+    order -- always read shipped=false against the OLD exact-trigger check below, forever,
+    since they were never personally the one that triggered a successful run. That falsely
+    tripped the missed-trigger-backfill logic days later when NRT sent their NEXT
+    lifecycle-stage email ("Scheduled for Pickup"), re-firing create_shipment for containers
+    that had already done their job. Checking the newer "all_confirmed_containers" field
+    (every container actually confirmed for whichever master(s) shipped in that run, not
+    just the trigger) fixes this going forward; the exact-trigger check below stays as a
+    fallback for older log entries recorded before this field existed."""
     if not container:
         return {"shipped": False}
     for h in history(limit=0):
-        # Exact token match against the ", "-joined list (see process_manual()'s
+        all_confirmed = h.get("all_confirmed_containers")
+        if all_confirmed and container in all_confirmed:
+            return {"shipped": True, "ts": h.get("ts"),
+                    "master_pos": sorted({o.get("po") for o in (h.get("orders") or []) if o.get("po")})}
+        # Fallback for log entries recorded before all_confirmed_containers existed --
+        # exact token match against the ", "-joined trigger field (see process_manual()'s
         # container_ref), not a bare substring check -- `container in "..."` would also
         # match if this container's ref happened to be a literal substring of a sibling
         # container's ref in the same run (e.g. a shorter/malformed ref folded into a
@@ -2398,6 +2419,11 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
     container_gaps = {}
     completeness_detail = []
     anomalies = []  # only ever populated on the container-resolution (NRT) path below
+    # Every resolved master's full expected-container set -- only ever populated on the
+    # container-resolution (NRT) path below (the pos-given/Maersk-FCR path isn't ledger-
+    # tracked, so there's no per-container confirmation concept for it). Defaulted here so
+    # the log_run() call further down can reference it unconditionally either way.
+    expected_containers_by_master = {}
     if pos:
         all_pos = list(dict.fromkeys(p.strip() for p in pos if p and p.strip()))
         unresolved = False
@@ -2557,6 +2583,11 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         completeness_detail = []
         container_gaps = {}
         ready = []
+        # Every resolved master's FULL expected-container set, regardless of ready/waiting --
+        # needed so a successful run can log which containers actually belong to whichever
+        # master(s) it ships, not just the single container that happened to trigger this
+        # call. See container_ship_history()'s docstring for why this matters.
+        expected_containers_by_master = {}
         for token in resolved:
             ref = po_refs.get(token)
             if ref is None:
@@ -2566,6 +2597,7 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                 po_ok, po_detail = po_completeness(*ref)
             completeness_detail.append(dict(po_detail, master=token, complete=po_ok))
             all_confirmed, missing, expected = containers_confirmed_available(token, current_container=container)
+            expected_containers_by_master[token] = expected
             if not all_confirmed:
                 container_gaps[token] = {"missing_containers": missing, "expected_containers": expected}
             if po_ok and all_confirmed:
@@ -2728,9 +2760,28 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
             status = "partial"
         else:
             status = "failed"
+        # FIXED 2026-08-03, real incident: master 642058's own containers (SZLU9148202,
+        # KKFU6781146, SEGU9247979, TTNU8872610, TCLU1353206) arrived as 5 SEPARATE real NRT
+        # events -- only the LAST one to arrive actually completed the set and triggered
+        # creation, so ONLY that one container's string ended up in a successful run's own
+        # "containers" field. container_ship_history() matches on that field, so the other 4
+        # -- equally real, equally shipped -- always read shipped=false when checked later,
+        # since they were never personally the trigger of a successful run. That falsely
+        # tripped the missed-trigger-backfill logic days later when NRT sent their NEXT
+        # lifecycle-stage email ("Scheduled for Pickup"), re-firing create_shipment for
+        # containers that had already done their job -- which then correctly (but uselessly)
+        # tripped the SEPARATE already-shipped anomaly check. Recording the FULL confirmed-
+        # container set for every master that actually ships in THIS run -- not just the
+        # single container parameter that happened to trigger it -- lets
+        # container_ship_history() match against any of them, not just the one.
+        all_confirmed_containers = sorted({
+            c for token in all_pos if po_all_created.get(token)
+            for c in (expected_containers_by_master.get(token) or [])
+        })
         log_run({"reference": None, "document": f"auto:{source or 'unknown'}",
                  "user": user or f"auto:{source or 'unknown'}", "acumatica_user": connected_user(),
                  "status": status, "orders_matched": to_create, "created": created, "containers": container,
+                 "all_confirmed_containers": all_confirmed_containers or None,
                  "unresolved_containers": unresolved_containers, "ship_date": ship_date,
                  "email_received_at": email_received_at,
                  "still_waiting_masters": still_waiting or None, "anomalies": anomalies or None,
