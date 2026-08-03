@@ -2491,6 +2491,30 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                 # ledger_check_sla() would measure from whenever this master first
                 # appeared, possibly months ago, and could immediately flag it as stuck.
                 ledger_set_status(token, "waiting", reset_first_seen=True)
+            else:
+                # FIXED 2026-08-03, real gap: a master NOT yet marked "shipped" in our
+                # ledger can still already be fulfilled in Acumatica -- shipped manually by
+                # a clerk, entirely bypassing the NRT/completeness flow this function
+                # gates on. Without this check, such a master runs the completeness gate
+                # below on every single event and every /ledger/recheck, forever, since it
+                # never actually completes ON ITS OWN (the manual shipment already
+                # satisfied the real-world need, so there's nothing left for our own
+                # criteria to catch up to). The OTHER "already fulfilled" check
+                # (find_fulfilled_sales_orders, further below) exists for exactly this
+                # semantic but only runs for masters that already PASSED this gate --
+                # never reached by a master that fails it. Same allow-list-based detection
+                # (Completed/Closed/Shipping -- see FULFILLED_SO_STATUSES's docstring for
+                # why Cancelled/Voided deliberately don't count), just moved earlier so a
+                # manually-shipped master gets caught regardless of gate outcome.
+                fulfilled = find_fulfilled_sales_orders([token]).get(token, [])
+                if fulfilled:
+                    ledger_set_status(token, "shipped",
+                                       note="Detected already fulfilled in Acumatica (status: "
+                                            f"{fulfilled[0]['status']}) -- likely shipped "
+                                            "manually, outside this automation.")
+                    ledger_record(token, container, pickup_date)
+                    anomalous_tokens.add(token)
+                    continue
             ledger_record(token, container, pickup_date)
         resolved = [t for t in original_resolved if t not in anomalous_tokens]
         if not resolved:
