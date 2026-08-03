@@ -1518,11 +1518,26 @@ def export_history_rows(limit=0):
 
 def _flagged_row_masters(r):
     """Every master/PO token an already-flagged agent_log row's OWN stored tool_result
-    named at decision time (from data.rows) -- pure local read of data already on the row,
-    no live call. Used by _find_later_success() to match a later resolving run by shared
-    master, not just by container name."""
+    named at decision time (from data.rows, or data.anomalies) -- pure local read of data
+    already on the row, no live call. Used by _find_later_success() to match a later
+    resolving run by shared master, not just by container name.
+
+    FIXED 2026-08-03, real incident: an anomaly response (reason=pickup_after_already_
+    shipped, e.g. master 642058's siblings SEGU9247979/SZLU9148202/TTNU8872610) stores its
+    master token(s) under data.anomalies (each entry: {"master": ..., "note": ...,
+    "ledger_entry": ...}), not data.rows -- rows is only populated on the normal
+    completeness-gate response shape. Without reading anomalies too, this always returned
+    an empty set for anomaly-flagged rows, so _find_later_success() fell back to
+    container-only matching -- which is exactly the match that fails for a sibling
+    container that was never personally the trigger of the later successful run (see
+    container_ship_history()'s docstring for the same underlying pattern). Genuinely
+    unresolved anomalies (no later run ever shows the master shipped) are unaffected --
+    this only lets ALREADY-resolved ones surface as "Resolved on retry" instead of sitting
+    flagged forever."""
     data = ((r or {}).get("tool_result") or {}).get("data") or {}
-    return {row.get("po") for row in (data.get("rows") or []) if row.get("po")}
+    from_rows = {row.get("po") for row in (data.get("rows") or []) if row.get("po")}
+    from_anomalies = {a.get("master") for a in (data.get("anomalies") or []) if a.get("master")}
+    return from_rows | from_anomalies
 
 def _find_later_success(container, after_ts, hist_rows, master_tokens=None):
     """Did a LATER run (e.g. a manual retry after a timeout exception) succeed for this
