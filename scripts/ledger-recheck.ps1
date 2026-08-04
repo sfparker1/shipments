@@ -34,22 +34,25 @@ try {
     $token = $null
 }
 
-Write-Output "Checked $($resp.checked) master(s)."
+Write-Output "Checked $($resp.checked) container(s)."
 Write-Output ""
 foreach ($r in $resp.results) {
     $res = $r.result
     if ($res.error) {
-        Write-Output ("- Master {0} (via {1}): ERROR -- {2}" -f $r.master, $r.container_used, $res.error)
+        Write-Output ("- Container {0}: ERROR -- {1}" -f $r.container, $res.error)
         continue
     }
     if ($res.waiting_on_containers) {
-        Write-Output ("- Master {0} (via {1}): still waiting -- {2}" -f $r.master, $r.container_used, $res.note)
+        Write-Output ("- Container {0}: still waiting -- {1}" -f $r.container, $res.note)
         continue
     }
     $created = $res.created
-    $line = "- Master {0} (via {1}): created={2}" -f $r.master, $r.container_used, $created
+    $line = "- Container {0}: created={1}" -f $r.container, $created
     if ($res.still_waiting_masters) {
         $line += " (sibling master(s) still waiting: $($res.still_waiting_masters -join ', '))"
+    }
+    if ($res.anomalies) {
+        $line += " -- $($res.anomalies.Count) ANOMALY(IES), needs review"
     }
     Write-Output $line
 }
