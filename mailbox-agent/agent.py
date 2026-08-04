@@ -179,12 +179,7 @@ TOOLS = [
                        "that the specific master(s) named in `anomalies` need a human to look at. Call "
                        "finish with exception=true naming those master(s), using whatever classification "
                        "fits the rest of the result otherwise (e.g. still nrt_available_for_pickup if other "
-                       "masters genuinely created); (7) needs_review=false with reason=already_closed and "
-                       "no `rows` at all -- every master tied to this container is already fully "
-                       "Completed/Closed in Acumatica (or was already detected as fulfilled), so this was "
-                       "just a late/duplicate NRT notification for an order that's fully done. NORMAL, not "
-                       "an error -- call finish with exception=false even though created=0, since there's "
-                       "nothing left to create or investigate.",
+                       "masters genuinely created).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -203,10 +198,7 @@ TOOLS = [
                        "recognize, a create_shipment that came back needs_review or created nothing, "
                        "missing/unclear data, a non-NRT email that landed in this folder, or anything "
                        "that didn't fit the normal path. Do NOT set exception=true for "
-                       "waiting_on_containers=true -- that's a normal, expected state, not a problem. Do "
-                       "NOT set exception=true for reason=already_closed either, even though created=0 -- "
-                       "that means every master is already fully Completed/Closed in Acumatica, nothing "
-                       "left to do.",
+                       "waiting_on_containers=true -- that's a normal, expected state, not a problem.",
         "input_schema": {
             "type": "object",
             "properties": {

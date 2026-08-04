@@ -2500,10 +2500,9 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                 # that case, misread it as "ledger stale," and reset a correctly-shipped
                 # master back to waiting for no reason (real case, masters 362040/041/044/
                 # 045, 2026-07-31 -- see FULFILLED_SO_STATUSES's docstring).
-                matched_for_token = find_any_sales_orders_batch([token]).get(token, [])
                 still_shipped = any(
                     _latest_shipment_for_order(m["order_type"], m["order_nbr"], retries=1, delay=0)
-                    for m in matched_for_token)
+                    for m in find_any_sales_orders_batch([token]).get(token, []))
                 if still_shipped:
                     # FIXED 2026-07-31 (real bug, caught live via /ledger/recheck): this used
                     # to `return` the WHOLE function here -- for a shared trigger container
@@ -2518,19 +2517,6 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                     # order. Now excludes only THIS token from further processing and lets
                     # every sibling proceed independently -- same principle as the
                     # completeness gate below, which Parker already confirmed is correct.
-                    #
-                    # FIXED 2026-08-03, Parker's call (real noise: master 642058's siblings
-                    # SEGU9247979/SZLU9148202/TTNU8872610): a duplicate/late NRT pickup email
-                    # for an order that's fully Completed/Closed in Acumatica already can't
-                    # indicate a real problem -- it's fully invoiced, there's nothing left to
-                    # undo or investigate. Only suppress for that terminal state; an order
-                    # merely "Shipping" (shipment exists but not yet confirmed/invoiced) still
-                    # gets flagged below, since something could genuinely still be wrong there.
-                    fully_closed = bool(matched_for_token) and all(
-                        m.get("status") in ("Completed", "Closed") for m in matched_for_token)
-                    if fully_closed:
-                        anomalous_tokens.add(token)
-                        continue
                     anomalies.append({"master": token,
                                        "note": f"master {token} was already marked shipped, but a "
                                                "new pickup event just arrived for it -- a clerk "
@@ -2573,21 +2559,11 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
             ledger_record(token, container, pickup_date)
         resolved = [t for t in original_resolved if t not in anomalous_tokens]
         if not resolved:
-            if anomalies:
-                # Every resolved master for this container was an anomaly -- genuinely
-                # nothing else to do this event.
-                _log_early("anomaly", {"anomalies": anomalies})
-                return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
-                        "reason": "pickup_after_already_shipped", "anomalies": anomalies}
-            # Every resolved master for this container was excluded for a BENIGN reason
-            # (fully Completed/Closed already, or a manually-fulfilled detection) -- not a
-            # real anomaly, just nothing left to do. Distinct from the anomalies branch
-            # above so this doesn't show up as "Needs review" noise.
-            note = ("every order tied to this container is already fully Completed/Closed "
-                    "in Acumatica, or was already detected as fulfilled -- no action needed")
-            _log_early("already_fulfilled", {"note": note})
-            return {"container": container, "needs_review": False, "created": 0, "orders_matched": 0,
-                    "reason": "already_closed", "note": note}
+            # Every resolved master for this container was an anomaly -- genuinely nothing
+            # else to do this event.
+            _log_early("anomaly", {"anomalies": anomalies})
+            return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
+                    "reason": "pickup_after_already_shipped", "anomalies": anomalies}
         po_refs = resolve_pos_by_master(container)
         for token in resolved:
             ledger_stamp_checked(token)
