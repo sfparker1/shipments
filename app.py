@@ -2585,15 +2585,7 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
             # above so this doesn't show up as "Needs review" noise.
             note = ("every order tied to this container is already fully Completed/Closed "
                     "in Acumatica, or was already detected as fulfilled -- no action needed")
-            # Populated with a real per-master "orders" entry (not left empty) so a LATER
-            # run like this one is recognized by _find_later_success() as resolving any
-            # OLDER flagged row for the same container/master -- see its docstring. Without
-            # this, an old pickup_after_already_shipped row would sit flagged forever even
-            # after this exact fix started suppressing the anomaly going forward.
-            synthetic_orders = [{"po": tok, "order": None, "shipment_nbr": None, "created": False,
-                                  "reason": "already fulfilled -- fully Completed/Closed in Acumatica"}
-                                 for tok in anomalous_tokens]
-            _log_early("already_fulfilled", {"note": note, "orders": synthetic_orders})
+            _log_early("already_fulfilled", {"note": note})
             return {"container": container, "needs_review": False, "created": 0, "orders_matched": 0,
                     "reason": "already_closed", "note": note}
         po_refs = resolve_pos_by_master(container)
