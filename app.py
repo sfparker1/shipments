@@ -2517,6 +2517,25 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                     # order. Now excludes only THIS token from further processing and lets
                     # every sibling proceed independently -- same principle as the
                     # completeness gate below, which Parker already confirmed is correct.
+                    # FIXED 2026-08-03, Parker's call (real noise: master 642058's siblings
+                    # SEGU9247979/SZLU9148202/TTNU8872610 -- confirmed via a live Acumatica
+                    # export that all 5 of that master's containers, including these 3, were
+                    # already on the SAME PO receipt back on 2026-07-01, well before any of
+                    # today's "anomaly" emails). A duplicate/late NRT pickup notification for
+                    # a PO that's already fully received can't be reporting anything new --
+                    # the goods are already logged into the warehouse. Deliberately checking
+                    # PO_COMPLETENESS() (the Gate-1 receiving fact), NOT the DC sales order's
+                    # own status -- an order THIS automation shipped itself sits at "Shipping"
+                    # forever (it never auto-confirms; a clerk does that manually), so a
+                    # Completed/Closed-only check on the sales order would almost never fire
+                    # for exactly the case it needs to catch (first tried and reverted this
+                    # same day). po_completeness() fails closed on any lookup problem, same
+                    # guarantee this already relies on elsewhere in this function.
+                    po_ref = resolve_pos_by_master(container).get(token)
+                    po_fully_received = bool(po_ref) and po_completeness(*po_ref)[0]
+                    if po_fully_received:
+                        anomalous_tokens.add(token)
+                        continue
                     anomalies.append({"master": token,
                                        "note": f"master {token} was already marked shipped, but a "
                                                "new pickup event just arrived for it -- a clerk "
@@ -2559,11 +2578,24 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
             ledger_record(token, container, pickup_date)
         resolved = [t for t in original_resolved if t not in anomalous_tokens]
         if not resolved:
-            # Every resolved master for this container was an anomaly -- genuinely nothing
-            # else to do this event.
-            _log_early("anomaly", {"anomalies": anomalies})
-            return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
-                    "reason": "pickup_after_already_shipped", "anomalies": anomalies}
+            if anomalies:
+                # Every resolved master for this container was an anomaly -- genuinely
+                # nothing else to do this event.
+                _log_early("anomaly", {"anomalies": anomalies})
+                return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
+                        "reason": "pickup_after_already_shipped", "anomalies": anomalies}
+            # Every resolved master for this container was excluded for a BENIGN reason
+            # (PO fully received already, or a manually-fulfilled detection) -- not a real
+            # anomaly, just nothing left to do. Distinct from the anomalies branch above so
+            # this doesn't show up as "Needs review" noise.
+            note = ("every PO tied to this container is already fully received in Acumatica, "
+                    "or was already detected as fulfilled -- no action needed")
+            synthetic_orders = [{"po": tok, "order": None, "shipment_nbr": None, "created": False,
+                                  "reason": "already fulfilled -- fully received in Acumatica"}
+                                 for tok in anomalous_tokens]
+            _log_early("already_fulfilled", {"note": note, "orders": synthetic_orders})
+            return {"container": container, "needs_review": False, "created": 0, "orders_matched": 0,
+                    "reason": "already_closed", "note": note}
         po_refs = resolve_pos_by_master(container)
         for token in resolved:
             ledger_stamp_checked(token)
