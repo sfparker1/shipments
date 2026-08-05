@@ -2265,6 +2265,74 @@ def _container_status_html(days=None):
     return header + ('<div class=twrap><table><tr><th>Customer Order</th><th>Master PO</th>'
                      f'<th>Container</th><th>Pickup Date</th></tr>{row_html}</table></div>')
 
+def backfill_pickup_dates(pairs_text):
+    """Parker's request, 2026-08-05: a real window existed where he was removed from the
+    NRT distribution list -- containers were genuinely picked up and NRT sent status
+    emails during that window, but nobody (and so nothing) in this automation ever saw
+    them. Outlook search can't recover a gap like that (the emails were never received in
+    the first place), so this is a direct manual correction: given container/date pairs
+    typed in by hand, resolve each container to its master(s) the SAME way container_scope()
+    already does for a real NRT trigger, and call the SAME ledger_record() a real trigger
+    would have called. Does NOT call create_shipment or touch Acumatica at all -- purely a
+    ledger data correction. If a backfilled master is now complete, the existing
+    /ledger/recheck job picks it up on its own schedule same as any other resolved gap.
+
+    pairs_text: one "CONTAINER: YYYY-MM-DD" (or CONTAINER, YYYY-MM-DD / CONTAINER YYYY-MM-DD)
+    per line. Returns a list of per-line result dicts for rendering."""
+    results = []
+    for line in (pairs_text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = re.split(r"[:,\s]+", line, maxsplit=1)
+        if len(parts) != 2:
+            results.append({"line": line, "ok": False, "error": "couldn't parse -- expected CONTAINER: YYYY-MM-DD"})
+            continue
+        container, date = parts[0].strip().upper(), parts[1].strip()
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+            results.append({"line": line, "container": container, "ok": False,
+                            "error": f"date '{date}' isn't YYYY-MM-DD"})
+            continue
+        scope, tokens = container_scope(container)
+        if scope != "in_scope" or not tokens:
+            results.append({"line": line, "container": container, "ok": False,
+                            "error": f"container_scope() returned '{scope}' -- no master(s) to record against "
+                                     "(check the container number, or whether its PO Receipt exists in Acumatica yet)"})
+            continue
+        for tok in tokens:
+            ledger_record(tok, container, date)
+        results.append({"line": line, "container": container, "date": date, "ok": True, "masters": tokens})
+    return results
+
+def _backfill_pickup_html(results=None):
+    def esc(v):
+        s = "" if v is None else str(v)
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    form = ('<div class=card><h1 style="font-size:18px">Manually record a pickup date</h1>'
+            '<p class=sub>For containers NRT genuinely confirmed but this automation never saw -- e.g. a '
+            'window where the NRT distribution list didn&#39;t include this inbox. Writes directly to the '
+            'same ledger a real "Available for Pickup" email would update -- does NOT create any shipment '
+            'or call Acumatica; if this completes a master, the next /ledger/recheck picks it up '
+            'automatically. One per line: <code>CONTAINER: YYYY-MM-DD</code></p>'
+            '<form method=post action=/backfill-pickup>'
+            '<textarea name=pairs rows=6 style="width:100%;font-family:var(--font-mono);font-size:13px" '
+            'placeholder="CAAU6583199: 2026-07-26\nMRKU5799017: 2026-07-27"></textarea><br><br>'
+            '<button class=fog>Record</button></form></div>')
+    if not results:
+        return form
+    rows = "".join(
+        f'<tr><td>{esc(r["line"])}</td>'
+        + (f'<td class=t-container>{esc(r.get("container"))}</td><td>{esc(r.get("date"))}</td>'
+           f'<td>{esc(", ".join(r.get("masters") or []))}</td><td>&#10003; recorded</td>'
+           if r["ok"] else
+           f'<td class=t-container>{esc(r.get("container"))}</td><td></td><td></td>'
+           f'<td style="color:var(--rust)">&#10007; {esc(r.get("error"))}</td>')
+        + '</tr>'
+        for r in results)
+    return form + ('<div class=card><h2>Results</h2><div class=twrap><table>'
+                   '<tr><th>Input</th><th>Container</th><th>Date</th><th>Master(s)</th><th>Outcome</th></tr>'
+                   f'{rows}</table></div></div>')
+
 # ---------------- process a handover PDF ----------------
 def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None):
     # Hard stop: creation requires a typed Shipment date. No more silent fallback
@@ -3623,6 +3691,7 @@ NAV_ITEMS = [
     ("container-status", "/container-status", "Container check"),
     ("splits", "/splits", "Split orders"),
     ("manual", "/manual", "Manual upload"),
+    ("backfill-pickup", "/backfill-pickup", "Backfill pickup"),
     ("guide", "/guide", "Guide"),
     ("history", "/history", "Shipment history"),
     ("diag", "/diag", "Diagnostics"),
@@ -4153,6 +4222,8 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, page(_dashboard_html(), current="dashboard"))
         if u.path == "/manual":
             return self._send(200, page(MANUAL_UPLOAD, current="manual"))
+        if u.path == "/backfill-pickup":
+            return self._send(200, page(_backfill_pickup_html(), current="backfill-pickup"))
         if u.path == "/connect":
             self.send_response(302); self.send_header("Location", build_authorize_url()); self.end_headers(); return
         if u.path == "/diag":
@@ -4322,6 +4393,19 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
+        if u.path == "/backfill-pickup":
+            # Session-authed (browser form submit), same standard as /manual -- a human
+            # correcting data by hand, not an automated flow.
+            if not self._authed():
+                return self._send(200, LOGIN)
+            ln = int(self.headers.get("Content-Length", 0))
+            data = urllib.parse.parse_qs(self.rfile.read(ln).decode())
+            pairs_text = data.get("pairs", [""])[0]
+            try:
+                results = backfill_pickup_dates(pairs_text)
+            except Exception as e:
+                results = [{"line": pairs_text, "ok": False, "error": str(e)}]
+            return self._send(200, page(_backfill_pickup_html(results), current="backfill-pickup"))
         if u.path == "/autoship":
             # Token-authenticated (not a browser session) -- called by the NRT Power
             # Automate flow and the Maersk/FCR watch-list checker. Separate token from
