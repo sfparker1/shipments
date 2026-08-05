@@ -2225,7 +2225,18 @@ def _container_status_rows(days):
         orders = matched.get(tok) or []
         order_labels = sorted({o.get("cust_order") for o in orders if o.get("cust_order")}) or [None]
         confirmed = entry.get("containers") or {}
-        all_containers = sorted(set(confirmed) | expected_containers_for_master(tok)) or [None]
+        # FIXED 2026-08-05, real case (master 141965): expected_containers_for_master()
+        # unions containers from EVERY receipt whose VendorRef mentions this master token
+        # anywhere -- correct for its actual purpose (the completeness gate, which only
+        # ever runs this for a master that's still waiting/partial), but wrong here for a
+        # master that's already Shipped: 141965 genuinely only ever needed MRKU5282940
+        # (confirmed, and it shipped on exactly that), yet the union pulled in
+        # MRKU2927958/MRKU4208510 from a LARGER sibling cluster's receipts and showed them
+        # as "Waiting" on an order that has nothing left to wait on. A shipped master shows
+        # only what it actually confirmed -- never a manufactured "still pending" list.
+        all_containers = sorted(confirmed) if entry.get("status") == "shipped" else \
+            sorted(set(confirmed) | expected_containers_for_master(tok))
+        all_containers = all_containers or [None]
         for order_label in order_labels:
             for cont in all_containers:
                 rows.append({"customer_order": order_label, "master_po": tok,
