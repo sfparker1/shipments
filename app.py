@@ -2226,16 +2226,18 @@ def _container_status_html(days=None):
         s = "" if v is None else str(v)
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     days = _container_status_days(days)
-    # TEMP DIAGNOSTIC, 2026-08-05: every row showing "no Sales Order matched yet" across
-    # unrelated masters means load_all_orders() itself likely isn't returning anything
-    # usable, not that these masters genuinely lack a Sales Order. Surfacing the raw count
-    # so this can be confirmed/denied without another blind guess -- remove once resolved.
-    diag_count = len(load_all_orders())
-    diag_note = ""
-    if diag_count < 100:
-        raw_st, raw_data = api("GET", f"{ENTITY}/SalesOrder?$select=OrderType,OrderNbr,CustomerOrder,CustomerID,Status&$top=5")
-        diag_note = (f'<p class=sub style="color:var(--rust)">Diagnostic: load_all_orders() returned '
-                     f'{diag_count} row(s) total. Raw probe: status={raw_st}, body={esc(str(raw_data)[:300])}</p>')
+    # TEMP DIAGNOSTIC, 2026-08-05: load_all_orders() returns 100+ rows (real data), but
+    # ZERO matched any of several unrelated masters -- including 041016/041017, which
+    # definitely have a Sales Order (they were force-shipped earlier). That rules out "no
+    # data" and points at the matching logic or the actual CustomerOrder format on this
+    # data. Showing real sample values instead of guessing again -- remove once resolved.
+    all_orders_sample = load_all_orders()
+    probe_tokens = ["041016", "041017"]
+    hits = [o for o in all_orders_sample if any(t in (o.get("cust_order") or "") for t in probe_tokens)]
+    sample_cust_orders = [o.get("cust_order") for o in all_orders_sample[:15]]
+    diag_note = ('<p class=sub style="color:var(--rust)">Diagnostic: load_all_orders() total='
+                 f'{len(all_orders_sample)}. Orders containing 041016/041017 anywhere in cust_order: '
+                 f'{esc(str(hits[:5]))}. Sample of first 15 cust_order values: {esc(str(sample_cust_orders))}</p>')
     header = ('<div class=card><h1 style="font-size:18px">Container status check</h1>'
               '<p class=sub>One row per Customer Order + container, showing the date NRT '
               'confirmed &#8220;Available for Pickup&#8221; for it -- or Waiting if it hasn&#39;t yet. '
