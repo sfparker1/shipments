@@ -2226,10 +2226,21 @@ def _container_status_html(days=None):
         s = "" if v is None else str(v)
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     days = _container_status_days(days)
+    # TEMP DIAGNOSTIC, 2026-08-05: every row showing "no Sales Order matched yet" across
+    # unrelated masters means load_all_orders() itself likely isn't returning anything
+    # usable, not that these masters genuinely lack a Sales Order. Surfacing the raw count
+    # so this can be confirmed/denied without another blind guess -- remove once resolved.
+    diag_count = len(load_all_orders())
+    diag_note = ""
+    if diag_count < 100:
+        raw_st, raw_data = api("GET", f"{ENTITY}/SalesOrder?$select=OrderType,OrderNbr,CustomerOrder,CustomerID,Status&$top=5")
+        diag_note = (f'<p class=sub style="color:var(--rust)">Diagnostic: load_all_orders() returned '
+                     f'{diag_count} row(s) total. Raw probe: status={raw_st}, body={esc(str(raw_data)[:300])}</p>')
     header = ('<div class=card><h1 style="font-size:18px">Container status check</h1>'
               '<p class=sub>One row per Customer Order + container, showing the date NRT '
               'confirmed &#8220;Available for Pickup&#8221; for it -- or Waiting if it hasn&#39;t yet. '
               'Masters touched in the last N day(s). Pure local-file read, no live Acumatica calls.</p>'
+              f'{diag_note}'
               '<form method=get action=/container-status class=search-row>'
               f'<input type=number name=days min=1 max=60 value="{days}" style="width:80px"> day(s) '
               '<button class=fog>Show</button>'
