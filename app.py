@@ -883,20 +883,27 @@ OPEN_TTL = 600   # cache open sales orders for 10 min
 
 def load_open_orders(force=False):
     """Fetch all OPEN sales orders once (no slow 'contains' scan — just a Status
-    filter), cache them, and reuse. Turns N table scans into one bounded fetch."""
+    filter), cache them, and reuse. Turns N table scans into one bounded fetch.
+
+    FIXED 2026-08-05 (real bug, caught via /container-status showing "no Sales Order
+    matched yet" for masters that plainly had shipped): this used a single unpaginated
+    api() call -- fine while the open-order count stayed under Acumatica's default page
+    size, but silently truncated once it didn't, with no error, just a quietly incomplete
+    result cached for the full 10-minute TTL. Paginated the same proven way
+    load_recent_receipts() already does."""
     now = time.time()
     if not force and _OPEN_ORDERS["rows"] is not None and now - _OPEN_ORDERS["ts"] < OPEN_TTL:
         return _OPEN_ORDERS["rows"]
-    rows = []
     q = (f"{ENTITY}/SalesOrder?$filter=Status eq 'Open'"
          f"&$select=OrderType,OrderNbr,CustomerOrder,CustomerID,Status")
-    st, data = api("GET", q)
-    if st == 200 and isinstance(data, list):
-        for so in data:
-            g = lambda k: (so.get(k) or {}).get("value")
-            rows.append({"order_type": g("OrderType"), "order_nbr": g("OrderNbr"),
-                         "cust_order": g("CustomerOrder") or "", "customer": g("CustomerID"),
-                         "status": g("Status")})
+    data, fetch_ok = _fetch_all_pages(q, page_size=500, max_pages=20)
+    rows = []
+    for so in data:
+        g = lambda k: (so.get(k) or {}).get("value")
+        rows.append({"order_type": g("OrderType"), "order_nbr": g("OrderNbr"),
+                     "cust_order": g("CustomerOrder") or "", "customer": g("CustomerID"),
+                     "status": g("Status")})
+    if fetch_ok or rows:
         _OPEN_ORDERS["rows"] = rows
         _OPEN_ORDERS["ts"] = now
     return rows
@@ -969,19 +976,28 @@ def load_all_orders(force=False):
     tried to ship turned out to be legacy orders Parker's team had already fulfilled
     (manually, before this automation existed) -- 'no open sales order' flagged every one
     of them as needing review, even though nothing was actually wrong. Same shape as
-    load_open_orders(), just without the Status filter."""
+    load_open_orders(), just without the Status filter.
+
+    FIXED 2026-08-05 (real bug, caught via /container-status showing "no Sales Order
+    matched yet" for masters that plainly had shipped): a single unpaginated api() call
+    over EVERY sales order regardless of status -- the company's entire order history --
+    was always going to hit Acumatica's default page-size truncation eventually, silently
+    and with no error. Every caller of this function (find_fulfilled_sales_orders,
+    find_any_sales_orders_batch, the stale-ledger check in process_manual) was reading a
+    quietly incomplete result for up to an hour at a time. Paginated the same proven way
+    load_recent_receipts() already does."""
     now = time.time()
     if not force and _ALL_ORDERS["rows"] is not None and now - _ALL_ORDERS["ts"] < ALL_ORDERS_TTL:
         return _ALL_ORDERS["rows"]
-    rows = []
     q = f"{ENTITY}/SalesOrder?$select=OrderType,OrderNbr,CustomerOrder,CustomerID,Status"
-    st, data = api("GET", q)
-    if st == 200 and isinstance(data, list):
-        for so in data:
-            g = lambda k: (so.get(k) or {}).get("value")
-            rows.append({"order_type": g("OrderType"), "order_nbr": g("OrderNbr"),
-                         "cust_order": g("CustomerOrder") or "", "customer": g("CustomerID"),
-                         "status": g("Status")})
+    data, fetch_ok = _fetch_all_pages(q, page_size=500, max_pages=40)
+    rows = []
+    for so in data:
+        g = lambda k: (so.get(k) or {}).get("value")
+        rows.append({"order_type": g("OrderType"), "order_nbr": g("OrderNbr"),
+                     "cust_order": g("CustomerOrder") or "", "customer": g("CustomerID"),
+                     "status": g("Status")})
+    if fetch_ok or rows:
         _ALL_ORDERS["rows"] = rows
         _ALL_ORDERS["ts"] = now
     return rows
@@ -2165,14 +2181,16 @@ def _lookup_html(query=None):
     return "".join(parts)
 
 def _container_status_html(days=None):
-    """Parker's morning-check request, 2026-08-05: for masters touched recently, show
-    Customer Order Nbr(s) + every container tied to it + the date NRT confirmed each one --
-    without clicking into /lookup one master at a time. Pure local-file read (ledger +
-    load_all_orders' cached rows) -- no live Acumatica calls, same standard as /lookup.
-
-    Grouped by MASTER (not one row per Customer Order Nbr) because containers are recorded
-    per master in the ledger -- every DC order under the same master shares the exact same
-    container/date list, so repeating it once per DC order would just be noise."""
+    """Parker's morning-check request, 2026-08-05: a flat list, one row per (Customer
+    Order Nbr, Container) pair, showing the date NRT confirmed that container -- or
+    "Waiting" if it hasn't yet. Pure local-file read (ledger + load_all_orders' cached
+    rows) for confirmed dates, plus one existing live-cache read (expected_containers_
+    for_master, backed by load_recent_receipts()' own cache) to know the FULL container
+    set a master's PO depends on -- without that, a container that hasn't confirmed yet
+    would just be silently absent instead of showing as "Waiting", which is the whole
+    point of this page. Same "expected containers" logic the completeness gate itself
+    already gates shipments on elsewhere in this file -- deliberately not a second,
+    different definition of "expected" from what the automation actually enforces."""
     def esc(v):
         s = "" if v is None else str(v)
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -2183,11 +2201,10 @@ def _container_status_html(days=None):
     ledger = load_json(LEDGER_PATH) or {}
     cutoff = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
     tokens = [tok for tok, e in ledger.items() if (e.get("last_updated") or "") >= cutoff]
-    tokens.sort(key=lambda t: ledger[t].get("last_updated", ""), reverse=True)
     header = ('<div class=card><h1 style="font-size:18px">Container status check</h1>'
-              '<p class=sub>Every container NRT has individually confirmed &#8220;Available for '
-              'Pickup&#8221; for, grouped by Master PO -- masters touched in the last N day(s). '
-              'Pure local-file read, no live Acumatica calls.</p>'
+              '<p class=sub>One row per Customer Order + container, showing the date NRT '
+              'confirmed &#8220;Available for Pickup&#8221; for it -- or Waiting if it hasn&#39;t yet. '
+              'Masters touched in the last N day(s). Pure local-file read, no live Acumatica calls.</p>'
               '<form method=get action=/container-status class=search-row>'
               f'<input type=number name=days min=1 max=60 value="{days}" style="width:80px"> day(s) '
               '<button class=fog>Show</button></form></div>')
@@ -2196,25 +2213,27 @@ def _container_status_html(days=None):
                          f'<h3>No masters touched in the last {days} day(s)</h3>'
                          '<p>Try a longer window.</p></div></div>')
     matched = find_any_sales_orders_batch(tokens)
-    cards = []
+    rows = []
     for tok in tokens:
         entry = ledger[tok]
         orders = matched.get(tok) or []
-        order_labels = sorted({o.get("cust_order") for o in orders if o.get("cust_order")})
-        order_display = ", ".join(esc(o) for o in order_labels) if order_labels else "(no Sales Order matched yet)"
-        status_label = {"waiting": "Waiting", "partial": "Partially shipped", "shipped": "Shipped"}.get(
-            entry.get("status"), entry.get("status") or "&mdash;")
-        pill_class = LOOKUP_STATUS_PILL.get(entry.get("status"), "pill")
-        cont_rows = "".join(f'<tr><td class=mc>{esc(c)}</td><td class=md>{esc(d)}</td></tr>'
-                            for c, d in sorted((entry.get("containers") or {}).items(), key=lambda kv: kv[1]))
-        cards.append(
-            f'<div class=master-card><div class=master-card-head><span class=m-id>{order_display}</span>'
-            f'<span class={pill_class}>{status_label}</span></div>'
-            f'<p class=sub style="margin:4px 0 8px">Master PO: <b>{esc(tok)}</b>'
-            f' &nbsp; <a href="/lookup?q={urllib.parse.quote(tok)}">full detail</a></p>'
-            f'<table class=mini-table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table>'
-            '</div>')
-    return header + '<div class=master-grid>%s</div>' % "".join(cards)
+        order_labels = sorted({o.get("cust_order") for o in orders if o.get("cust_order")}) or [f"{tok} (no Sales Order matched yet)"]
+        confirmed = entry.get("containers") or {}
+        all_containers = sorted(set(confirmed) | expected_containers_for_master(tok))
+        if not all_containers:
+            all_containers = ["(no container on file yet)"]
+        for order_label in order_labels:
+            for cont in all_containers:
+                date = confirmed.get(cont)
+                rows.append((order_label, cont, date))
+    rows.sort(key=lambda r: (r[0], r[1]))
+    row_html = "".join(
+        f'<tr><td>{esc(order_label)}</td><td class=t-container>{esc(cont)}</td>'
+        + (f'<td>{esc(date)}</td>' if date else '<td class=t-waiting>Waiting</td>')
+        + '</tr>'
+        for order_label, cont, date in rows)
+    return header + ('<div class=twrap><table><tr><th>Customer Order</th><th>Container</th>'
+                     f'<th>Pickup Date</th></tr>{row_html}</table></div>')
 
 # ---------------- process a handover PDF ----------------
 def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None):
@@ -3480,6 +3499,7 @@ tbody tr.row-moss::before{background:var(--moss)} tbody tr.row-rust::before{back
 tbody tr.row-neutral::before{background:var(--line-strong)} tbody tr.row-fog::before{background:var(--fog)}
 .t-time{font:400 12.5px var(--font-mono);color:var(--taupe);white-space:nowrap;font-variant-numeric:tabular-nums}
 .t-container{font:600 13px var(--font-mono);color:var(--stone);letter-spacing:.01em}
+.t-waiting{color:var(--fog);font-weight:600}
 .t-status{color:var(--stone)}
 .status-sub{display:block;color:var(--taupe);font-weight:400;font-size:12px;margin-top:2px}
 
