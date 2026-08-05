@@ -992,13 +992,20 @@ def load_all_orders(force=False):
     now = time.time()
     if not force and _ALL_ORDERS["rows"] is not None and now - _ALL_ORDERS["ts"] < ALL_ORDERS_TTL:
         return _ALL_ORDERS["rows"]
-    q = f"{ENTITY}/SalesOrder?$select=OrderType,OrderNbr,CustomerOrder,CustomerID,Status"
-    # FIXED 2026-08-05: confirmed via live diagnostic on /container-status -- this tenant's
-    # SalesOrder count exceeds 20,000 (max_pages=40 * page_size=500), so orders past that
-    # point were silently truncated, not missing. Raised well past the observed total, and
-    # (2026-08-05, cutting round-trips) using a larger page size than the 500 default -- if
-    # the tenant caps $top lower server-side, OData clamps it silently rather than erroring.
-    data, fetch_ok = _fetch_all_pages(q, page_size=2000, max_pages=75)
+    select = "$select=OrderType,OrderNbr,CustomerOrder,CustomerID,Status"
+    # Parker's ask, 2026-08-05: bound this to the last 6 months instead of the whole
+    # order history -- RequestDate is the field this tenant's own "Container SO Lookup" GI
+    # displays as "Requested On" (confirmed real data, not a guess at the API field name).
+    # FAILS OPEN, not closed, on this specific filter: if RequestDate turns out to be the
+    # wrong field (400 on page 0), fall back to the unfiltered fetch rather than silently
+    # returning nothing for the rest of this cache cycle -- that exact silent-empty failure
+    # is what caused today's "no Sales Order matched yet" incident in the first place.
+    cutoff = (datetime.date.today() - datetime.timedelta(days=182)).isoformat()
+    filtered_q = (f"{ENTITY}/SalesOrder?$filter=RequestDate ge datetimeoffset'{cutoff}T00:00:00Z'"
+                  f"&{select}")
+    data, fetch_ok = _fetch_all_pages(filtered_q, page_size=2000, max_pages=75)
+    if not fetch_ok and not data:
+        data, fetch_ok = _fetch_all_pages(f"{ENTITY}/SalesOrder?{select}", page_size=2000, max_pages=75)
     rows = []
     for so in data:
         g = lambda k: (so.get(k) or {}).get("value")
