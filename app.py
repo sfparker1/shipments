@@ -2276,7 +2276,7 @@ def _container_status_html(days=None):
     return header + ('<div class=twrap><table><tr><th>Customer Order</th><th>Master PO</th>'
                      f'<th>Container</th><th>Pickup Date</th></tr>{row_html}</table></div>')
 
-def backfill_pickup_dates(pairs_text):
+def backfill_pickup_dates(containers, dates):
     """Parker's request, 2026-08-05: a real window existed where he was removed from the
     NRT distribution list -- containers were genuinely picked up and NRT sent status
     emails during that window, but nobody (and so nothing) in this automation ever saw
@@ -2288,60 +2288,70 @@ def backfill_pickup_dates(pairs_text):
     ledger data correction. If a backfilled master is now complete, the existing
     /ledger/recheck job picks it up on its own schedule same as any other resolved gap.
 
-    pairs_text: one "CONTAINER: YYYY-MM-DD" (or CONTAINER, YYYY-MM-DD / CONTAINER YYYY-MM-DD)
-    per line. Returns a list of per-line result dicts for rendering."""
+    containers/dates: parallel lists (one row of the form = one position in each) --
+    blank rows (either side empty) are silently skipped, not errors, since the form always
+    submits a few trailing empty rows. Returns a list of per-row result dicts for rendering."""
     results = []
-    for line in (pairs_text or "").splitlines():
-        line = line.strip()
-        if not line:
+    for container, date in zip(containers, dates):
+        container, date = (container or "").strip().upper(), (date or "").strip()
+        if not container and not date:
             continue
-        parts = re.split(r"[:,\s]+", line, maxsplit=1)
-        if len(parts) != 2:
-            results.append({"line": line, "ok": False, "error": "couldn't parse -- expected CONTAINER: YYYY-MM-DD"})
+        if not container or not date:
+            results.append({"container": container, "date": date, "ok": False,
+                            "error": "both container and date are required"})
             continue
-        container, date = parts[0].strip().upper(), parts[1].strip()
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
-            results.append({"line": line, "container": container, "ok": False,
+            results.append({"container": container, "date": date, "ok": False,
                             "error": f"date '{date}' isn't YYYY-MM-DD"})
             continue
         scope, tokens = container_scope(container)
         if scope != "in_scope" or not tokens:
-            results.append({"line": line, "container": container, "ok": False,
+            results.append({"container": container, "date": date, "ok": False,
                             "error": f"container_scope() returned '{scope}' -- no master(s) to record against "
                                      "(check the container number, or whether its PO Receipt exists in Acumatica yet)"})
             continue
         for tok in tokens:
             ledger_record(tok, container, date)
-        results.append({"line": line, "container": container, "date": date, "ok": True, "masters": tokens})
+        results.append({"container": container, "date": date, "ok": True, "masters": tokens})
     return results
+
+BACKFILL_PICKUP_ROWS = 6  # blank starting rows shown; "+ Add another" grows the form with no server round-trip
 
 def _backfill_pickup_html(results=None):
     def esc(v):
         s = "" if v is None else str(v)
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    row_html = ('<div class=backfill-row><input type=text name=container placeholder="Container #" '
+                'style="text-transform:uppercase"><input type=date name=date></div>')
     form = ('<div class=card><h1 style="font-size:18px">Manually record a pickup date</h1>'
             '<p class=sub>For containers NRT genuinely confirmed but this automation never saw -- e.g. a '
             'window where the NRT distribution list didn&#39;t include this inbox. Writes directly to the '
             'same ledger a real "Available for Pickup" email would update -- does NOT create any shipment '
             'or call Acumatica; if this completes a master, the next /ledger/recheck picks it up '
-            'automatically. One per line: <code>CONTAINER: YYYY-MM-DD</code></p>'
+            'automatically.</p>'
             '<form method=post action=/backfill-pickup>'
-            '<textarea name=pairs rows=6 style="width:100%;font-family:var(--font-mono);font-size:13px" '
-            'placeholder="CAAU6583199: 2026-07-26\nMRKU5799017: 2026-07-27"></textarea><br><br>'
-            '<button class=fog>Record</button></form></div>')
+            f'<div id=backfill-rows>{row_html * BACKFILL_PICKUP_ROWS}</div>'
+            '<button type=button id=backfill-add style="margin:8px 0">+ Add another</button><br>'
+            '<button class=fog>Record</button></form></div>'
+            '<script>'
+            "document.getElementById('backfill-add').addEventListener('click', function(){"
+            "var d=document.createElement('div'); d.className='backfill-row';"
+            "d.innerHTML='<input type=text name=container placeholder=\"Container #\" "
+            "style=\"text-transform:uppercase\"><input type=date name=date>';"
+            "document.getElementById('backfill-rows').appendChild(d);"
+            "});"
+            '</script>')
     if not results:
         return form
     rows = "".join(
-        f'<tr><td>{esc(r["line"])}</td>'
-        + (f'<td class=t-container>{esc(r.get("container"))}</td><td>{esc(r.get("date"))}</td>'
-           f'<td>{esc(", ".join(r.get("masters") or []))}</td><td>&#10003; recorded</td>'
+        f'<tr><td class=t-container>{esc(r.get("container"))}</td><td>{esc(r.get("date"))}</td>'
+        + (f'<td>{esc(", ".join(r.get("masters") or []))}</td><td>&#10003; recorded</td>'
            if r["ok"] else
-           f'<td class=t-container>{esc(r.get("container"))}</td><td></td><td></td>'
-           f'<td style="color:var(--rust)">&#10007; {esc(r.get("error"))}</td>')
+           f'<td></td><td style="color:var(--rust)">&#10007; {esc(r.get("error"))}</td>')
         + '</tr>'
         for r in results)
     return form + ('<div class=card><h2>Results</h2><div class=twrap><table>'
-                   '<tr><th>Input</th><th>Container</th><th>Date</th><th>Master(s)</th><th>Outcome</th></tr>'
+                   '<tr><th>Container</th><th>Date</th><th>Master(s)</th><th>Outcome</th></tr>'
                    f'{rows}</table></div></div>')
 
 # ---------------- process a handover PDF ----------------
@@ -3609,6 +3619,8 @@ tbody tr.row-neutral::before{background:var(--line-strong)} tbody tr.row-fog::be
 .t-time{font:400 12.5px var(--font-mono);color:var(--taupe);white-space:nowrap;font-variant-numeric:tabular-nums}
 .t-container{font:600 13px var(--font-mono);color:var(--stone);letter-spacing:.01em}
 .t-waiting{color:var(--fog);font-weight:600}
+.backfill-row{display:flex;gap:10px;margin-bottom:8px;max-width:420px}
+.backfill-row input[type=text]{flex:1}
 .t-status{color:var(--stone)}
 .status-sub{display:block;color:var(--taupe);font-weight:400;font-size:12px;margin-top:2px}
 
@@ -4411,11 +4423,11 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, LOGIN)
             ln = int(self.headers.get("Content-Length", 0))
             data = urllib.parse.parse_qs(self.rfile.read(ln).decode())
-            pairs_text = data.get("pairs", [""])[0]
+            containers, dates = data.get("container", []), data.get("date", [])
             try:
-                results = backfill_pickup_dates(pairs_text)
+                results = backfill_pickup_dates(containers, dates)
             except Exception as e:
-                results = [{"line": pairs_text, "ok": False, "error": str(e)}]
+                results = [{"container": "", "date": "", "ok": False, "error": str(e)}]
             return self._send(200, page(_backfill_pickup_html(results), current="backfill-pickup"))
         if u.path == "/autoship":
             # Token-authenticated (not a browser session) -- called by the NRT Power
