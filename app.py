@@ -2164,6 +2164,58 @@ def _lookup_html(query=None):
                      f'<th>Master PO(s)</th><th>Shipment(s)</th></tr>{rows_html}</table></div>')
     return "".join(parts)
 
+def _container_status_html(days=None):
+    """Parker's morning-check request, 2026-08-05: for masters touched recently, show
+    Customer Order Nbr(s) + every container tied to it + the date NRT confirmed each one --
+    without clicking into /lookup one master at a time. Pure local-file read (ledger +
+    load_all_orders' cached rows) -- no live Acumatica calls, same standard as /lookup.
+
+    Grouped by MASTER (not one row per Customer Order Nbr) because containers are recorded
+    per master in the ledger -- every DC order under the same master shares the exact same
+    container/date list, so repeating it once per DC order would just be noise."""
+    def esc(v):
+        s = "" if v is None else str(v)
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    try:
+        days = max(1, min(60, int(days)))
+    except (TypeError, ValueError):
+        days = 2
+    ledger = load_json(LEDGER_PATH) or {}
+    cutoff = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+    tokens = [tok for tok, e in ledger.items() if (e.get("last_updated") or "") >= cutoff]
+    tokens.sort(key=lambda t: ledger[t].get("last_updated", ""), reverse=True)
+    header = ('<div class=card><h1 style="font-size:18px">Container status check</h1>'
+              '<p class=sub>Every container NRT has individually confirmed &#8220;Available for '
+              'Pickup&#8221; for, grouped by Master PO -- masters touched in the last N day(s). '
+              'Pure local-file read, no live Acumatica calls.</p>'
+              '<form method=get action=/container-status class=search-row>'
+              f'<input type=number name=days min=1 max=60 value="{days}" style="width:80px"> day(s) '
+              '<button class=fog>Show</button></form></div>')
+    if not tokens:
+        return header + ('<div class=card><div class=empty-state><span class=e-icon>&#128230;</span>'
+                         f'<h3>No masters touched in the last {days} day(s)</h3>'
+                         '<p>Try a longer window.</p></div></div>')
+    matched = find_any_sales_orders_batch(tokens)
+    cards = []
+    for tok in tokens:
+        entry = ledger[tok]
+        orders = matched.get(tok) or []
+        order_labels = sorted({o.get("cust_order") for o in orders if o.get("cust_order")})
+        order_display = ", ".join(esc(o) for o in order_labels) if order_labels else "(no Sales Order matched yet)"
+        status_label = {"waiting": "Waiting", "partial": "Partially shipped", "shipped": "Shipped"}.get(
+            entry.get("status"), entry.get("status") or "&mdash;")
+        pill_class = LOOKUP_STATUS_PILL.get(entry.get("status"), "pill")
+        cont_rows = "".join(f'<tr><td class=mc>{esc(c)}</td><td class=md>{esc(d)}</td></tr>'
+                            for c, d in sorted((entry.get("containers") or {}).items(), key=lambda kv: kv[1]))
+        cards.append(
+            f'<div class=master-card><div class=master-card-head><span class=m-id>{order_display}</span>'
+            f'<span class={pill_class}>{status_label}</span></div>'
+            f'<p class=sub style="margin:4px 0 8px">Master PO: <b>{esc(tok)}</b>'
+            f' &nbsp; <a href="/lookup?q={urllib.parse.quote(tok)}">full detail</a></p>'
+            f'<table class=mini-table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table>'
+            '</div>')
+    return header + '<div class=master-grid>%s</div>' % "".join(cards)
+
 # ---------------- process a handover PDF ----------------
 def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None):
     # Hard stop: creation requires a typed Shipment date. No more silent fallback
@@ -3518,6 +3570,7 @@ LOGIN = """<!doctype html><meta charset=utf-8><title>Sign in</title>%s<style>%s
 NAV_ITEMS = [
     ("dashboard", "/", "Dashboard"),
     ("lookup", "/lookup", "Look up"),
+    ("container-status", "/container-status", "Container check"),
     ("splits", "/splits", "Split orders"),
     ("manual", "/manual", "Manual upload"),
     ("guide", "/guide", "Guide"),
@@ -4088,6 +4141,15 @@ class H(BaseHTTPRequestHandler):
                 out = ('<div class=card><h1 style="font-size:16px">Lookup &mdash; error</h1>'
                        '<p class=sub style="color:var(--rust)">%s</p></div>' % str(e).replace("<", "&lt;"))
             return self._send(200, page(out, current="lookup"))
+        if u.path == "/container-status":
+            qs = urllib.parse.parse_qs(u.query)
+            days = qs.get("days", ["2"])[0]
+            try:
+                out = _container_status_html(days)
+            except Exception as e:
+                out = ('<div class=card><h1 style="font-size:16px">Container status &mdash; error</h1>'
+                       '<p class=sub style="color:var(--rust)">%s</p></div>' % str(e).replace("<", "&lt;"))
+            return self._send(200, page(out, current="container-status"))
         if u.path == "/history/export.csv":
             # Session-authed (browser download button), same as every other dashboard
             # page -- not token-gated like the automated endpoints, since this is a human
