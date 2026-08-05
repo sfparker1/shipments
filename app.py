@@ -990,7 +990,10 @@ def load_all_orders(force=False):
     if not force and _ALL_ORDERS["rows"] is not None and now - _ALL_ORDERS["ts"] < ALL_ORDERS_TTL:
         return _ALL_ORDERS["rows"]
     q = f"{ENTITY}/SalesOrder?$select=OrderType,OrderNbr,CustomerOrder,CustomerID,Status"
-    data, fetch_ok = _fetch_all_pages(q, page_size=500, max_pages=40)
+    # FIXED 2026-08-05: confirmed via live diagnostic on /container-status -- this tenant's
+    # SalesOrder count exceeds 20,000 (max_pages=40 * page_size=500), so orders past that
+    # point were silently truncated, not missing. Raised well past the observed total.
+    data, fetch_ok = _fetch_all_pages(q, page_size=500, max_pages=300)
     rows = []
     for so in data:
         g = lambda k: (so.get(k) or {}).get("value")
@@ -2226,23 +2229,10 @@ def _container_status_html(days=None):
         s = "" if v is None else str(v)
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     days = _container_status_days(days)
-    # TEMP DIAGNOSTIC, 2026-08-05: load_all_orders() returns 100+ rows (real data), but
-    # ZERO matched any of several unrelated masters -- including 041016/041017, which
-    # definitely have a Sales Order (they were force-shipped earlier). That rules out "no
-    # data" and points at the matching logic or the actual CustomerOrder format on this
-    # data. Showing real sample values instead of guessing again -- remove once resolved.
-    all_orders_sample = load_all_orders()
-    probe_tokens = ["041016", "041017"]
-    hits = [o for o in all_orders_sample if any(t in (o.get("cust_order") or "") for t in probe_tokens)]
-    sample_cust_orders = [o.get("cust_order") for o in all_orders_sample[:15]]
-    diag_note = ('<p class=sub style="color:var(--rust)">Diagnostic: load_all_orders() total='
-                 f'{len(all_orders_sample)}. Orders containing 041016/041017 anywhere in cust_order: '
-                 f'{esc(str(hits[:5]))}. Sample of first 15 cust_order values: {esc(str(sample_cust_orders))}</p>')
     header = ('<div class=card><h1 style="font-size:18px">Container status check</h1>'
               '<p class=sub>One row per Customer Order + container, showing the date NRT '
               'confirmed &#8220;Available for Pickup&#8221; for it -- or Waiting if it hasn&#39;t yet. '
               'Masters touched in the last N day(s). Pure local-file read, no live Acumatica calls.</p>'
-              f'{diag_note}'
               '<form method=get action=/container-status class=search-row>'
               f'<input type=number name=days min=1 max=60 value="{days}" style="width:80px"> day(s) '
               '<button class=fog>Show</button>'
