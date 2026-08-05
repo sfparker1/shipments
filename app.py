@@ -1374,97 +1374,6 @@ def notify_shipment_created(event):
     except Exception as e:
         print(f"[notify_shipment_created] webhook call failed (non-fatal): {e}")
 
-# ---------------- shipment-creation audit certificate (file attachment) ----------------
-# Confirmed live-proven pattern, ported from the packing-list-acumatica sibling app (same
-# Acumatica tenant): PUT {ENTITY}/{Entity}/{key}/files/{filename} with the raw file bytes,
-# Content-Type: application/octet-stream. That app keys PurchaseReceipt as
-# "PurchaseReceipt/Receipt/{receiptNbr}/files/..." (Receipt is a fixed Type discriminator
-# PurchaseReceipt needs); Shipment doesn't need one -- this app already keys Shipment by
-# number alone everywhere else (_latest_shipment_for_order, set_shipment_date_and_container),
-# so the analogous call is Shipment/{shipmentNbr}/files/{filename}.
-def attach_file(entity_path, filename, content):
-    """Attach a file to an Acumatica record via the contract API's files endpoint.
-    entity_path is the entity + key, e.g. "Shipment/018808" -- caller-supplied so this stays
-    reusable beyond just Shipment if ever needed. Returns (ok, detail)."""
-    tk = access_token()
-    if not tk:
-        return False, "not connected"
-    # Same base_url + ENTITY prefix convention as api() (ENTITY already = "/entity/Default/{version}").
-    url = CFG["base_url"] + f"{ENTITY}/{entity_path}/files/{urllib.parse.quote(filename)}"
-    req = urllib.request.Request(url, data=content, method="PUT",
-        headers={"Authorization": "Bearer " + tk,
-                 "Content-Type": "application/octet-stream", "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return (resp.status in (200, 204)), "attached"
-    except urllib.error.HTTPError as e:
-        return False, f"attach HTTP {e.code}"
-    except Exception as e:
-        return False, str(e)[:80]
-
-def _pdf_cert(title, lines):
-    """Minimal dependency-free single-page PDF (Courier, monospace for alignment). Direct
-    port of the same technique already proven in the packing-list-acumatica sibling app's
-    PO Receipt reconciliation certificate -- no new dependency, stdlib only."""
-    def esc(s):
-        return str(s).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-    content = "BT\n/F2 15 Tf 1 0 0 1 54 760 Tm (%s) Tj\n" % esc(title)
-    y = 730
-    for (t, size, bold) in lines:
-        content += "/%s %d Tf 1 0 0 1 54 %d Tm (%s) Tj\n" % ("F2" if bold else "F1", size, y, esc(t))
-        y -= int(size * 1.7)
-    content += "ET"
-    cb = content.encode("latin-1", "replace")
-    objs = [
-        b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>",
-        b"<< /Length %d >>\nstream\n" % len(cb) + cb + b"\nendstream",
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>",
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier-Bold >>",
-    ]
-    out = b"%PDF-1.4\n"
-    offsets = []
-    for i, o in enumerate(objs, 1):
-        offsets.append(len(out))
-        out += ("%d 0 obj\n" % i).encode() + o + b"\nendobj\n"
-    xref = len(out)
-    out += ("xref\n0 %d\n" % (len(objs) + 1)).encode() + b"0000000000 65535 f \n"
-    for off in offsets:
-        out += ("%010d 00000 n \n" % off).encode()
-    out += ("trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF"
-            % (len(objs) + 1, xref)).encode()
-    return out
-
-def attach_shipment_certificate(shipment_nbr, po, order, customer, container, ship_date,
-                                 email_received_at, source, po_status=None):
-    """Best-effort, fire-and-forget (same standard as notify_shipment_created): attach a
-    one-page 'Shipment Creation Certificate' PDF directly onto the Shipment record, so an
-    auditor opening the Shipment in Acumatica sees the justification right there -- no need
-    to cross-reference this app's separate logs. A failure here must never affect the real
-    shipment-creation result already in hand."""
-    if not shipment_nbr:
-        return
-    try:
-        lines = [
-            (f"Shipment: {shipment_nbr}     Master PO: {po or '-'}", 11, True),
-            (f"Order: {order or '-'}     Customer: {customer or '-'}", 10, False),
-            (f"Container: {container or '-'}", 10, False),
-            (f"Ship date: {ship_date or '-'}", 10, False),
-            (f"NRT status-email received: {email_received_at or '(not recorded)'}", 10, False),
-            (f"Trigger source: {source or 'unknown'}", 10, False),
-        ]
-        if po_status:
-            lines.append((f"Purchase Order status at creation: {po_status}", 10, False))
-        lines.append(("", 6, False))
-        lines.append((f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}", 9, False))
-        pdf = _pdf_cert("Shipment Creation Certificate", lines)
-        ok, detail = attach_file(f"Shipment/{shipment_nbr}", f"Creation-Certificate-{shipment_nbr}.pdf", pdf)
-        if not ok:
-            print(f"[attach_shipment_certificate] failed for {shipment_nbr} (non-fatal): {detail}")
-    except Exception as e:
-        print(f"[attach_shipment_certificate] failed for {shipment_nbr} (non-fatal): {e}")
-
 def history(limit=200):
     """Every non-dry-run process runs through here permanently (ship_runs.jsonl
     on the persistent disk) -- nothing is ever deleted from the file itself.
@@ -2331,10 +2240,6 @@ def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None
                 row["result"] = res
                 if res.get("created"):
                     created += 1
-                    attach_shipment_certificate(
-                        res.get("shipment_nbr"), po, f"{m['order_type']} {m['order_nbr']}".strip(),
-                        m.get("customer"), container_ref, res.get("ship_date") or ship_date,
-                        None, "manual-pdf-upload")
                 log_orders.append({"po": po, "order": f"{m['order_type']} {m['order_nbr']}".strip(),
                                     "customer": m.get("customer"),
                                     "shipment_nbr": res.get("shipment_nbr"), "created": res.get("created"),
@@ -2768,12 +2673,6 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                 row["result"] = res
                 if res.get("created"):
                     created += 1
-                    po_status = next((d.get("po_status") for d in completeness_detail
-                                       if d.get("master") == po), None)
-                    attach_shipment_certificate(
-                        res.get("shipment_nbr"), po, f"{m['order_type']} {m['order_nbr']}".strip(),
-                        m.get("customer"), container, res.get("ship_date") or effective_date,
-                        email_received_at, source, po_status)
                 else:
                     po_ok = False
                 log_orders.append({"po": po, "order": f"{m['order_type']} {m['order_nbr']}".strip(),
