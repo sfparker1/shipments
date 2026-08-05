@@ -311,7 +311,14 @@ def run_tool(name, args, item, decision):
         # notification), never used for any gating/date-math decision.
         body = {"container": args.get("container"), "ship_date": args.get("ship_date"),
                 "source": "nrt-agent", "email_received_at": item.get("received_date")}
-        st, data = _http("POST", "/autoship", AUTOSHIP_TOKEN, body=body)
+        # Longer timeout than _http()'s 120s default: a container resolving to several
+        # masters at once (each with several DC orders, each a create_shipment poll of up
+        # to ~15s) can legitimately run past 120s server-side even after the 2026-08-05 fix
+        # that removed the worst redundant-API-call source. This is a Cron Job, not a
+        # user-facing request -- nothing is waiting on this synchronously, so there's no
+        # cost to giving it more headroom rather than giving up and flagging a false
+        # "needs review" while Acumatica is still correctly finishing the work.
+        st, data = _http("POST", "/autoship", AUTOSHIP_TOKEN, body=body, timeout=240)
         decision["tool_result"] = {"status": st, "data": data}
         return (data if st == 200 else {"error": f"autoship HTTP {st}", "detail": data}), True
 

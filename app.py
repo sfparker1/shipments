@@ -2482,6 +2482,22 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
         pickup_date = ship_date or datetime.date.today().isoformat()
         original_resolved = resolved
         anomalous_tokens = set()
+        # Lazy + memoized: resolve_pos_by_master() does a live $expand=Details fetch PER
+        # RECEIPT tied to this container. FIXED 2026-08-05, real incident: calling it fresh
+        # inside the loop below (once per already-shipped token) refetched the SAME
+        # receipts once per token instead of once total -- for a container resolving to
+        # several already-shipped siblings at once (e.g. CAAU6433199 -> 6 masters), that's
+        # 6x redundant live API round-trips just for this one check, on top of everything
+        # else /autoship already does. That extra latency is what was pushing total request
+        # time past the mailbox-agent's 120s client timeout, producing the "autoship HTTP 0
+        # / read operation timed out" errors -- Acumatica-side, the shipment usually still
+        # completed fine (see the "Resolved on retry" rows), the CLIENT just gave up first.
+        _po_refs_by_master = None
+        def _po_ref_for(tok):
+            nonlocal _po_refs_by_master
+            if _po_refs_by_master is None:
+                _po_refs_by_master = resolve_pos_by_master(container)
+            return _po_refs_by_master.get(tok)
         for token in original_resolved:
             entry = ledger_entry(token)
             if entry and entry.get("status") == "shipped":
@@ -2531,7 +2547,7 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                     # for exactly the case it needs to catch (first tried and reverted this
                     # same day). po_completeness() fails closed on any lookup problem, same
                     # guarantee this already relies on elsewhere in this function.
-                    po_ref = resolve_pos_by_master(container).get(token)
+                    po_ref = _po_ref_for(token)
                     po_fully_received = bool(po_ref) and po_completeness(*po_ref)[0]
                     if po_fully_received:
                         anomalous_tokens.add(token)
