@@ -2180,60 +2180,75 @@ def _lookup_html(query=None):
                      f'<th>Master PO(s)</th><th>Shipment(s)</th></tr>{rows_html}</table></div>')
     return "".join(parts)
 
-def _container_status_html(days=None):
-    """Parker's morning-check request, 2026-08-05: a flat list, one row per (Customer
-    Order Nbr, Container) pair, showing the date NRT confirmed that container -- or
-    "Waiting" if it hasn't yet. Pure local-file read (ledger + load_all_orders' cached
-    rows) for confirmed dates, plus one existing live-cache read (expected_containers_
-    for_master, backed by load_recent_receipts()' own cache) to know the FULL container
-    set a master's PO depends on -- without that, a container that hasn't confirmed yet
-    would just be silently absent instead of showing as "Waiting", which is the whole
-    point of this page. Same "expected containers" logic the completeness gate itself
+def _container_status_days(days):
+    try:
+        return max(1, min(60, int(days)))
+    except (TypeError, ValueError):
+        return 2
+
+def _container_status_rows(days):
+    """Shared by the HTML page and the CSV export: one row per (Customer Order Nbr,
+    Container) pair for masters touched in the last `days` day(s), each with the date NRT
+    confirmed that container -- or None if it hasn't yet. Master PO is its OWN field
+    (never folded into customer_order) -- real feedback, 2026-08-05: showing the bare
+    master token inside the Customer Order column when no Sales Order has matched yet
+    read as a garbled/wrong customer order number, not as "this master has no SO yet".
+
+    Pure local-file read (ledger + load_all_orders' cached rows) for confirmed dates, plus
+    one existing cache read (expected_containers_for_master, backed by load_recent_
+    receipts()' own cache -- no new live API calls) to know the FULL container set a
+    master's PO depends on. Same "expected containers" logic the completeness gate itself
     already gates shipments on elsewhere in this file -- deliberately not a second,
     different definition of "expected" from what the automation actually enforces."""
-    def esc(v):
-        s = "" if v is None else str(v)
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    try:
-        days = max(1, min(60, int(days)))
-    except (TypeError, ValueError):
-        days = 2
     ledger = load_json(LEDGER_PATH) or {}
     cutoff = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
     tokens = [tok for tok, e in ledger.items() if (e.get("last_updated") or "") >= cutoff]
+    matched = find_any_sales_orders_batch(tokens) if tokens else {}
+    rows = []
+    for tok in tokens:
+        entry = ledger[tok]
+        orders = matched.get(tok) or []
+        order_labels = sorted({o.get("cust_order") for o in orders if o.get("cust_order")}) or [None]
+        confirmed = entry.get("containers") or {}
+        all_containers = sorted(set(confirmed) | expected_containers_for_master(tok)) or [None]
+        for order_label in order_labels:
+            for cont in all_containers:
+                rows.append({"customer_order": order_label, "master_po": tok,
+                             "container": cont, "pickup_date": confirmed.get(cont) if cont else None})
+    rows.sort(key=lambda r: (r["customer_order"] or "", r["master_po"], r["container"] or ""))
+    return rows
+
+def _container_status_html(days=None):
+    """Parker's morning-check request, 2026-08-05: a flat list, one row per (Customer
+    Order Nbr, Container) pair, showing the date NRT confirmed that container -- or
+    "Waiting" if it hasn't yet."""
+    def esc(v):
+        s = "" if v is None else str(v)
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    days = _container_status_days(days)
     header = ('<div class=card><h1 style="font-size:18px">Container status check</h1>'
               '<p class=sub>One row per Customer Order + container, showing the date NRT '
               'confirmed &#8220;Available for Pickup&#8221; for it -- or Waiting if it hasn&#39;t yet. '
               'Masters touched in the last N day(s). Pure local-file read, no live Acumatica calls.</p>'
               '<form method=get action=/container-status class=search-row>'
               f'<input type=number name=days min=1 max=60 value="{days}" style="width:80px"> day(s) '
-              '<button class=fog>Show</button></form></div>')
-    if not tokens:
+              '<button class=fog>Show</button>'
+              f'<a href="/container-status/export.csv?days={days}" style="margin-left:12px;font-size:13px">'
+              '&#8659; Export CSV</a></form></div>')
+    rows = _container_status_rows(days)
+    if not rows:
         return header + ('<div class=card><div class=empty-state><span class=e-icon>&#128230;</span>'
                          f'<h3>No masters touched in the last {days} day(s)</h3>'
                          '<p>Try a longer window.</p></div></div>')
-    matched = find_any_sales_orders_batch(tokens)
-    rows = []
-    for tok in tokens:
-        entry = ledger[tok]
-        orders = matched.get(tok) or []
-        order_labels = sorted({o.get("cust_order") for o in orders if o.get("cust_order")}) or [f"{tok} (no Sales Order matched yet)"]
-        confirmed = entry.get("containers") or {}
-        all_containers = sorted(set(confirmed) | expected_containers_for_master(tok))
-        if not all_containers:
-            all_containers = ["(no container on file yet)"]
-        for order_label in order_labels:
-            for cont in all_containers:
-                date = confirmed.get(cont)
-                rows.append((order_label, cont, date))
-    rows.sort(key=lambda r: (r[0], r[1]))
     row_html = "".join(
-        f'<tr><td>{esc(order_label)}</td><td class=t-container>{esc(cont)}</td>'
-        + (f'<td>{esc(date)}</td>' if date else '<td class=t-waiting>Waiting</td>')
+        f'<tr><td>{esc(r["customer_order"]) if r["customer_order"] else "&mdash; (no Sales Order matched yet)"}</td>'
+        f'<td>{esc(r["master_po"])}</td>'
+        f'<td class=t-container>{esc(r["container"]) if r["container"] else "&mdash;"}</td>'
+        + (f'<td>{esc(r["pickup_date"])}</td>' if r["pickup_date"] else '<td class=t-waiting>Waiting</td>')
         + '</tr>'
-        for order_label, cont, date in rows)
-    return header + ('<div class=twrap><table><tr><th>Customer Order</th><th>Container</th>'
-                     f'<th>Pickup Date</th></tr>{row_html}</table></div>')
+        for r in rows)
+    return header + ('<div class=twrap><table><tr><th>Customer Order</th><th>Master PO</th>'
+                     f'<th>Container</th><th>Pickup Date</th></tr>{row_html}</table></div>')
 
 # ---------------- process a handover PDF ----------------
 def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None):
@@ -4170,6 +4185,24 @@ class H(BaseHTTPRequestHandler):
                 out = ('<div class=card><h1 style="font-size:16px">Container status &mdash; error</h1>'
                        '<p class=sub style="color:var(--rust)">%s</p></div>' % str(e).replace("<", "&lt;"))
             return self._send(200, page(out, current="container-status"))
+        if u.path == "/container-status/export.csv":
+            qs = urllib.parse.parse_qs(u.query)
+            days = _container_status_days(qs.get("days", ["2"])[0])
+            rows = _container_status_rows(days)
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=["customer_order", "master_po", "container", "pickup_date"])
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(r)
+            data = buf.getvalue().encode("utf-8-sig")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition",
+                              'attachment; filename="container_status_%s.csv"' % time.strftime("%Y%m%d"))
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if u.path == "/history/export.csv":
             # Session-authed (browser download button), same as every other dashboard
             # page -- not token-gated like the automated endpoints, since this is a human
