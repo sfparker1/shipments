@@ -896,7 +896,10 @@ def load_open_orders(force=False):
         return _OPEN_ORDERS["rows"]
     q = (f"{ENTITY}/SalesOrder?$filter=Status eq 'Open'"
          f"&$select=OrderType,OrderNbr,CustomerOrder,CustomerID,Status")
-    data, fetch_ok = _fetch_all_pages(q, page_size=500, max_pages=20)
+    # Larger page size than the 500 default (2026-08-05, cutting round-trips): if the
+    # tenant caps $top lower server-side, OData clamps it silently rather than erroring, so
+    # this is a safe thing to try without verifying a hard limit first.
+    data, fetch_ok = _fetch_all_pages(q, page_size=2000, max_pages=20)
     rows = []
     for so in data:
         g = lambda k: (so.get(k) or {}).get("value")
@@ -992,8 +995,10 @@ def load_all_orders(force=False):
     q = f"{ENTITY}/SalesOrder?$select=OrderType,OrderNbr,CustomerOrder,CustomerID,Status"
     # FIXED 2026-08-05: confirmed via live diagnostic on /container-status -- this tenant's
     # SalesOrder count exceeds 20,000 (max_pages=40 * page_size=500), so orders past that
-    # point were silently truncated, not missing. Raised well past the observed total.
-    data, fetch_ok = _fetch_all_pages(q, page_size=500, max_pages=300)
+    # point were silently truncated, not missing. Raised well past the observed total, and
+    # (2026-08-05, cutting round-trips) using a larger page size than the 500 default -- if
+    # the tenant caps $top lower server-side, OData clamps it silently rather than erroring.
+    data, fetch_ok = _fetch_all_pages(q, page_size=2000, max_pages=75)
     rows = []
     for so in data:
         g = lambda k: (so.get(k) or {}).get("value")
