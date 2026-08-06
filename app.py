@@ -3634,8 +3634,9 @@ tbody tr.row-neutral::before{background:var(--line-strong)} tbody tr.row-fog::be
 .t-time{font:400 12.5px var(--font-mono);color:var(--taupe);white-space:nowrap;font-variant-numeric:tabular-nums}
 .t-container{font:600 13px var(--font-mono);color:var(--stone);letter-spacing:.01em}
 .t-waiting{color:var(--fog);font-weight:600}
-.backfill-row{display:flex;gap:10px;margin-bottom:8px;max-width:420px}
-.backfill-row input[type=text]{flex:1}
+.backfill-row{display:flex;gap:10px;margin-bottom:8px;max-width:480px}
+.backfill-row input[type=text]{flex:1 1 auto;min-width:0;width:auto}
+.backfill-row input[type=date]{flex:0 0 170px;width:auto}
 .t-status{color:var(--stone)}
 .status-sub{display:block;color:var(--taupe);font-weight:400;font-size:12px;margin-top:2px}
 
