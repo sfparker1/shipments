@@ -1607,14 +1607,16 @@ def agent_log(entry):
         pass
     return row
 
-def agent_log_read(limit=200, exceptions_only=False, pickup_only=False, message_id=None):
+def agent_log_read(limit=200, exceptions_only=False, pickup_only=False, created_only=False, message_id=None):
     """Newest-first. exceptions_only filters to flagged rows for quick review; pickup_only
     (the dashboard's default view, per Parker's request 2026-07-27) drops the routine NRT
     noise -- Scheduled/Picked up/Empty-returned status emails, non-NRT mail, skipped/
     ambiguous ones -- keeping only genuine "Available for pickup" triggers PLUS anything
     flagged for review (an exception should never be hidden just because the email that
-    caused it wasn't itself a pickup trigger). message_id returns every row for one source
-    email (the idempotency lookup), bypassing both filters."""
+    caused it wasn't itself a pickup trigger). created_only (Parker's request, 2026-08-05)
+    keeps ONLY rows that actually created a real shipment -- no No-action-needed, no
+    Needs-review, nothing else. message_id returns every row for one source email (the
+    idempotency lookup), bypassing every other filter."""
     out = []
     try:
         with open(AGENTLOG_PATH) as f:
@@ -1626,6 +1628,8 @@ def agent_log_read(limit=200, exceptions_only=False, pickup_only=False, message_
     out = list(reversed(out))
     if exceptions_only:
         out = [r for r in out if r.get("exception_flag")]
+    elif created_only:
+        out = [r for r in out if _row_created_shipment(r)]
     elif pickup_only:
         out = [r for r in out if r.get("classification") in
                                  ("nrt_available_for_pickup", "nrt_late_pickup_confirmation")
@@ -1872,6 +1876,16 @@ def _row_severity(r):
             return "moss"
     return "neutral"
 
+def _row_created_shipment(r):
+    """True only for a decision row that actually resulted in a real, live shipment
+    creation -- exactly the "Shipment created" branch of _status_pill(), factored out so
+    the /agent/log created-only filter (Parker's request, 2026-08-05: a view with just
+    created shipments, no No-action-needed/Needs-review noise) can't drift out of sync
+    with what the pill itself shows."""
+    if r.get("exception_flag") or r.get("mode") != "live" or r.get("action_taken") != "create_shipment":
+        return False
+    return bool(((r.get("tool_result") or {}).get("data") or {}).get("created"))
+
 def _status_pill(r):
     """One colored badge that says, at a glance, what happened -- replaces the separate
     raw Action/Mode text columns. Derived from fields already on every decision row:
@@ -1884,11 +1898,11 @@ def _status_pill(r):
     if r.get("action_taken") == "create_shipment":
         if r.get("mode") != "live":
             return '<span class="pill fog">&#9678; Would create &middot; shadow</span>'
+        if _row_created_shipment(r):
+            return '<span class="pill moss">&#10003; Shipment created</span>'
         data = (r.get("tool_result") or {}).get("data") or {}
         if data.get("waiting_on_containers"):
             return '<span class="pill fog">&#8987; Waiting on containers</span>'
-        if data.get("created"):
-            return '<span class="pill moss">&#10003; Shipment created</span>'
     return '<span class=pill>No action needed</span>'
 
 def _fmt_kv(d, esc):
@@ -2037,11 +2051,12 @@ def _agent_log_html(rows, mode="all"):
                 f"<td>{note}</td><td>{detail}</td></tr>")
     body_rows = "".join(_row(r) for r in rows)
     title_suffix = {"pickup": " &mdash; available for pickup", "exceptions": " &mdash; exceptions only",
-                    "all": " &mdash; all classifications"}.get(mode, "")
+                    "all": " &mdash; all classifications", "created": " &mdash; created shipments only"}.get(mode, "")
     title = "Agent decisions" + title_suffix
     toggle = ('<a class=pill href="/agent/log">available for pickup</a> '
               '<a class=pill href="/agent/log?all=1">all classifications</a> '
-              '<a class=pill href="/agent/log?exceptions_only=1">exceptions only</a>')
+              '<a class=pill href="/agent/log?exceptions_only=1">exceptions only</a> '
+              '<a class=pill href="/agent/log?created_only=1">created shipments only</a>')
     return ('<div class=card><h1 style="font-size:16px">%s</h1>'
             '<p class=sub>One row per decision the mailbox-agent made (not per LLM turn). '
             'Flagged rows are highlighted. Times are Pacific. %s</p>'
@@ -4164,12 +4179,13 @@ class H(BaseHTTPRequestHandler):
             msg_id = qs.get("message_id", [""])[0].strip() or None
             exc_only = qs.get("exceptions_only", ["0"])[0] == "1"
             show_all = qs.get("all", ["0"])[0] == "1"
-            mode = "exceptions" if exc_only else ("all" if show_all else "pickup")
+            created_only = qs.get("created_only", ["0"])[0] == "1"
+            mode = "created" if created_only else ("exceptions" if exc_only else ("all" if show_all else "pickup"))
             try:
                 limit = int(qs.get("limit", ["200"])[0])
             except Exception:
                 limit = 200
-            rows = agent_log_read(limit=limit, exceptions_only=exc_only,
+            rows = agent_log_read(limit=limit, exceptions_only=exc_only, created_only=created_only,
                                    pickup_only=(mode == "pickup"), message_id=msg_id)
             if qs.get("view", [""])[0] == "html" or self._authed():
                 return self._send(200, page(_agent_log_html(rows, mode), favicon=AGENT_FAVICON))
