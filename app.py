@@ -3847,10 +3847,8 @@ def _dashboard_recent_html(rows):
     return ('<div class=section-head><h2>Recent pickup decisions (last %d)</h2></div>'
             '<p class=section-sub>Times are Pacific. Available-for-pickup triggers and exceptions only &mdash; '
             '<a href="/agent/log?all=1&view=html">see every email, all classifications</a>. %s</p>'
-            '<div class=twrap><table style="table-layout:fixed"><tr>'
-            '<th style="width:14%%">Received</th><th style="width:16%%">Container</th>'
-            '<th style="width:18%%">Email status</th><th style="width:16%%">Result</th>'
-            '<th style="width:36%%">Exception</th></tr>%s</table></div>'
+            '<div class=twrap><table><tr><th>Received</th><th>Container</th><th>Email status</th><th>Result</th>'
+            '<th>Exception</th></tr>%s</table></div>'
             % (len(rows), CLASSIFICATION_LEGEND, body or
                '<tr><td colspan=5 class=sub>No decisions logged yet.</td></tr>'))
 
