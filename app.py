@@ -194,11 +194,19 @@ def watchlist_check_sla():
 # containers arrive via separate receipts (see master_multi_receipt_flags' docstring) can
 # still be shipped once -- at the LATEST recorded pickup date -- rather than refused forever.
 # Same JSON-on-persistent-disk pattern as the Maersk watch-list above.
-def ledger_record(master_token, container, pickup_date):
+def ledger_record(master_token, container, pickup_date, email_received_at=None):
     """Idempotent upsert -- a duplicate/resent NRT email for a container already in the
     ledger just re-writes the same date, harmless. Always called BEFORE any shipment
     decision, so the ledger reflects reality even if the completeness check or the
-    shipment-creation loop below it fails partway through."""
+    shipment-creation loop below it fails partway through.
+
+    email_received_at (optional): the triggering NRT email's own received timestamp,
+    stored alongside pickup_date -- Parker's request, 2026-08-05, so a human can see the
+    ACTUAL email that proved a container was confirmed, not just the date this automation
+    recorded, without having to separately cross-check Outlook for every shipment. Kept as
+    a parallel dict rather than replacing containers[container]'s existing bare-date value
+    -- that shape is read by /lookup, /container-status, and the anomaly ledger_entry
+    note, all of which expect a plain date string."""
     if not master_token or not container:
         return None
     with _JSON_LOCK:
@@ -206,6 +214,8 @@ def ledger_record(master_token, container, pickup_date):
         entry = data.setdefault(master_token, {"containers": {}, "status": "waiting",
                                                 "first_seen": pickup_date, "last_updated": pickup_date})
         entry["containers"][container] = pickup_date
+        if email_received_at:
+            entry.setdefault("email_received", {})[container] = email_received_at
         entry["last_updated"] = pickup_date
         save_json(LEDGER_PATH, data)
         return entry
@@ -2252,10 +2262,17 @@ def _container_status_rows(days):
         all_containers = sorted(confirmed) if entry.get("status") == "shipped" else \
             sorted(set(confirmed) | expected_containers_for_master(tok))
         all_containers = all_containers or [None]
+        email_received = entry.get("email_received") or {}
         for order_label in order_labels:
             for cont in all_containers:
+                # Prefer the triggering email's own received timestamp (Parker's request,
+                # 2026-08-05 -- proof of WHICH email confirmed this, not just a bare date
+                # this automation recorded) -- fall back to pickup_date for ledger entries
+                # written before this field existed, or for manual /backfill-pickup entries
+                # where there's genuinely no email at all.
+                received = (email_received.get(cont) or confirmed.get(cont)) if cont else None
                 rows.append({"customer_order": order_label, "master_po": tok,
-                             "container": cont, "pickup_date": confirmed.get(cont) if cont else None})
+                             "container": cont, "email_received": received})
     rows.sort(key=lambda r: (r["customer_order"] or "", r["master_po"], r["container"] or ""))
     return rows
 
@@ -2268,9 +2285,10 @@ def _container_status_html(days=None):
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     days = _container_status_days(days)
     header = ('<div class=card><h1 style="font-size:18px">Container status check</h1>'
-              '<p class=sub>One row per Customer Order + container, showing the date NRT '
-              'confirmed &#8220;Available for Pickup&#8221; for it -- or Waiting if it hasn&#39;t yet. '
-              'Masters touched in the last N day(s). Pure local-file read, no live Acumatica calls.</p>'
+              '<p class=sub>One row per Customer Order + container, showing when the &#8220;Available for '
+              'Pickup&#8221; email itself was received (not just the date this automation recorded) -- or '
+              'Waiting if none has arrived yet. Masters touched in the last N day(s). Pure local-file read, '
+              'no live Acumatica calls.</p>'
               '<form method=get action=/container-status class=search-row>'
               f'<input type=number name=days min=1 max=60 value="{days}" style="width:80px"> day(s) '
               '<button class=fog>Show</button>'
@@ -2285,11 +2303,11 @@ def _container_status_html(days=None):
         f'<tr><td>{esc(r["customer_order"]) if r["customer_order"] else "&mdash; (no Sales Order matched yet)"}</td>'
         f'<td>{esc(r["master_po"])}</td>'
         f'<td class=t-container>{esc(r["container"]) if r["container"] else "&mdash;"}</td>'
-        + (f'<td>{esc(r["pickup_date"])}</td>' if r["pickup_date"] else '<td class=t-waiting>Waiting</td>')
+        + (f'<td>{esc(r["email_received"])}</td>' if r["email_received"] else '<td class=t-waiting>Waiting</td>')
         + '</tr>'
         for r in rows)
     return header + ('<div class=twrap><table><tr><th>Customer Order</th><th>Master PO</th>'
-                     f'<th>Container</th><th>Pickup Date</th></tr>{row_html}</table></div>')
+                     f'<th>Container</th><th>Email Received</th></tr>{row_html}</table></div>')
 
 def backfill_pickup_dates(containers, dates):
     """Parker's request, 2026-08-05: a real window existed where he was removed from the
@@ -2698,10 +2716,10 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
                                        note="Detected already fulfilled in Acumatica (status: "
                                             f"{fulfilled[0]['status']}) -- likely shipped "
                                             "manually, outside this automation.")
-                    ledger_record(token, container, pickup_date)
+                    ledger_record(token, container, pickup_date, email_received_at)
                     anomalous_tokens.add(token)
                     continue
-            ledger_record(token, container, pickup_date)
+            ledger_record(token, container, pickup_date, email_received_at)
         resolved = [t for t in original_resolved if t not in anomalous_tokens]
         if not resolved:
             if anomalies:
@@ -4316,7 +4334,7 @@ class H(BaseHTTPRequestHandler):
             days = _container_status_days(qs.get("days", ["2"])[0])
             rows = _container_status_rows(days)
             buf = io.StringIO()
-            writer = csv.DictWriter(buf, fieldnames=["customer_order", "master_po", "container", "pickup_date"])
+            writer = csv.DictWriter(buf, fieldnames=["customer_order", "master_po", "container", "email_received"])
             writer.writeheader()
             for r in rows:
                 writer.writerow(r)
