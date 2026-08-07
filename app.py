@@ -1566,10 +1566,19 @@ def agent_log_read(limit=200, exceptions_only=False, pickup_only=False, created_
     noise -- Scheduled/Picked up/Empty-returned status emails, non-NRT mail, skipped/
     ambiguous ones -- keeping only genuine "Available for pickup" triggers PLUS anything
     flagged for review (an exception should never be hidden just because the email that
-    caused it wasn't itself a pickup trigger). created_only (Parker's request, 2026-08-05)
-    keeps ONLY rows that actually created a real shipment -- no No-action-needed, no
-    Needs-review, nothing else. message_id returns every row for one source email (the
-    idempotency lookup), bypassing every other filter."""
+    caused it wasn't itself a pickup trigger).
+
+    nrt_late_pickup_confirmation (FIXED 2026-08-06, real feedback: a batch of these showing
+    "No action needed" read as pure noise on the dashboard) is a DIFFERENT case from the
+    other classifications this filters out -- it's the missed-trigger-backfill path, which
+    sometimes creates a genuinely new shipment for a container whose first-stage "Available
+    for Pickup" email was never seen. Only keep it when it actually did something
+    (_row_created_shipment or flagged); drop it when the shipment already existed and
+    nothing happened, same as the rest of the routine-noise classifications.
+
+    created_only (Parker's request, 2026-08-05) keeps ONLY rows that actually created a
+    real shipment -- no No-action-needed, no Needs-review, nothing else. message_id returns
+    every row for one source email (the idempotency lookup), bypassing every other filter."""
     out = []
     try:
         with open(AGENTLOG_PATH) as f:
@@ -1584,9 +1593,10 @@ def agent_log_read(limit=200, exceptions_only=False, pickup_only=False, created_
     elif created_only:
         out = [r for r in out if _row_created_shipment(r)]
     elif pickup_only:
-        out = [r for r in out if r.get("classification") in
-                                 ("nrt_available_for_pickup", "nrt_late_pickup_confirmation")
-                                 or r.get("exception_flag")]
+        out = [r for r in out if r.get("exception_flag")
+                                 or r.get("classification") == "nrt_available_for_pickup"
+                                 or (r.get("classification") == "nrt_late_pickup_confirmation"
+                                     and _row_created_shipment(r))]
     return out[:limit] if limit else out
 
 def agent_summary(hours=24):
