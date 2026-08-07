@@ -447,68 +447,11 @@ def api_with_headers(method, path, body=None, token=None):
     except Exception as e:
         return 0, {"error": str(e)}, {}
 
-# ---------------- PDF parser (Dachser formats A & B) ----------------
-_SKIP_MARK = ("CUBE", "STANDARD", "REEFER", "HIGH", "N/M", "CONTAINER", "40'", "20'", "45'")
-
-def parse_handover(path):
-    if pdfplumber is None: raise RuntimeError("pdfplumber not installed")
-    # NOTE: most containers on a real advice do NOT list PO#s in Description of
-    # Goods -- often only one container out of many does (confirmed against a
-    # real 10-container advice). `po_numbers` below is best-effort text parsing
-    # and is known-incomplete; process_file() fills the gap by resolving each
-    # container's POs via Acumatica PO Receipts (see containers_to_pos()).
-    ref = None; ports = []; dates = []; containers = {}; pos = []; text_pos_by_container = {}
-    with pdfplumber.open(path) as pdf:
-        full = ""
-        for pg in pdf.pages:
-            full += (pg.extract_text() or "") + "\n"
-            # Column mapping for the current "Container No / Marks / Description of
-            # Goods" block on this page. Scanned per ROW (not per-table t[0] only):
-            # pdfplumber sometimes merges a container's header+data into the same
-            # table object as a leftover "Pieces/SLAC" row from the *previous*
-            # container (different column count), which shifts the real header
-            # off row 0 and silently drops that container if we only look at t[0].
-            ci = mi = di = None
-            for t in pg.extract_tables():
-                if not t: continue
-                for row in t:
-                    if any((c or "") == "Container No" for c in row) and any((c or "") == "Marks" for c in row):
-                        ci = [i for i, c in enumerate(row) if (c or "") == "Container No"][0]
-                        mi = [i for i, c in enumerate(row) if (c or "") == "Marks"][0]
-                        dd = [i for i, c in enumerate(row) if (c or "") == "Description of Goods"]
-                        di = dd[0] if dd else None
-                        continue  # header row itself, not a data row
-                    if ci is None: continue
-                    cont = (row[ci].strip() if ci < len(row) and row[ci] else "")
-                    if not re.match(r"^[A-Z]{4}\d{7}$", cont): continue
-                    containers.setdefault(cont, None)
-                    if mi is not None and mi < len(row) and row[mi]:
-                        for ln in row[mi].split("\n"):
-                            s = ln.strip().rstrip(",").strip()
-                            if not s or any(k in s.upper() for k in _SKIP_MARK): continue
-                            if re.match(r"^[A-Za-z]{0,3}\d{5,9}$", s) and s not in pos: pos.append(s)
-                    if di is not None and di < len(row) and row[di] and "PO#" in row[di]:
-                        for blk in re.findall(r"PO#\s*(.*?)(?:Q'ty|HS code|In Gate|Total NW|$)", row[di], re.DOTALL):
-                            for n in re.findall(r"\b(\d{6})\b", blk):
-                                if n not in pos: pos.append(n)
-                                cset = text_pos_by_container.setdefault(cont, [])
-                                if n not in cset: cset.append(n)
-        for c, p, w in re.findall(r"\b([A-Z]{4}\d{7})\b\s+\d+\s+([\d,]+)\s+([\d,\.]+)", full):
-            containers.setdefault(c, None); containers[c] = int(p.replace(",", ""))
-        m = re.search(r"\b(\d{11})\b", full); ref = m.group(1) if m else None
-        for p in re.findall(r"\b([A-Z]{2}\s[A-Z]{3})\b", full):
-            if p not in ports: ports.append(p)
-        for d in re.findall(r"\b(20\d\d-\d\d-\d\d)\b", full):
-            if d not in dates: dates.append(d)
-    return {"dachser_reference": ref, "pol": ports[0] if ports else None,
-            "pod": ports[1] if len(ports) > 1 else None, "eta": dates[-1] if dates else None,
-            "containers": [{"container": c, "pieces": containers[c],
-                             "po_numbers_text": text_pos_by_container.get(c, [])} for c in containers],
-            "po_numbers": pos}
-
 # ---------------- container -> PO resolution (Acumatica PO Receipts) ----------------
-# The advice text only lists PO#s for a container "sometimes" (see the note in
-# parse_handover). The reliable source is Acumatica: the PO-receipts tool tags
+# The old handover-advice PDF path this was originally built alongside only listed PO#s
+# for a container "sometimes" -- that manual-upload flow is gone (Parker's call, 2026-08-06:
+# the mailbox agent replaced it entirely), but Acumatica remains the reliable source either
+# way: the PO-receipts tool tags
 # each PurchaseReceipt with the container number, and each receipt line carries
 # Sand+Fog's own internal PO# (POOrderNbr). That internal PO's VendorRef field
 # is where the retail PO text ("MS 117256", "TJX 117261") actually lives -- it's
@@ -556,7 +499,7 @@ def discover_receipt_container_field():
     transient failure (timeout, 5xx, rate-limit) on whichever call happened to be the
     first one after a deploy/restart would permanently cache "field not found" for the
     rest of that process's life. Every downstream caller (load_recent_receipts, and
-    everything built on it -- process_manual, process_file, /diag, /splits, /lookup) would
+    everything built on it -- process_manual, /diag, /splits, /lookup) would
     silently stop resolving ANY container until the next restart, with no error message
     pointing to why. Now only caches "not found" once a real 200 response actually said
     so -- a transient failure just retries on the next call instead."""
@@ -1238,9 +1181,9 @@ def _sync_scheduled_shipment_date(order_type, order_nbr, target_date):
         return {"requested_on_sync_error": str(e)}
 
 def create_shipment(order_type, order_nbr, container_ref=None, ship_date=None, po=None):
-    # ship_date is required by the caller (process_file hard-stops before this
-    # point if it's missing) -- no more silent fallback to a synced date or to
-    # "today". po is accepted for logging only.
+    # ship_date is required by the caller (process_manual hard-stops before this
+    # point if it's missing, unless dry_run) -- no more silent fallback to a synced
+    # date or to "today". po is accepted for logging only.
     # NOTE: the ShipmentDate action PARAMETER below is NOT reliably honored by Acumatica --
     # confirmed via a real run where the resulting shipment came back dated "today" despite
     # this parameter. Kept here in case it helps in some configs, but the real mechanism is
@@ -2387,138 +2330,22 @@ def _backfill_pickup_html(results=None):
                    '<tr><th>Container</th><th>Date</th><th>Master(s)</th><th>Outcome</th></tr>'
                    f'{rows}</table></div></div>')
 
-# ---------------- process a handover PDF ----------------
-def process_file(path, dry_run=True, ship_date=None, user=None, source_name=None):
-    # Hard stop: creation requires a typed Shipment date. No more silent fallback
-    # to a per-PO/advice date or to "today" -- if it's blank, nothing is created.
-    # (Preview / dry_run is unaffected -- you can preview matches before typing a date.)
-    if not dry_run and not ship_date:
-        return {"error": "Shipment date is required. Enter the NRT pickup date before creating shipments."}
-
-    parsed = parse_handover(path)
-    containers = [c["container"] for c in parsed["containers"]]
-    container_ref = ", ".join(containers)
-
-    # Most containers don't list PO#s in the advice text (see parse_handover) --
-    # resolve the gap via Acumatica PO Receipts, and merge with whatever the
-    # advice text did give us (belt-and-suspenders; text PO#s still count).
-    text_pos_by_container = {c["container"]: (c.get("po_numbers_text") or []) for c in parsed["containers"]}
-    receipt_pos_by_container = containers_to_pos(containers)
-    all_pos = list(parsed["po_numbers"])
-    for c in containers:
-        for p in receipt_pos_by_container.get(c, []):
-            if p not in all_pos: all_pos.append(p)
-    no_po_containers = [c for c in containers
-                        if not receipt_pos_by_container.get(c) and not text_pos_by_container.get(c)]
-    # Split by WHY no PO was found -- container_scope() (same check process_manual() already
-    # uses) tells 3PL-bound units (revenue recognized at the 3PL, not at port; expected,
-    # nothing to review) apart from a genuine gap (no receipt yet, or a receipt with no
-    # recognizable order token -- needs a human look). Previously both cases were lumped
-    # into one red "unresolved" flag on this page and in /history, which read as "something's
-    # wrong" for a container that's actually working exactly as designed.
-    out_of_scope_containers = []
-    unresolved_containers = []
-    for c in no_po_containers:
-        scope, _ = container_scope(c)
-        (out_of_scope_containers if scope == "out_of_scope" else unresolved_containers).append(c)
-
-    matched = find_sales_orders_batch(all_pos)
-    if all_pos and not any(matched.get(p) for p in all_pos):
-        # Every PO missed -- before flagging "no open sales order" across the board, force
-        # one fresh fetch. The 10-min open-orders cache (load_open_orders) can lag behind a
-        # very recent status change in Acumatica: confirmed via a real case where an order
-        # was genuinely Open in Acumatica but the cached snapshot pre-dated that.
-        load_open_orders(force=True)
-        matched = find_sales_orders_batch(all_pos)
-    unmatched = [po for po in all_pos if not matched.get(po)]
-    # Same distinction as process_manual() (see find_fulfilled_sales_orders()'s docstring
-    # for the original incident, and process_manual()'s comment for why this also has to
-    # feed the overall run status, not just the per-PO note text).
-    fulfilled = find_fulfilled_sales_orders(unmatched) if unmatched else {}
-    already_fulfilled_pos = [po for po in unmatched if fulfilled.get(po)]
-    genuinely_missing_pos = [po for po in unmatched if not fulfilled.get(po)]
-    rows = []; log_orders = []; to_create = 0; created = 0
-    for po in all_pos:
-        matches = matched.get(po, [])
-        if not matches:
-            fulfilled_orders = fulfilled.get(po) or []
-            if fulfilled_orders:
-                statuses = sorted({o["status"] for o in fulfilled_orders if o.get("status")})
-                note = (f"already fulfilled -- {len(fulfilled_orders)} sales order(s) found with "
-                        f"status {', '.join(statuses)}; no action needed")
-                rows.append({"po": po, "confidence": "ok", "note": note, "orders": [],
-                             "already_fulfilled": True})
-            else:
-                note = "no open sales order"
-                rows.append({"po": po, "confidence": "flag", "note": note, "orders": []})
-            if not dry_run:
-                log_orders.append({"po": po, "order": None, "shipment_nbr": None,
-                                    "created": False, "reason": note})
-            continue
-        for m in matches:
-            to_create += 1
-            row = {"po": po, "confidence": "ok", "orders": [m], "note": ""}
-            if not dry_run:
-                res = create_shipment(m["order_type"], m["order_nbr"], container_ref, ship_date, po=po)
-                row["result"] = res
-                if res.get("created"):
-                    created += 1
-                log_orders.append({"po": po, "order": f"{m['order_type']} {m['order_nbr']}".strip(),
-                                    "customer": m.get("customer"),
-                                    "shipment_nbr": res.get("shipment_nbr"), "created": res.get("created"),
-                                    "ship_date": res.get("ship_date"), "reason": res.get("reason") or res.get("error")})
-            rows.append(row)
-    summary = {"dachser_reference": parsed["dachser_reference"],
-               "route": f'{parsed["pol"]} -> {parsed["pod"]}', "eta": parsed["eta"],
-               "containers": containers, "po_count": len(all_pos),
-               "unresolved_containers": unresolved_containers,
-               "out_of_scope_containers": out_of_scope_containers,
-               "orders_matched": to_create, "created": created, "dry_run": dry_run, "rows": rows}
-    if not dry_run:
-        if to_create == 0:
-            if not already_fulfilled_pos:
-                status = "no_matches"
-            elif not genuinely_missing_pos:
-                status = "already_fulfilled"
-            else:
-                status = "partial"
-        elif created == to_create and not genuinely_missing_pos:
-            status = "ok"
-        elif created > 0 or already_fulfilled_pos:
-            status = "partial"
-        else:
-            status = "failed"
-        log_run({"reference": parsed["dachser_reference"], "document": source_name or os.path.basename(path),
-                 "user": user, "acumatica_user": connected_user(), "status": status,
-                 "orders_matched": to_create, "created": created,
-                 "containers": container_ref, "unresolved_containers": unresolved_containers,
-                 "out_of_scope_containers": out_of_scope_containers,
-                 "ship_date": ship_date, "orders": log_orders})
-        if created:
-            notify_shipment_created({
-                "container": container_ref, "source": "manual-pdf-upload",
-                "acumatica_user": connected_user(), "ship_date": ship_date,
-                "created_count": created, "orders": [o for o in log_orders if o.get("created")],
-                "reference": parsed["dachser_reference"],
-            })
-    return summary
-
 # ---------------- automated trigger (no PDF): NRT email / Maersk+FCR watch-list ----------------
 def process_manual(container, ship_date, pos=None, user=None, source=None, dry_run=False,
                     force_receipts=True, email_received_at=None):
-    """Programmatic twin of process_file() for automated triggers that never see a
-    handover PDF. Two calling shapes:
-      - container only (NRT path: the pickup email has no PO info) -> resolve PO#s the
-        same way process_file() does, via containers_to_pos() (container -> Acumatica
-        PurchaseReceipt -> internal PO# -> VendorRef -> retail PO#).
+    """The automated-trigger entry point (NRT email / Maersk+FCR watch-list) -- there is
+    no manual-upload counterpart anymore (Parker's call, 2026-08-06: the old handover-PDF
+    flow was removed once the mailbox agent fully replaced it). Two calling shapes:
+      - container only (NRT path: the pickup email has no PO info) -> resolve PO#s via
+        containers_to_pos() (container -> Acumatica PurchaseReceipt -> internal PO# ->
+        VendorRef -> retail PO#).
       - container + pos (Maersk/FCR path: the FCR already lists the PO#s under that
         container) -> use the given PO#s directly, skipping containers_to_pos() entirely
         so this doesn't depend on a PO Receipt already existing in Acumatica by the time
         the vessel-loading event fires.
-    Same creation path as process_file(): create_shipment() (unconfirmed, human Confirms
-    in Acumatica) + log_run() to the same permanent audit log. `source` is a free-text tag
-    (e.g. "nrt" / "maersk-fcr") recorded in the run history so History shows where each
-    automated run came from.
+    create_shipment() (unconfirmed, human Confirms in Acumatica) + log_run() to the
+    permanent audit log. `source` is a free-text tag (e.g. "nrt" / "maersk-fcr") recorded
+    in the run history so History shows where each automated run came from.
 
     force_receipts (default True): force a fresh load_recent_receipts() pull before the
     completeness gate runs, so a stale cache can't understate a master's expected-container
@@ -2824,7 +2651,8 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
 
     matched = find_sales_orders_batch(all_pos)
     if all_pos and not any(matched.get(p) for p in all_pos):
-        # Same stale-cache guard as process_file() -- see its comment above.
+        # Stale-cache guard: zero matches for EVERY resolved PO is suspicious enough to
+        # warrant one forced refresh before accepting "no open sales order" as real.
         load_open_orders(force=True)
         matched = find_sales_orders_batch(all_pos)
     unmatched = [po for po in all_pos if not matched.get(po)]
@@ -3747,7 +3575,6 @@ NAV_ITEMS = [
     ("lookup", "/lookup", "Look up"),
     ("container-status", "/container-status", "Container check"),
     ("splits", "/splits", "Split orders"),
-    ("manual", "/manual", "Manual upload"),
     ("backfill-pickup", "/backfill-pickup", "Backfill pickup"),
     ("guide", "/guide", "Guide"),
     ("history", "/history", "Shipment history"),
@@ -3874,9 +3701,9 @@ def _dashboard_html():
     """Agent dashboard -- the default landing page. Big KPI tiles up top (shipped/needs
     review/waiting/no action -- the same agent_summary() the daily email digest already
     computes), then the most recent decisions inline, so a glance here is enough for
-    day-to-day monitoring. The manual PDF-upload tool (the old default landing page) moved
-    to /manual -- still there as a fallback, just no longer the front door now that the
-    agent handles the common case."""
+    day-to-day monitoring. The old manual PDF-upload tool (the original default landing
+    page, before the mailbox agent existed) was removed entirely 2026-08-06 -- Parker's
+    call, once the agent had fully replaced it as the real front door."""
     def esc(v):
         s = "" if v is None else str(v)
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -4020,59 +3847,12 @@ def _dashboard_recent_html(rows):
     return ('<div class=section-head><h2>Recent pickup decisions (last %d)</h2></div>'
             '<p class=section-sub>Times are Pacific. Available-for-pickup triggers and exceptions only &mdash; '
             '<a href="/agent/log?all=1&view=html">see every email, all classifications</a>. %s</p>'
-            '<div class=twrap><table><tr><th>Received</th><th>Container</th><th>Email status</th><th>Result</th>'
-            '<th>Exception</th></tr>%s</table></div>'
+            '<div class=twrap><table style="table-layout:fixed"><tr>'
+            '<th style="width:14%%">Received</th><th style="width:16%%">Container</th>'
+            '<th style="width:18%%">Email status</th><th style="width:16%%">Result</th>'
+            '<th style="width:36%%">Exception</th></tr>%s</table></div>'
             % (len(rows), CLASSIFICATION_LEGEND, body or
                '<tr><td colspan=5 class=sub>No decisions logged yet.</td></tr>'))
-
-MANUAL_UPLOAD = """<div class=card>
-<h1 style="font-size:18px">Create shipments from a handover advice (manual fallback)</h1>
-<p class=sub>The mailbox agent normally creates these automatically from NRT pickup emails &mdash; use this only as a fallback (e.g. an item the agent flagged, or a container to check manually). Drop a Dachser handover-advice PDF. Preview the matched sales orders, then create shipments (left unconfirmed for a person to confirm in Acumatica).</p>
-<form id=f onsubmit="return false">
-<p><input type=file id=pdf accept="application/pdf"></p>
-<p style="max-width:340px"><label class=sub>Shipment date (required &mdash; type the NRT pickup date)</label><input type=date id=sd required></p>
-<button class=fog onclick="go(true)">Preview</button>
-<button onclick="go(false)" id=create disabled>Create shipments</button>
-</form></div>
-<div id=out></div>
-<script>
-let last=null;
-async function go(dry){
- const f=document.getElementById('pdf').files[0]; if(!f){alert('Choose a PDF');return;}
- const sdVal=document.getElementById('sd').value;
- if(!dry && !sdVal){alert('Enter the Shipment date before creating shipments.');return;}
- const fd=new FormData(); fd.append('pdf',f); fd.append('dry',dry?'1':'0'); fd.append('sd',sdVal);
- document.getElementById('out').innerHTML='<div class=card>Working...</div>';
- const r=await fetch('/process',{method:'POST',body:fd}); const d=await r.json(); render(d,dry);
-}
-function render(d,dry){
- if(d.error){document.getElementById('out').innerHTML='<div class=card>Error: '+d.error+'</div>';return;}
- let h='<div class=card><h1 style="font-size:16px">'+(dry?'Preview':'Result')+' &mdash; ref '+(d.dachser_reference||'?')+'</h1>';
- h+='<p class=sub>'+d.route+' &nbsp; ETA '+(d.eta||'?')+'</p>';
- h+='<p>'+d.containers.map(c=>'<span class="pill'+((d.unresolved_containers||[]).includes(c)?' rust':'')+'">'+c+'</span>').join('')+'</p>';
- if((d.unresolved_containers||[]).length){
-   h+='<p class=sub style="color:var(--rust)">&#9888; No PO could be found for '+d.unresolved_containers.length+' container(s) ('+d.unresolved_containers.join(', ')+') -- checked both the advice text and PO Receipts. Verify manually (e.g. against the packing list) before assuming this handover is fully covered.</p>';
- }
- if((d.out_of_scope_containers||[]).length){
-   h+='<p class=sub>'+d.out_of_scope_containers.length+' container(s) ('+d.out_of_scope_containers.join(', ')+') are 3PL-bound -- revenue recognizes at the 3PL, not at port pickup, so no shipment is expected here. Not an error.</p>';
- }
- h+='<p class=sub>'+d.po_count+' PO#s found (advice text + PO Receipts) &middot; '+d.orders_matched+' open sales orders matched'+(dry?'':' &middot; '+d.created+' shipments created')+'</p>';
- h+='<table><tr><th></th><th>PO#</th><th>Sales order</th><th>Customer</th><th>Result</th></tr>';
- for(const row of d.rows){
-   const dot='<span class="dot '+(row.confidence=='ok'?'ok':'flag')+'"></span>';
-   if(!row.orders.length){h+='<tr>'+td(dot)+td(row.po)+td('&mdash;')+td('&mdash;')+td(row.note)+'</tr>';continue;}
-   for(const o of row.orders){
-     let res=row.note||'';
-     if(row.result){res=row.result.created?('&#10003; '+(row.result.shipment_nbr||'created')+(row.result.ship_date?' &middot; '+row.result.ship_date:'')):('&#9888; '+(row.result.reason||row.result.error||'failed'));}
-     h+='<tr>'+td(dot)+td(row.po)+td((o.order_type||'')+' '+(o.order_nbr||''))+td(o.customer||'')+td(res)+'</tr>';
-   }
- }
- h+='</table></div>';
- document.getElementById('out').innerHTML=h;
- document.getElementById('create').disabled = !(dry && d.orders_matched>0);
-}
-function td(x){return '<td>'+x+'</td>';}
-</script>"""
 
 GUIDE = """<div class=card>
 <h1 style="font-size:18px">User guide &mdash; how this tool works</h1>
@@ -4278,8 +4058,6 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, LOGIN)
         if u.path == "/":
             return self._send(200, page(_dashboard_html(), current="dashboard"))
-        if u.path == "/manual":
-            return self._send(200, page(MANUAL_UPLOAD, current="manual"))
         if u.path == "/backfill-pickup":
             return self._send(200, page(_backfill_pickup_html(), current="backfill-pickup"))
         if u.path == "/connect":
@@ -4452,8 +4230,8 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
         if u.path == "/backfill-pickup":
-            # Session-authed (browser form submit), same standard as /manual -- a human
-            # correcting data by hand, not an automated flow.
+            # Session-authed (browser form submit) -- a human correcting data by hand,
+            # not an automated flow.
             if not self._authed():
                 return self._send(200, LOGIN)
             ln = int(self.headers.get("Content-Length", 0))
@@ -4725,35 +4503,6 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, LOGIN)
         if not self._authed():
             return self._send(403, "forbidden", "text/plain")
-        if u.path == "/process":
-            ctype = self.headers.get("Content-Type", "")
-            if "multipart/form-data" not in ctype or "boundary=" not in ctype:
-                return self._send(400, json.dumps({"error": "expected upload"}), "application/json")
-            boundary = ctype.split("boundary=", 1)[1].strip().strip('"').encode()
-            ln = int(self.headers.get("Content-Length", 0))
-            fields = parse_multipart(self.rfile.read(ln), boundary)
-            filedata = fields.get("pdf")
-            orig_name = fields.get("_fn_pdf") or None
-            dry = (fields.get("dry") or "1") == "1"
-            sd = (fields.get("sd") or "") or None
-            if not filedata:
-                return self._send(400, json.dumps({"error": "no file"}), "application/json")
-            # Hard stop before we even write the temp file: no typed ship date, no creation.
-            if not dry and not sd:
-                return self._send(200, json.dumps({"error": "Shipment date is required. Enter the NRT pickup date before creating shipments."}), "application/json")
-            tmp = os.path.join(TOKEN_DIR, "_ship_upload_%s.pdf" % secrets.token_hex(8))
-            with open(tmp, "wb") as f:
-                f.write(filedata if isinstance(filedata, bytes) else filedata.encode())
-            try:
-                out = process_file(tmp, dry_run=dry, ship_date=sd, user=session_user(self._cookie()), source_name=orig_name)
-                return self._send(200, json.dumps(out), "application/json")
-            except Exception as e:
-                return self._send(200, json.dumps({"error": str(e)}), "application/json")
-            finally:
-                try:
-                    os.remove(tmp)
-                except Exception:
-                    pass
         return self._send(404, json.dumps({"error": "not found"}), "application/json")
 
     def _redirect_with_cookie(self, cookie):
