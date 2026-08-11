@@ -1798,6 +1798,22 @@ CLASSIFICATION_SUBTEXT = {
 CLASSIFICATION_LEGEND = ("<b>Email status:</b> what the agent decided this email was about &mdash; "
     "<b>Available for pickup</b> is the shipment trigger; the others result in no shipment.")
 
+# Staff-plain override for the dashboard's Needs-review table (Parker's feedback,
+# 2026-08-10: the agent's own free-text exception_reason -- however it happens to
+# paraphrase a given case -- can drift into internal jargon a staff member wouldn't know
+# how to act on). Keyed by process_manual's own machine-readable `reason` code (stable,
+# not LLM-authored), read from the row's stored tool_result -- falls back to the agent's
+# exception_reason for any case not covered here yet. Expand this as new confusing cases
+# come up rather than trying to cover every possible reason up front.
+REASON_STAFF_MESSAGES = {
+    "unresolved_container": "This container isn't linked to a Purchase Order in Acumatica yet. "
+        "Check whether the packing list for this container has been entered -- if it has, the PO "
+        "number on that receipt may be missing or entered incorrectly.",
+    "pickup_after_already_shipped": "This order already shipped, but a new pickup notice just came "
+        "in for it -- possibly a duplicate email from the carrier, or a container that wasn't "
+        "accounted for the first time. Worth a quick look to confirm nothing extra needs to ship.",
+}
+
 def _friendly_classification(c):
     return CLASSIFICATION_LABELS.get(c, c or "&mdash;")
 
@@ -2429,12 +2445,18 @@ def process_manual(container, ship_date, pos=None, user=None, source=None, dry_r
             # silently invisible forever, with zero human visibility, unless another NRT
             # email happens to arrive later.
             _log_early("unresolved")
+            # Staff-plain wording (Parker's feedback, 2026-08-10): "VendorRef" and "receipt"
+            # are internal Acumatica jargon that only mean something to Parker, not the
+            # staff this note is actually meant to guide. REASON_STAFF_MESSAGES on the
+            # dashboard's Needs-review table overrides this with the same plain phrasing
+            # regardless of how the agent's own free-text exception_reason paraphrases it --
+            # this note is what feeds that paraphrase, so it's worth keeping plain too.
             return {"container": container, "needs_review": True, "created": 0, "orders_matched": 0,
                     "reason": "unresolved_container",
-                    "note": "no Acumatica receipt was found for this container, or its receipt's "
-                            "VendorRef has no recognizable retail PO# -- a clerk should check "
-                            "whether the packing list has been processed yet, or whether the "
-                            "receipt's VendorRef is missing/malformed"}
+                    "note": "This container isn't linked to a Purchase Order in Acumatica yet. "
+                            "Check whether the packing list for this container has been entered -- "
+                            "if it has, the PO number on that receipt may be missing or entered "
+                            "incorrectly."}
         # NRT path completeness gate (Phase 2 / Tier 2 -- see majestic-swimming-melody.md):
         # does the underlying Purchase Order behind this container actually show everything
         # received yet? Runs on EVERY in-scope pickup event, not just ones that already look
@@ -3833,7 +3855,9 @@ def _dashboard_review_html(rows, total):
             why = ('<span style="color:var(--moss)">&#10003; Shipped on a later retry &mdash; '
                    'no action needed now.</span>')
         else:
-            why = f'<span style="color:var(--rust)">{esc(r.get("exception_reason") or "Needs review")}</span>'
+            reason_code = ((r.get("tool_result") or {}).get("data") or {}).get("reason")
+            text = REASON_STAFF_MESSAGES.get(reason_code) or r.get("exception_reason") or "Needs review"
+            why = f'<span style="color:var(--rust)">{esc(text)}</span>'
         link = f' &middot; <a href="/lookup?q={urllib.parse.quote(container_raw)}">details</a>' if container_raw else ""
         return (f'<tr class="row-{"moss" if resolved else "rust"}"><td class=t-time>{esc(_fmt_ts(r.get("ts")))}</td>'
                 f'<td class=t-container>{container}</td><td>{why}{link}</td></tr>')
