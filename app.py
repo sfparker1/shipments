@@ -3606,12 +3606,14 @@ NAV_ITEMS = [
     ("dashboard", "/", "Dashboard"),
     ("lookup", "/lookup", "Look up"),
     ("container-status", "/container-status", "Container check"),
-    ("splits", "/splits", "Split orders"),
     ("backfill-pickup", "/backfill-pickup", "Backfill pickup"),
     ("guide", "/guide", "Guide"),
     ("history", "/history", "Shipment history"),
-    ("diag", "/diag", "Diagnostics"),
 ]
+# Trimmed from the nav for staff clarity, 2026-08-10 (Parker's call) -- not removed, still
+# reachable directly by URL when needed:
+#   /splits -- operational backlog view, not referenced by the staff verification checklist
+#   /diag -- pure engineering/debugging (Acumatica API field probes), never a staff need
 
 def page(body, favicon=None, current=None):
     favicon = favicon or SHIP_FAVICON
