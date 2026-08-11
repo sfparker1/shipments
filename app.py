@@ -3708,24 +3708,22 @@ def _diag_html(d, sample_po, sample_container, sample_receipt):
             + '<div class=section-label>Reference &amp; raw data</div>' + reference + raw_json)
 
 def _dashboard_html():
-    """Agent dashboard -- the default landing page. Big KPI tiles up top (shipped/needs
-    review/waiting/no action -- the same agent_summary() the daily email digest already
-    computes), then the most recent decisions inline, so a glance here is enough for
-    day-to-day monitoring. The old manual PDF-upload tool (the original default landing
-    page, before the mailbox agent existed) was removed entirely 2026-08-06 -- Parker's
-    call, once the agent had fully replaced it as the real front door."""
+    """Agent dashboard -- the default landing page. Rebuilt 2026-08-09 for staff clarity
+    (Parker's ask, ahead of sharing this with his team): the classification chips, the
+    4-tile KPI band, and the mixed-classification "recent decisions" table all required
+    knowing this tool's internal vocabulary (waiting_on_containers vs no_action vs
+    exception_flag) to actually read. Staff need exactly two answers -- what shipped, and
+    what needs a person -- so the page is now just those two tables, plus the smallest
+    possible trust signal (is the agent actually running) above them. The fuller views
+    (classification breakdown, full history, split-order backlog) all still exist, just
+    one click away via the top nav or each table's own "see all" link, not on the front
+    page every day."""
     def esc(v):
         s = "" if v is None else str(v)
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     s = agent_summary(hours=24)
-    # Pickup-only by default (2026-07-27, Parker's request): the routine NRT status noise
-    # (Scheduled/Picked up/Empty-returned, non-NRT mail, skipped/ambiguous) was cluttering
-    # the home page -- exceptions still always show regardless of classification, see
-    # agent_log_read()'s docstring. Full history remains one click away via /agent/log?all=1.
-    recent = agent_log_read(limit=15, pickup_only=True)
-
-    mode_class = {"live": "moss", "shadow": "", "mixed": "rust", "n/a": ""}.get(s["mode"], "")
-    mode_pill = '<span class="pill %s">%s</span>' % (mode_class, esc(s["mode"]))
+    created_rows = agent_log_read(limit=15, created_only=True)
+    review_rows = agent_log_read(limit=15, exceptions_only=True)
 
     # Same dead-man's-switch signal the daily digest email relies on, surfaced here too so
     # a glance at the dashboard catches a stuck/stopped agent without waiting for 7am.
@@ -3741,10 +3739,15 @@ def _dashboard_html():
     elif s["decisions"] == 0:
         warn = '<p class=sub style="color:var(--rust)">&#9888; No decisions logged in the last 24h.</p>'
 
-    # ledger_check_sla()'s result was already computed inside agent_summary() (used by the
-    # Power Automate digest email) but never shown here -- real gap found 2026-07-29: a
-    # master stuck "waiting"/"partial" past LEDGER_SLA_DAYS had no way to reach Parker
-    # except through that external, unverified email template. Now shown directly.
+    glance = ('<div class=glance>'
+        '<div class=g-item>Mode <span class="pill %s">%s</span></div>'
+        '<div class=divider></div><div class=g-item>Last decision <b>%s</b></div></div>'
+        % ({"live": "moss", "shadow": "", "mixed": "rust", "n/a": ""}.get(s["mode"], ""), esc(s["mode"]),
+           esc(_fmt_ts(s["last_decision_at"])) if s["last_decision_at"] else "&mdash;"))
+
+    # ledger_check_sla()'s result (a master stuck "waiting"/"partial" past LEDGER_SLA_DAYS)
+    # is also fundamentally a "needs a person" signal, same spirit as the exceptions table
+    # below -- shown as its own alert since it's ledger-sourced, not an agent_log row.
     stale = s.get("ledger_stale") or []
     stale_html = ""
     if stale:
@@ -3758,109 +3761,62 @@ def _dashboard_html():
             f'<div class=group-card-head><h3>&#9888; {len(stale)} master PO(s) stuck past '
             f'{LEDGER_SLA_DAYS} days</h3></div>{stale_rows}</div>')
 
-    # Display-only: agent_summary()'s by_classification keeps the raw enum keys (the
-    # digest email/Power-Automate side may match on them) -- map through
-    # _friendly_classification and MERGE by the resulting label (nrt_available_for_pickup
-    # and nrt_late_pickup_confirmation both map to plain "Available for pickup" -- see
-    # CLASSIFICATION_LABELS -- so they should show as one chip, not two identical-looking
-    # ones with different counts).
-    merged_class = {}
-    for k, v in s["by_classification"].items():
-        label = _friendly_classification(k)
-        merged_class[label] = merged_class.get(label, 0) + v
-    swatch = {"Available for pickup": "var(--fog)", "Waiting on containers": "var(--fog)"}
-    class_chips = "".join(
-        '<div class=class-chip><span class=swatch style="background:%s"></span>%s <span class=n>%d</span></div>'
-        % (swatch.get(label, "var(--line-strong)"), esc(label), n)
-        for label, n in sorted(merged_class.items(), key=lambda kv: -kv[1]))
-
-    # Cheap count (ledger's own stored status, not a live re-check -- that's what the
-    # dedicated /splits page is for) so a glance here shows whether anything's mid-split.
-    active_splits = sum(1 for e in (load_json(LEDGER_PATH) or {}).values()
-                         if e.get("status") in ("waiting", "partial"))
-    splits_chip = ('<a class="split-chip pill fog" href=/splits>%d order(s) split across containers &rarr;</a>'
-                   % active_splits) if active_splits else ""
-
-    kpis = ('<div class=kpi-band>'
-        '<div class="kpi moss"><div class=kpi-top><span class=kpi-label>Shipped</span>'
-        '<span class=kpi-icon>&#10003;</span></div><div class=kpi-num>%d</div>'
-        '<div class=kpi-sub>Ready and waiting in Acumatica for <b>a clerk to confirm</b></div></div>'
-
-        '<div class="kpi rust"><div class=kpi-top><span class=kpi-label>Needs review</span>'
-        '<span class=kpi-icon>&#9888;</span></div><div class=kpi-num>%d</div>'
-        '<div class=kpi-sub>Waiting on <b>someone to take a look</b></div></div>'
-
-        '<div class="kpi fog"><div class=kpi-top><span class=kpi-label>Waiting</span>'
-        '<span class=kpi-icon>&#8987;</span></div><div class=kpi-num>%d</div>'
-        '<div class=kpi-sub>Other containers in these orders haven&#39;t confirmed pickup yet. '
-        '<b>They&#39;ll ship on their own</b> once they do</div></div>'
-
-        '<div class="kpi neutral"><div class=kpi-top><span class=kpi-label>No action needed</span>'
-        '<span class=kpi-icon>&mdash;</span></div><div class=kpi-num>%d</div>'
-        '<div class=kpi-sub>Routine status updates that didn&#39;t call for anything</div></div>'
-        '</div>'
-        % (s["shipped"], s["flagged"], s["waiting"], s["no_action"]))
-
-    glance = ('<div class=glance>'
-        '<div class=g-item><span class=mode-dot style="background:var(--%s)"></span> Mode %s</div>'
-        '<div class=divider></div><div class=g-item>Queue depth <b>%s</b></div>'
-        '<div class=divider></div><div class=g-item>Last decision <b>%s</b></div>%s</div>'
-        % ({"live": "moss", "shadow": "line-strong", "mixed": "rust", "n/a": "line-strong"}.get(s["mode"], "line-strong"),
-           mode_pill, s["queue_depth"],
-           esc(_fmt_ts(s["last_decision_at"])) if s["last_decision_at"] else "&mdash;",
-           splits_chip))
-
-    # Only the /agent/log view variants -- everything else here used to duplicate a link
-    # already in the persistent top nav (Look up, Split orders, Shipment history,
-    # Diagnostics, Manual upload), which is exactly the redundant clutter Parker asked to
-    # cut once the shared header existed.
-    quicklinks = ('<p><a class=pill href=/agent/log?view=html>Pickup decisions</a> '
-             '<a class=pill href="/agent/log?all=1&view=html">Full decision log</a> '
-             '<a class=pill href="/agent/log?exceptions_only=1&view=html">Exceptions only</a></p>')
-
     header = ('<div class=section-head><h1 style="font-size:20px">Agent dashboard</h1></div>'
               '<p class=section-sub>Last 24 hours.</p>%s' % warn)
 
-    return (header + kpis + glance + stale_html
-            + ('<div class=class-row>%s</div>' % class_chips if class_chips else '')
-            + quicklinks + _dashboard_recent_html(recent))
+    return (header + glance + stale_html
+            + _dashboard_created_html(created_rows, s["shipped"])
+            + _dashboard_review_html(review_rows, s["flagged"]))
 
-def _dashboard_recent_html(rows):
-    """Compact recent-activity table for the dashboard -- deliberately lighter than
-    /agent/log's full view (no args/result expand) so it stays scannable at a glance."""
+def _dashboard_created_html(rows, total):
+    """Shipments the agent actually created, plain and simple -- for staff, not just
+    Parker: no classification jargon, no severity coloring, nothing here needs a person to
+    do anything. Reuses _friendly_shipment_result() for the detail column so a real
+    shipment number/date shows, not a raw JSON blob."""
+    def esc(v):
+        s = "" if v is None else str(v)
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    def _row(r):
+        m = _CONTAINER_IN_SUBJECT.search(r.get("subject") or "")
+        args = r.get("tool_args") or {}
+        container = esc(args.get("container") or (m.group(1) if m else None) or r.get("subject") or "")
+        detail = _friendly_shipment_result(r.get("tool_result"), esc) or "&mdash;"
+        return (f'<tr class=row-moss><td class=t-time>{esc(_fmt_ts(r.get("ts")))}</td>'
+                f'<td class=t-container>{container}</td><td>{detail}</td></tr>')
+    body = "".join(_row(r) for r in rows)
+    return ('<div class=section-head><h2>&#10003; Shipments created (last %d)</h2></div>'
+            '<p class=section-sub>Times are Pacific. Ready and waiting in Acumatica for a clerk to confirm. '
+            '<a href="/agent/log?created_only=1&view=html">see all</a>.</p>'
+            '<div class=twrap><table><tr><th>Received</th><th>Container</th><th>Shipment</th></tr>%s</table></div>'
+            % (total, body or '<tr><td colspan=3 class=sub>No shipments created in the last 24h.</td></tr>'))
+
+def _dashboard_review_html(rows, total):
+    """Everything currently needing a person to look at it -- for staff, the other half of
+    the two things that matter. Shows the reason plainly instead of a redundant "Needs
+    review" pill on every row (that's already the whole point of this table)."""
     def esc(v):
         s = "" if v is None else str(v)
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     hist_rows = history(limit=0)  # local file read only, no live calls -- cheap per page load
     def _row(r):
-        flagged = bool(r.get("exception_flag"))
         m = _CONTAINER_IN_SUBJECT.search(r.get("subject") or "")
         container_raw = m.group(1) if m else None
-        resolved = (_find_later_success(container_raw, r.get("ts", ""), hist_rows, _flagged_row_masters(r))
-                    if flagged else None)
-        sev = "moss" if resolved else _row_severity(r)
         container = esc(container_raw) if container_raw else esc(r.get("subject") or "")
-        status = ('<span class="pill moss">&#10003; Resolved on retry</span>'
-                   if resolved else _status_pill(r))
-        if not flagged:
-            exc_cell = "<td></td>"
-        elif resolved:
-            exc_cell = '<td style="color:var(--moss)">Shipped on a later retry &mdash; no action needed now.</td>'
+        resolved = _find_later_success(container_raw, r.get("ts", ""), hist_rows, _flagged_row_masters(r))
+        if resolved:
+            why = ('<span style="color:var(--moss)">&#10003; Shipped on a later retry &mdash; '
+                   'no action needed now.</span>')
         else:
-            exc_cell = f'<td style="color:var(--rust)">{esc(r.get("exception_reason") or "")}</td>'
-        return (f'<tr class="row-{sev}"><td class=t-time>{esc(_fmt_ts(r.get("ts")))}</td>'
-                f'<td class=t-container title="{esc(r.get("subject") or "")}">{container}</td>'
-                f'<td class=t-status>{_classification_cell(r.get("classification"), esc)}</td>'
-                f"<td>{status}</td>"
-                f"{exc_cell}</tr>")
+            why = f'<span style="color:var(--rust)">{esc(r.get("exception_reason") or "Needs review")}</span>'
+        link = f' &middot; <a href="/lookup?q={urllib.parse.quote(container_raw)}">details</a>' if container_raw else ""
+        return (f'<tr class="row-{"moss" if resolved else "rust"}"><td class=t-time>{esc(_fmt_ts(r.get("ts")))}</td>'
+                f'<td class=t-container>{container}</td><td>{why}{link}</td></tr>')
     body = "".join(_row(r) for r in rows)
-    return ('<div class=section-head><h2>Recent pickup decisions (last %d)</h2></div>'
-            '<p class=section-sub>Times are Pacific. Available-for-pickup triggers and exceptions only &mdash; '
-            '<a href="/agent/log?all=1&view=html">see every email, all classifications</a>. %s</p>'
-            '<div class=twrap><table><tr><th>Received</th><th>Container</th><th>Email status</th><th>Result</th>'
-            '<th>Exception</th></tr>%s</table></div>'
-            % (len(rows), CLASSIFICATION_LEGEND, body or
-               '<tr><td colspan=5 class=sub>No decisions logged yet.</td></tr>'))
+    return ('<div class=section-head><h2>&#9888; Needs review (last %d)</h2></div>'
+            '<p class=section-sub>Times are Pacific. '
+            '<a href="/agent/log?exceptions_only=1&view=html">see all</a>.</p>'
+            '<div class=twrap><table><tr><th>Received</th><th>Container</th><th>Why</th></tr>%s</table></div>'
+            % (total, body or '<tr><td colspan=3 class=sub>Nothing needs review right now.</td></tr>'))
 
 GUIDE = """<div class=card>
 <h1 style="font-size:18px">User guide &mdash; how this tool works</h1>
