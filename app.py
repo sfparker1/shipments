@@ -1599,19 +1599,20 @@ def agent_log_read(limit=200, exceptions_only=False, pickup_only=False, created_
                                      and _row_created_shipment(r))]
     return out[:limit] if limit else out
 
+def _row_epoch(r):
+    try:
+        return time.mktime(time.strptime(r.get("ts", ""), "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return 0.0
+
 def agent_summary(hours=24):
     """Roll up the last `hours` of agent decisions for the notification digest:
     counts, the flagged-exception list (flat rows, ready for Power Automate's
     'Create HTML table'), plus queue depth and last-decision time so the digest
     also reveals job-silence (agent stopped) or a backing-up queue."""
-    def _epoch(r):
-        try:
-            return time.mktime(time.strptime(r.get("ts", ""), "%Y-%m-%d %H:%M:%S"))
-        except Exception:
-            return 0.0
     all_rows = agent_log_read(limit=0)  # newest-first, all rows
     cutoff = time.time() - hours * 3600
-    rows = [r for r in all_rows if _epoch(r) >= cutoff]
+    rows = [r for r in all_rows if _row_epoch(r) >= cutoff]
     by_class = {}
     # prepared: every create_shipment call regardless of outcome -- kept exactly as before
     # for existing consumers (the digest email may key on this). shipped/waiting/flagged/
@@ -3746,8 +3747,13 @@ def _dashboard_html():
         s = "" if v is None else str(v)
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     s = agent_summary(hours=24)
-    created_rows = agent_log_read(limit=15, created_only=True)
-    review_rows = agent_log_read(limit=15, exceptions_only=True)
+    # Time-box both tables to the same 24h window the header/KPIs already claim -- previously
+    # these just grabbed the last 15 matching rows with no date cutoff at all, so a quiet day
+    # could still show exceptions from days/weeks ago that had long since been resolved
+    # (Parker's report 2026-08-11: stale "needs review" rows cluttering the dashboard).
+    _cutoff_24h = time.time() - 24 * 3600
+    created_rows = [r for r in agent_log_read(limit=0, created_only=True) if _row_epoch(r) >= _cutoff_24h][:15]
+    review_rows = [r for r in agent_log_read(limit=0, exceptions_only=True) if _row_epoch(r) >= _cutoff_24h][:15]
 
     # Same dead-man's-switch signal the daily digest email relies on, surfaced here too so
     # a glance at the dashboard catches a stuck/stopped agent without waiting for 7am.
