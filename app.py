@@ -3764,7 +3764,33 @@ def _dashboard_html():
     header = ('<div class=section-head><h1 style="font-size:20px">Agent dashboard</h1></div>'
               '<p class=section-sub>Last 24 hours.</p>%s' % warn)
 
-    return (header + glance + stale_html
+    # Parker's ask, 2026-08-09, while still testing before staff rollout: the verification
+    # steps he wanted staff following live in chat, embedded on the page itself rather than
+    # a separate guide they'd have to remember exists. Collapsed by default (<details>, same
+    # pattern already used for "What happened" elsewhere in this app) so it doesn't clutter
+    # the two-table simplicity for anyone who already knows the drill.
+    howto = ('<div class=card><details><summary style="cursor:pointer;font-weight:600">'
+        'How to check a shipment before confirming it in Acumatica</summary>'
+        '<ol style="line-height:1.8;font-size:13.5px;padding-left:20px;margin-top:10px">'
+        '<li>Every shipment in the table below already has a real order/shipment number -- '
+        'that\'s your list for the day.</li>'
+        '<li>For each one, check <a href=/container-status>Container check</a> (default '
+        '2-day window covers overnight). It lists every container that Customer Order '
+        'depends on, and the date NRT confirmed each one. <b>If every container shows a '
+        'real date, that shipment is genuinely backed by NRT confirmations -- nothing more '
+        'to check.</b> A container still showing "Waiting" for an already-created shipment '
+        'is the one thing worth flagging.</li>'
+        '<li>That date column already IS the inbox check -- it\'s the actual email\'s '
+        'received timestamp, not just a date this tool recorded, so there\'s no need to '
+        'separately open Outlook for each one.</li>'
+        '<li>Spot-check one or two a day against the NRT Updates folder directly while '
+        'we\'re still testing this, even though step 3 makes it unnecessary long-term.</li>'
+        '<li>If anything looks off, <a href=/lookup>Look up</a> the Master PO for the '
+        'single deepest view, including a "refresh live" link to re-verify directly '
+        'against Acumatica.</li>'
+        '</ol></details></div>')
+
+    return (header + glance + stale_html + howto
             + _dashboard_created_html(created_rows, s["shipped"])
             + _dashboard_review_html(review_rows, s["flagged"]))
 
