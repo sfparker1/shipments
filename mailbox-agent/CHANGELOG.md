@@ -1,6 +1,6 @@
 # Changelog — NRT mailbox agent / shipment trigger
 
-## 2026-10 — Shipment trigger moves from "Available for Pickup" to "Picked Up"
+## 2026-10-06 — Shipment trigger moves from "Available for Pickup" to "Picked Up"
 
 **What changed.** The agent now creates a shipment when NRT reports a container **Picked Up**
 (custody taken by the customer's designated logistics partner), not when it becomes
@@ -14,6 +14,8 @@ month-end variance (Jul–Sep 2026 log: median Available→Picked Up lag 3 days;
 56 shipments Available 8/28–8/31 but Picked Up 9/1–9/3). (3) Two bases were already in use by
 accident: 310 of 1,620 shipments (19%) were missed-trigger backfills dated at a later
 Picked Up / Empty Returned email, the rest at Available.
+
+**Go-live / effective date: 2026-10-06.** Policy v2.1 revision history carries the same date.
 
 **Not retroactive.** September 2026 and earlier stay on the Available basis. Shipments already
 created are unchanged.
