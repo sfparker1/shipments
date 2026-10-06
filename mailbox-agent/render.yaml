@@ -8,7 +8,7 @@ services:
     runtime: python
     rootDir: mailbox-agent
     # :17 (not :00) to avoid the top-of-hour load spike. Every 3 hours keeps NRT
-    # "Available for Pickup" shipments current for month-end cutoff without over-running.
+    # "Picked Up" shipments current for month-end cutoff without over-running.
     # Daily is also fine (transit takes days) -- tune to taste.
     schedule: "17 */3 * * *"
     buildCommand: pip install -r requirements.txt

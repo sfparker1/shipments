@@ -248,12 +248,22 @@ def ledger_latest_date(master_token):
     container_ledger.json entry, which can be missing a real confirmation if Acumatica's
     receipt didn't exist yet at the moment that container's NRT trigger fired. Also folds
     in the ledger entry's own dates (belt-and-suspenders -- covers anything recorded by a
-    path that doesn't log to agent_log.jsonl, e.g. a manual /autoship test)."""
+    path that doesn't log to agent_log.jsonl, e.g. a manual /autoship test).
+
+    Picked-Up basis (2026-10): a container confirmed on the new basis takes its date ONLY from
+    the log (see _confirmed_pickup_detail()). The ledger entry's own per-container date is
+    overwritten by every later create_shipment call for that container, so folding it in
+    would let a later Empty-returned email push a master's date past the real pickup.
+    Containers confirmed only on the legacy (Available-for-Pickup) basis keep the exact
+    previous behavior."""
     dates = []
     expected = expected_containers_for_master(master_token)
-    dates.extend(d for c, d in confirmed_pickup_containers().items() if c in expected)
+    detail = _confirmed_pickup_detail()
+    dates.extend(d for c, (d, _basis) in detail.items() if c in expected)
     data = load_json(LEDGER_PATH) or {}
-    dates.extend((data.get(master_token) or {}).get("containers", {}).values())
+    for c, d in (data.get(master_token) or {}).get("containers", {}).items():
+        if detail.get(c, (None, "legacy"))[1] == "legacy":
+            dates.append(d)
     return max(dates) if dates else None
 
 def ledger_stamp_checked(master_token):
@@ -767,8 +777,29 @@ def confirmed_pickup_containers():
     action_taken is set unconditionally whenever the tool was called (see agent.py
     run_tool()'s create_shipment branch), regardless of what finish() classified it as.
 
-    Local file read only, no live Acumatica calls. Returns {container: latest ship_date}."""
-    out = {}
+    Local file read only, no live Acumatica calls. Returns {container: ship_date} -- see
+    _confirmed_pickup_detail() for how the date is chosen per container."""
+    return {c: d for c, (d, _basis) in _confirmed_pickup_detail().items()}
+
+# Recognition basis for the NRT pickup program (policy 5.3). Until 2026-10 the trigger was
+# the "Available for Pickup" email (no nrt_status on those log rows = "legacy"); it is now
+# the partner's "Picked Up" notice -- the point custody is actually taken -- with "Empty
+# Returned" accepted only as a fallback when the Picked Up email never arrived.
+PICKUP_BASIS_RANK = {"picked_up": 2, "empty_returned": 1}
+
+def _confirmed_pickup_detail():
+    """{container: (date, basis)} from the permanent agent log, basis in picked_up /
+    empty_returned / legacy. Rows carry `nrt_status` in tool_args when the agent triggered on
+    the Picked-Up basis; rows without it are the older Available-for-Pickup triggers.
+
+    Per container: a Picked Up entry wins over Empty Returned, which wins over legacy --
+    regardless of date, so a container confirmed Available before the switch is superseded
+    by its own Picked Up email. Within the new basis the EARLIEST date wins: a later email
+    (Empty Returned, a resend) must never push a container's pickup date past the real
+    pickup. Legacy keeps its original latest-date-wins rule, which is correct for Available
+    because a cancel-date decline can be followed by a fresh Available email."""
+    legacy = {}
+    new = {}
     for r in agent_log_read(limit=0):
         if r.get("action_taken") != "create_shipment":
             continue
@@ -777,14 +808,24 @@ def confirmed_pickup_containers():
         d = args.get("ship_date")
         if not c or not d:
             continue
-        if c not in out or d > out[c]:
-            out[c] = d
+        st = str(args.get("nrt_status") or "").strip().lower()
+        if st in PICKUP_BASIS_RANK:
+            cur = new.setdefault(c, {})
+            if st not in cur or d < cur[st]:
+                cur[st] = d
+        elif c not in legacy or d > legacy[c]:
+            legacy[c] = d
+    out = {c: (d, "legacy") for c, d in legacy.items()}
+    for c, by_status in new.items():
+        best = max(by_status, key=lambda s: PICKUP_BASIS_RANK[s])
+        out[c] = (by_status[best], best)
     return out
 
 def containers_confirmed_available(master_token, current_container=None):
     """Has EVERY container Acumatica's receipts say belongs to this master ALSO been
-    individually confirmed 'Available for Pickup' (or later) by its own NRT email --
-    not just "the Purchase Order shows fully received in Acumatica"?
+    individually confirmed by its own NRT email -- 'Picked Up' since Oct 2026 (policy 5.3:
+    custody taken), 'Available for Pickup' (or later) for confirmations logged before that
+    -- not just "the Purchase Order shows fully received in Acumatica"?
 
     Real incident, 2026-07-23/24 (Light Forever / L26US-051, then MRKU5545922 /
     MSGU9216100): a multi-container consolidated PO's underlying Purchase Order can show
@@ -1563,8 +1604,9 @@ def agent_log(entry):
 def agent_log_read(limit=200, exceptions_only=False, pickup_only=False, created_only=False, message_id=None):
     """Newest-first. exceptions_only filters to flagged rows for quick review; pickup_only
     (the dashboard's default view, per Parker's request 2026-07-27) drops the routine NRT
-    noise -- Scheduled/Picked up/Empty-returned status emails, non-NRT mail, skipped/
-    ambiguous ones -- keeping only genuine "Available for pickup" triggers PLUS anything
+    noise -- Available/Scheduled/Empty-returned status emails, non-NRT mail, skipped/
+    ambiguous ones -- keeping only genuine shipment triggers (Picked up since Oct 2026;
+    "Available for pickup" before that) PLUS anything
     flagged for review (an exception should never be hidden just because the email that
     caused it wasn't itself a pickup trigger).
 
@@ -1594,7 +1636,7 @@ def agent_log_read(limit=200, exceptions_only=False, pickup_only=False, created_
         out = [r for r in out if _row_created_shipment(r)]
     elif pickup_only:
         out = [r for r in out if r.get("exception_flag")
-                                 or r.get("classification") == "nrt_available_for_pickup"
+                                 or r.get("classification") in ("nrt_picked_up", "nrt_available_for_pickup")
                                  or (r.get("classification") == "nrt_late_pickup_confirmation"
                                      and _row_created_shipment(r))]
     return out[:limit] if limit else out
@@ -1781,8 +1823,9 @@ def _fmt_ts(ts):
 # table. Plain text only, no embedded HTML entities -- every use of this is esc()'d, so an
 # entity like &middot; would double-escape and show up as literal text on screen.
 CLASSIFICATION_LABELS = {
+    "nrt_picked_up": "Picked up",
     "nrt_available_for_pickup": "Available for pickup",
-    "nrt_late_pickup_confirmation": "Available for pickup",
+    "nrt_late_pickup_confirmation": "Picked up",
     "nrt_waiting_on_containers": "Waiting on containers",
     "nrt_other_status": "Just a status update",
     "not_nrt": "Not an NRT email",
@@ -1797,7 +1840,8 @@ CLASSIFICATION_SUBTEXT = {
     "nrt_late_pickup_confirmation": "caught after the fact",
 }
 CLASSIFICATION_LEGEND = ("<b>Email status:</b> what the agent decided this email was about &mdash; "
-    "<b>Available for pickup</b> is the shipment trigger; the others result in no shipment.")
+    "<b>Picked up</b> is the shipment trigger (since Oct 2026; before that it was "
+    "<b>Available for pickup</b>); the others result in no shipment.")
 
 # Staff-plain override for the dashboard's Needs-review table (Parker's feedback,
 # 2026-08-10: the agent's own free-text exception_reason -- however it happens to
@@ -2030,10 +2074,10 @@ def _agent_log_html(rows, mode="all"):
                 f"<td class=t-status>{what}</td><td>{status}</td>"
                 f"<td>{note}</td><td>{detail}</td></tr>")
     body_rows = "".join(_row(r) for r in rows)
-    title_suffix = {"pickup": " &mdash; available for pickup", "exceptions": " &mdash; exceptions only",
+    title_suffix = {"pickup": " &mdash; shipment triggers", "exceptions": " &mdash; exceptions only",
                     "all": " &mdash; all classifications", "created": " &mdash; created shipments only"}.get(mode, "")
     title = "Agent decisions" + title_suffix
-    toggle = ('<a class=pill href="/agent/log">available for pickup</a> '
+    toggle = ('<a class=pill href="/agent/log">shipment triggers</a> '
               '<a class=pill href="/agent/log?all=1">all classifications</a> '
               '<a class=pill href="/agent/log?exceptions_only=1">exceptions only</a> '
               '<a class=pill href="/agent/log?created_only=1">created shipments only</a>')
@@ -2167,7 +2211,7 @@ def _lookup_html(query=None):
         master_cards.append(
             f'<div class=master-card><div class=master-card-head><span class=m-id>{esc(tok)}</span>'
             f'<span class={pill_class}>{status_label}</span></div>'
-            f'<table class=mini-table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table>'
+            f'<table class=mini-table><tr><th>Container</th><th>Pickup confirmed</th></tr>{cont_rows}</table>'
             f'<div class=as-of>{"Last checked live: " + esc(_fmt_ts(checked)) if checked else "Not yet checked live"} '
             f'&mdash; <a href="/splits?live=1">refresh live</a></div></div>')
     if master_cards:
@@ -3144,7 +3188,7 @@ def _split_order_card(tok, entry, esc, live=False):
         return (
             f'<div class=group-card><div class=group-card-head><h3>Master PO {esc(tok)}</h3>'
             f'<span class={pill_class}>{status_label}</span></div>'
-            f'<table class=mini-table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table>'
+            f'<table class=mini-table><tr><th>Container</th><th>Pickup confirmed</th></tr>{cont_rows}</table>'
             f'<div class=as-of>{checked_note}</div></div>')
     info = split_order_status(tok, entry)
     _, live_missing, _ = containers_confirmed_available(tok)
@@ -3164,7 +3208,7 @@ def _split_order_card(tok, entry, esc, live=False):
         f'<div class=group-card><div class=group-card-head><h3>Master PO {esc(tok)}</h3>'
         f'<span class={pill_class}>{status_label}</span></div>'
         f'<p class=sub>Containers seen so far, in order of pickup date:</p>'
-        f'<table class=mini-table><tr><th>Container</th><th>Available for pickup</th></tr>{cont_rows}</table>'
+        f'<table class=mini-table><tr><th>Container</th><th>Pickup confirmed</th></tr>{cont_rows}</table>'
         f'<p class=sub style="margin-top:14px">Underlying Purchase Order(s) &mdash; ALL must be fully received before this ships:</p>'
         f'<table class=mini-table><tr><th>Purchase Order</th><th>Status</th></tr>{po_rows}</table>'
         f'<p class=sub style="margin-top:14px">Matched Sales Order(s):</p>'
@@ -4022,7 +4066,15 @@ class H(BaseHTTPRequestHandler):
             if not (token_ok or self._authed()):
                 return self._send(403, json.dumps({"error": "auth required"}), "application/json")
             container = (qs.get("container", [""])[0] or "").strip().upper()
-            return self._send(200, json.dumps(container_ship_history(container)), "application/json")
+            result = container_ship_history(container)
+            # Picked-Up basis: tell the agent whether this container's pickup has ALREADY been
+            # counted (shipped=false alone can't say -- a container waiting on siblings is
+            # also unshipped), so a later Empty-returned email doesn't re-fire the trigger.
+            date, basis = _confirmed_pickup_detail().get(container, (None, None))
+            result["pickup_recorded"] = basis in PICKUP_BASIS_RANK
+            result["recorded_pickup_status"] = basis if basis in PICKUP_BASIS_RANK else None
+            result["recorded_pickup_date"] = date if basis in PICKUP_BASIS_RANK else None
+            return self._send(200, json.dumps(result), "application/json")
         if u.path == "/agent/summary":
             # Rollup for the notification digest (a scheduled Power Automate flow reads
             # this and emails/Teams-messages Parker). AGENT_TOKEN-authed. ?hours=N window.
