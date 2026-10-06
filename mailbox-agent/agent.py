@@ -115,6 +115,28 @@ def strip_html(body):
     b = re.sub(r"\n\s*\n\s*\n+", "\n\n", b)
     return b.strip()
 
+# Statuses that may trigger a shipment, and the wording each must show in the email body.
+# "Picked Up" is the recognition event (the customer's partner takes custody); "Empty
+# returned" is accepted only as proof of pickup when the Picked Up email never arrived.
+# NRT words the latter variously: "Empty", "Empty Returned", "Empty Returned To Terminal".
+TRIGGER_STATUS_PATTERNS = {
+    "picked_up": re.compile(r"\bpicked[\s\-]*up\b", re.I),
+    "empty_returned": re.compile(r"\bempty\b", re.I),
+}
+
+def verify_trigger_status(claimed, item):
+    """(ok, reason). The model's claimed nrt_status must be an allowed trigger AND actually
+    appear in the email's own body -- so an 'Available for Pickup' email can't ship even if
+    the model mislabels it."""
+    claimed = (claimed or "").strip().lower()
+    pattern = TRIGGER_STATUS_PATTERNS.get(claimed)
+    if pattern is None:
+        return False, ("nrt_status must be 'picked_up' or 'empty_returned' -- 'Available for "
+                       "Pickup' and 'Scheduled for Pickup' are not shipment triggers")
+    if not pattern.search(strip_html(item.get("body") or "")):
+        return False, f"the email body does not show a '{claimed}' status"
+    return True, ""
+
 # ---------------- tool definitions (the agent's action surface) ----------------
 # The ONLY things the agent can do. create_shipment is the single write (maps to the
 # already-scoped /autoship; intercepted in shadow mode); finish records the decision to
@@ -126,15 +148,19 @@ TOOLS = [
         "description": "Check whether a shipment has ALREADY been created off this "
                        "container, from an earlier email (possibly a previous run). Call "
                        "this for EVERY email about a container, regardless of status -- "
-                       "including 'Scheduled for Pickup', 'Picked Up', 'Empty returned', "
-                       "not just 'Available for Pickup'. Returns shipped=true/false and, "
-                       "if true, when and which Master PO(s). The container lifecycle order "
-                       "is: Available for Pickup < Scheduled for Pickup < Picked Up < Empty "
-                       "returned -- 'Available for Pickup' is the FIRST tracked stage, so "
-                       "any OTHER status arriving after a shipment already exists is the "
-                       "normal, expected continuation, not an anomaly -- do not flag it. "
-                       "The one genuinely suspicious case is a SECOND 'Available for "
-                       "Pickup' email for a container that's already shipped (a duplicate "
+                       "including 'Available for Pickup', 'Scheduled for Pickup', 'Picked Up', "
+                       "'Empty returned'. Returns shipped=true/false and, "
+                       "if true, when and which Master PO(s). It also returns pickup_recorded "
+                       "(true if this container's Picked Up / Empty-returned notice was ALREADY "
+                       "counted toward its master, even though no shipment exists yet because "
+                       "sibling containers are still outstanding), plus recorded_pickup_status "
+                       "and recorded_pickup_date. The container lifecycle is: Available for "
+                       "Pickup / Scheduled for Pickup < Picked Up < Empty returned. The shipment "
+                       "trigger is 'Picked Up' (the customer's logistics partner has taken "
+                       "custody), so any OTHER status arriving after a shipment already exists is "
+                       "the normal, expected continuation, not an anomaly -- do not flag it. "
+                       "The one genuinely suspicious case is a SECOND 'Picked Up' "
+                       "email for a container that's already shipped (a duplicate "
                        "or resend) -- but create_shipment already detects and flags that "
                        "server-side on its own (reason=pickup_after_already_shipped), so "
                        "you don't need to re-derive it here either. Use this tool mainly "
@@ -151,10 +177,12 @@ TOOLS = [
     {
         "name": "create_shipment",
         "description": "Create an UNCONFIRMED (On Hold) Acumatica shipment for the given container. "
-                       "Use for NRT emails whose status is 'Available for Pickup', OR a later status "
-                       "(Scheduled for Pickup/Picked Up/Empty returned) when check_container_status "
-                       "shows no shipment exists yet -- see the system prompt's missed-trigger-backfill "
-                       "case. ship_date must be the date the email was received (provided in the email "
+                       "Use ONLY for an NRT email whose status is 'Picked Up' (nrt_status=picked_up), or "
+                       "'Empty returned' when the Picked Up email was evidently missed "
+                       "(nrt_status=empty_returned) -- see the system prompt. NEVER for 'Available for "
+                       "Pickup' or 'Scheduled for Pickup': custody has not transferred yet, and the call "
+                       "is rejected if the email body doesn't actually show the status you claim. "
+                       "ship_date must be the date the email was received (provided in the email "
                        "metadata). "
                        "Never releases/confirms -- a clerk does that in Acumatica. The result's `rows` "
                        "list has one entry per matched master; check each row, not just the top-level "
@@ -190,8 +218,11 @@ TOOLS = [
             "properties": {
                 "container": {"type": "string", "description": "ISO container number, e.g. CGMU6574694"},
                 "ship_date": {"type": "string", "description": "YYYY-MM-DD; the email's received date"},
+                "nrt_status": {"type": "string", "enum": ["picked_up", "empty_returned"],
+                               "description": "The status shown in THIS email's body that justifies "
+                                              "creating the shipment"},
             },
-            "required": ["container", "ship_date"],
+            "required": ["container", "ship_date", "nrt_status"],
             "additionalProperties": False,
         },
     },
@@ -212,7 +243,7 @@ TOOLS = [
             "properties": {
                 "classification": {
                     "type": "string",
-                    "enum": ["nrt_available_for_pickup", "nrt_late_pickup_confirmation",
+                    "enum": ["nrt_picked_up", "nrt_available_for_pickup", "nrt_late_pickup_confirmation",
                               "nrt_waiting_on_containers", "nrt_other_status",
                               "not_nrt", "ambiguous", "skip"],
                 },
@@ -241,42 +272,50 @@ STATUS is only in the email body, so you must read the body to know what this em
 For EVERY email, after you've read the container number and status, call \
 check_container_status for that container BEFORE calling finish -- regardless of what the \
 status is. This is a read-only check (safe to call every time, no side effects): it tells \
-you whether a shipment already exists for this container from an earlier email. The \
-container lifecycle order is: Available for Pickup < Scheduled for Pickup < Picked Up < \
-Empty returned -- "Available for Pickup" is the FIRST tracked stage.
+you whether a shipment already exists for this container, and whether this container's \
+pickup has already been counted toward its master (pickup_recorded). The container \
+lifecycle is: Available for Pickup / Scheduled for Pickup < Picked Up < Empty returned.
 
-- If the body status is "Available for Pickup" (allow minor wording variants like \
-"Available to Pickup"): this is the revenue/shipment trigger. Call create_shipment with \
-the container number (from the subject/body) and ship_date = the email's received date \
-(given in the metadata -- NOT any date in the body, NOT today). Then call finish. \
-Acumatica resolves which sales orders that container maps to; you don't need to.
+THE SHIPMENT TRIGGER IS "PICKED UP" (policy change effective October 2026 -- revenue is \
+recognized when the customer's logistics partner physically takes custody, not when the \
+container merely becomes available). "Available for Pickup" is NO LONGER a trigger.
+
+- If the body status is "Picked Up" (allow minor wording variants like "Picked-Up"): this \
+is the revenue/shipment trigger.
+   - If check_container_status shows shipped=true: a shipment already exists for this \
+container -- normal continuation (e.g. it was created before the October 2026 switch, when \
+"Available for Pickup" was the trigger). Do NOT call create_shipment. Call finish with \
+classification nrt_other_status, exception=false, no action.
+   - Otherwise (shipped=false): call create_shipment with the container number \
+(from the subject/body), ship_date = the email's received date (given in the metadata -- NOT \
+any date in the body, NOT today), and nrt_status="picked_up". Then call finish with \
+classification nrt_picked_up. Acumatica resolves which sales orders that container maps to; \
+you don't need to.
    - If create_shipment comes back with waiting_on_containers=true: this order's \
-Purchase Order isn't fully received yet (more containers for it are still arriving, \
-possibly weeks apart). This is EXPECTED, not an error -- call finish with \
+Purchase Order isn't fully received yet, or more of its containers haven't been picked up \
+yet (possibly weeks apart). This is EXPECTED, not an error -- call finish with \
 classification nrt_waiting_on_containers, exception=false. It'll ship automatically \
 once complete; nothing more for you to do.
    - If create_shipment comes back with needs_review=true instead (e.g. no open sales \
 order resolved, or a pickup arrived for an order already marked shipped), that DOES \
 need a human -- call finish with exception=true and explain.
-- Any OTHER status (Scheduled for Pickup, in transit, arrived at port, delayed, on hold, \
-Picked Up, Empty returned, etc.): do NOT create a shipment by default. Since "Available \
-for Pickup" is the first stage, any of these arriving AFTER a shipment already exists \
-(per check_container_status) is the normal, expected continuation -- NOT an anomaly, \
-don't flag it. Call finish with classification nrt_other_status, exception=false, no \
-action.
-   - EXCEPTION -- missed-trigger backfill: if the status is specifically "Scheduled for \
-Pickup", "Picked Up", or "Empty returned" (NOT "in transit"/"arrived at port"/"delayed"/ \
-"on hold", which don't reliably imply this) AND check_container_status shows \
-shipped=false (no shipment exists yet for this container): treat this the same as \
-"Available for Pickup". Reaching any of these later stages necessarily means the \
-container WAS available at some point, even though NRT apparently never sent that \
-specific email -- a real, confirmed gap on NRT's side (Parker confirmed this directly, \
-2026-07-28), not something to second-guess. Call create_shipment with the container \
-number and ship_date = the email's received date, exactly as in the normal trigger case, \
-then call finish with classification nrt_late_pickup_confirmation and a rationale noting \
-the intermediate "Available for Pickup" email was missed. Handle \
-waiting_on_containers=true / needs_review=true exactly as in the normal trigger case \
-above.
+- "Available for Pickup", "Scheduled for Pickup", in transit, arrived at port, delayed, on \
+hold, or any other status that is not Picked Up / Empty returned: NOT a trigger -- custody \
+has not transferred. Do NOT call create_shipment. Call finish with classification \
+nrt_other_status, exception=false, no action, and say which status it was in the rationale \
+(e.g. "Available for Pickup -- awaiting pickup").
+- "Empty returned" (also worded "Empty" or "Empty Returned To Terminal"): normally just the \
+continuation after a pickup that was already handled -- call finish with nrt_other_status, \
+exception=false, no action. EXCEPTION -- missed-trigger fallback: if shipped=false AND \
+pickup_recorded=false, the Picked Up email evidently never arrived (a real, confirmed gap \
+on NRT's side). An empty container being returned proves it was picked up, so treat it as \
+the trigger: call create_shipment with ship_date = the email's received date and \
+nrt_status="empty_returned", then call finish with classification \
+nrt_late_pickup_confirmation and a rationale noting the Picked Up email was missed (the \
+shipment date will be a day or so after the real pickup). Handle \
+waiting_on_containers=true / needs_review=true exactly as in the Picked Up case above. If \
+pickup_recorded=true (the pickup was already counted and the master is just waiting on \
+siblings), do NOT call create_shipment again.
 
 If the email isn't an NRT status email at all (wrong sender, no container number, some \
 other message that landed in this folder), or anything is unclear or conflicting: do NOT \
@@ -299,6 +338,14 @@ def run_tool(name, args, item, decision):
         return (data if st == 200 else {"error": f"containerstatus HTTP {st}", "detail": data}), False
 
     if name == "create_shipment":
+        # Deterministic backstop for the Picked-Up trigger (policy 5.3): the prompt says never
+        # to ship on Available/Scheduled, but a revenue date shouldn't rest on the prompt
+        # alone. Checked BEFORE action_taken/tool_args are recorded -- the server derives a
+        # container's confirmed pickup from those log fields, so a rejected call must leave
+        # no trace there.
+        ok, why = verify_trigger_status(args.get("nrt_status"), item)
+        if not ok:
+            return {"error": "create_shipment rejected: " + why}, False
         decision["action_taken"] = "create_shipment"
         decision["tool_args"] = args
         if SHADOW_MODE:
