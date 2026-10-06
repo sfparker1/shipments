@@ -44,6 +44,8 @@ Config (env vars):
 """
 import os, re, json, base64, html, time
 import urllib.request, urllib.error, urllib.parse
+from datetime import datetime, timezone, date
+from zoneinfo import ZoneInfo
 
 import anthropic
 
@@ -114,6 +116,33 @@ def strip_html(body):
     b = re.sub(r"[ \t]+", " ", b)
     b = re.sub(r"\n\s*\n\s*\n+", "\n\n", b)
     return b.strip()
+
+PACIFIC = ZoneInfo("America/Los_Angeles")
+
+def pacific_received_date(item):
+    """The email's received date as a PACIFIC calendar date (YYYY-MM-DD) -- the date used for
+    the shipment and the revenue period.
+
+    Power Automate sends received_date as the UTC date, so an NRT email sent between 5pm and
+    midnight Pacific arrives stamped with the NEXT day -- about 21% of emails in Jul-Sep 2026,
+    and it matters most at month-end. NRT's Message-ID embeds the send time in UTC
+    (<yyyymmddhhmmss.hash@nrsonline.com>); on all 1,227 logged emails that carry one it equals
+    the logged UTC date, so it's a reliable stand-in for the receive time. Converted to
+    Pacific here, and ONLY from the Message-ID: received_date itself is never converted, so
+    fixing the date in the Power Automate flow later can't cause a double conversion. Falls
+    back to received_date as sent when there is no usable Message-ID, or when the two differ
+    by more than a day (a forwarded/odd email whose id says nothing about the receive date)."""
+    raw = (item.get("received_date") or "")[:10]
+    m = re.match(r"<(\d{14})\.", item.get("message_id") or "")
+    if m:
+        try:
+            local = (datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
+                     .replace(tzinfo=timezone.utc).astimezone(PACIFIC).date())
+            if not raw or abs((local - date.fromisoformat(raw)).days) <= 1:
+                return local.isoformat()
+        except ValueError:
+            pass
+    return raw
 
 # Statuses that may trigger a shipment, and the wording each must show in the email body.
 # "Picked Up" is the recognition event (the customer's partner takes custody); "Empty
@@ -346,6 +375,11 @@ def run_tool(name, args, item, decision):
         ok, why = verify_trigger_status(args.get("nrt_status"), item)
         if not ok:
             return {"error": "create_shipment rejected: " + why}, False
+        # The shipment date is computed here, not trusted from the model: the Pacific date of
+        # the email (see pacific_received_date), so a model copying the UTC date can't leak it.
+        local_date = pacific_received_date(item)
+        if local_date:
+            args = {**args, "ship_date": local_date}
         decision["action_taken"] = "create_shipment"
         decision["tool_args"] = args
         if SHADOW_MODE:
@@ -387,14 +421,14 @@ def process_item(client, item):
         f"Source mailbox: {item.get('source_mailbox')}\n"
         f"Message-ID: {msg_id}\n"
         f"Subject: {item.get('subject')}\n"
-        f"Received date: {item.get('received_date')}\n"
+        f"Received date (Pacific): {pacific_received_date(item)}\n"
         f"Attachments: {att_summary}\n"
         f"---- body (HTML stripped to text) ----\n{body_text[:6000]}"
     )
 
     decision = {
         "run_id": RUN_ID, "source_mailbox": item.get("source_mailbox"), "message_id": msg_id,
-        "subject": item.get("subject"), "message_date": item.get("received_date"),
+        "subject": item.get("subject"), "message_date": pacific_received_date(item),
         "mode": "shadow" if SHADOW_MODE else "live",
     }
 

@@ -38,9 +38,16 @@ yet shipped stay confirmed on the legacy basis so nothing is stranded. If their 
 arrives after go-live it supersedes the Available date; if it already arrived before go-live,
 the master ships on the legacy date. This is a small, one-time cohort.
 
-**Known limitation (unchanged by this work).** The email date is the UTC date. NRT emails
-sent 5pm–midnight Pacific carry the next day's date (about 21% of emails in the Jul–Sep log),
-which matters most at month-end. Not changed here — separate decision.
+**Shipment date is now the Pacific date (same release).** Power Automate sends `received_date` as the UTC
+date, so NRT emails sent 5pm-midnight Pacific were dated the next day (21% of emails, Jul-Sep 2026). The agent
+now derives the Pacific date from the UTC send time embedded in NRT's Message-ID
+(`<yyyymmddhhmmss.hash@nrsonline.com>`; matched the logged date on all 1,227 emails that carry one),
+overrides the model's `ship_date` with it in `run_tool`, shows it to the model as "Received date (Pacific)",
+and logs it as `message_date`. It falls back to the raw date when there is no usable id or the two disagree by
+more than a day, and never converts `received_date` itself, so fixing the Power Automate flow later can't
+double-convert. Needs `tzdata` (added to `mailbox-agent/requirements.txt`). Replay of the Jul-Sep log: 118 of
+1,620 shipments would have been dated a day earlier, none moving to a different month. Log rows before
+2026-10-06 have UTC `message_date`; rows after have Pacific -- keep that in mind when comparing across the switch.
 
 **Deploy order.** (1) `shipments` web service (backward compatible: ignores a missing
 `nrt_status`), (2) then the `mailbox-agent` cron. Do not deploy the agent first.
